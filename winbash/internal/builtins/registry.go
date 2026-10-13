@@ -23,7 +23,8 @@ type Builtin func(ctx context.Context, cwd string, argv []string, out io.Writer,
 // 这类重名冲突 —— 使用者敲 find 时拿到的语义由这里定义,而不是由一个碰巧在
 // PATH 里排得更前面的 exe 决定。
 //
-// 新增 ① 层命令时在这里加一行。Task 5/6 会补上 cat 与 grep。
+// 新增 ① 层命令时在这里加一行。Task 6 会补上 grep。
 var Registry = map[string]Builtin{
-	"ls": Ls,
+	"ls":  Ls,
+	"cat": Cat,
 }
