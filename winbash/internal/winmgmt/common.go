@@ -36,6 +36,7 @@ var Registry = map[string]Cmd{
 	"svc": Svc,
 	"reg": Reg,
 	"ps":  Ps,
+	"sys": Sys,
 }
 
 // runRecords 执行一段 PowerShell 脚本,把它返回的 JSON 解析成记录集。
