@@ -21,14 +21,18 @@ const (
 // `ls` 永远是我们的 ls,不是某个碰巧排在前面的 exe。Windows 上 find / sort / where
 // 这类重名冲突,根源就是「谁排在 PATH 前面谁说话」;这里的名字由我们自己定义。
 //
-// ③ 与 ④ 的区分需要搜索路径(Task 12 的 pathsearch),在此之前 classify 只回答
-// 前两层的问题,落不到前两层的都先按 ③ 交给默认 handler。
-func classify(cmd string) layer {
+// ③ 与 ④ 的分界靠 Which:能定位到可执行文件就是 ③,否则是 ④(报错 + 建议)。
+// searchPath 由调用方给出(真实 PATH + Git Bash 的 usr\bin),**不是**进程 PATH ——
+// 进程环境在整个生命周期里都不被改动(Global Constraints)。
+func classify(cmd string, searchPath string) layer {
 	if _, ok := builtins.Registry[cmd]; ok {
 		return layerBuiltin
 	}
 	if _, ok := winmgmt.Registry[cmd]; ok {
 		return layerWinmgmt
 	}
-	return layerPath
+	if _, ok := Which(cmd, searchPath); ok {
+		return layerPath
+	}
+	return layerMissing
 }

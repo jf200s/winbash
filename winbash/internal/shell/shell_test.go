@@ -3,6 +3,7 @@ package shell
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"strings"
 	"testing"
 )
@@ -104,5 +105,57 @@ func TestSessionJSONFlagReachesLayerTwo(t *testing.T) {
 	}
 	if len(items) != 1 || items[0]["Status"] == nil {
 		t.Fatalf("unexpected record: %q", out)
+	}
+}
+
+// ③ 层:真实 PATH 里的工具必须能跑,而且退出码是它自己的。
+func TestSessionRunsExternalCommandFromPath(t *testing.T) {
+	s := NewSession()
+
+	out, exit, errs := s.Run(context.Background(), "git --version", false)
+	if exit != 0 {
+		t.Fatalf("exit=%d errs=%v", exit, errs)
+	}
+	if !strings.Contains(out, "git version") {
+		t.Fatalf("unexpected output: %q", out)
+	}
+
+	// 非零退出码要原样带回来,不能被吞成 0。
+	_, exit, _ = s.Run(context.Background(), "git definitely-not-a-subcommand-xyz", false)
+	if exit == 0 {
+		t.Fatal("external command's non-zero exit code was swallowed")
+	}
+}
+
+// Git Bash 的 usr\bin 只存在于我们构造的搜索路径里(不在进程 PATH 里)——
+// 这条钉住「③ 层确实用上了它」,而不是碰巧进程 PATH 里就有 sed。
+func TestSessionReachesGitBashToolsNotOnProcessPath(t *testing.T) {
+	if gitBashUsrBin() == "" {
+		t.Skip("Git Bash 不在标准位置,跳过")
+	}
+	if strings.Contains(strings.ToLower(os.Getenv("PATH")), `git\usr\bin`) {
+		t.Skip("这台机器的进程 PATH 里本来就有 Git 的 usr\\bin,这条断言证明不了什么")
+	}
+
+	s := NewSession()
+	out, exit, errs := s.Run(context.Background(), "echo hello | sed s/hello/world/", false)
+	if exit != 0 {
+		t.Fatalf("exit=%d errs=%v", exit, errs)
+	}
+	if strings.TrimSpace(out) != "world" {
+		t.Fatalf("got %q", out)
+	}
+}
+
+// export 必须对 ③ 层的子进程可见 —— 否则「在 winbash 里导出变量再跑工具」
+// 是**静默无效**的,而那正是本项目要消灭的失败形态。
+func TestSessionExportedVarReachesExternalCommand(t *testing.T) {
+	s := NewSession()
+	out, exit, errs := s.Run(context.Background(), `export WINBASH_PROBE=42; pwsh -NoProfile -c '$env:WINBASH_PROBE'`, false)
+	if exit != 0 {
+		t.Fatalf("exit=%d errs=%v", exit, errs)
+	}
+	if strings.TrimSpace(out) != "42" {
+		t.Fatalf("exported variable did not reach the child process: %q", out)
 	}
 }

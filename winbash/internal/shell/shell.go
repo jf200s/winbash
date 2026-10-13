@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 
@@ -42,6 +43,11 @@ type Session struct {
 	// engineErr 缓存启动失败,避免每次调用都重付一次启动超时。
 	engine    *pwsh.Conn
 	engineErr error
+
+	// searchPath 是 ③ 层要用的搜索路径:真实 PATH + Git Bash 的 usr\bin。
+	// 它在构造时算一次,存下来 —— 进程环境不动(Global Constraints),
+	// 所以这条路径只活在 Session 里。
+	searchPath string
 }
 
 // switchWriter 是一个输出目标可替换的 io.Writer。
@@ -77,8 +83,9 @@ func NewSession() *Session {
 	}
 
 	s := &Session{
-		stdout: &switchWriter{},
-		stderr: &switchWriter{},
+		stdout:     &switchWriter{},
+		stderr:     &switchWriter{},
+		searchPath: BuildSearchPath(os.Getenv("PATH")),
 	}
 
 	runner, err := interp.New(
@@ -106,7 +113,7 @@ func (s *Session) execHandler(ctx context.Context, args []string) error {
 	}
 	hc := interp.HandlerCtx(ctx)
 
-	switch classify(args[0]) {
+	switch classify(args[0], s.searchPath) {
 	case layerBuiltin:
 		if code := builtins.Registry[args[0]](ctx, hc.Dir, args[1:], hc.Stdout, hc.Stderr); code != 0 {
 			return interp.ExitStatus(code)
@@ -126,10 +133,66 @@ func (s *Session) execHandler(ctx context.Context, args []string) error {
 		return nil
 	}
 
-	// ③ 层:暂由 mvdan/sh 的默认 handler 兜着(走进程 PATH)。
-	// Task 12 会换成自定义 handler —— 默认 handler 只认进程 PATH,而我们要能加上
-	// Git Bash 的 usr\bin,同时不改环境变量(Global Constraints)。
-	return interp.DefaultExecHandler(0)(ctx, args)
+	// ③/④ 层:自己定位、自己执行。
+	// **不用 interp.DefaultExecHandler**(R3 决定):它内部走 interp.LookPath,
+	// 读的是**进程 PATH**,不受我们构造的 searchPath 控制 —— 两者接不上,
+	// 而 Global Constraints 不允许改环境变量。
+	return s.runExternal(ctx, args, hc)
+}
+
+// runExternal 是 ③ 层(命中真实 PATH)与 ④ 层(哪个都没有)的实现。
+func (s *Session) runExternal(ctx context.Context, args []string, hc interp.HandlerContext) error {
+	abs, ok := Which(args[0], s.searchPath)
+	if !ok {
+		// ④ 层。这里只给最基础的可操作错误;已知坑的翻译表(Task 13)接在同一处。
+		fmt.Fprintln(hc.Stderr, errs.Errorf(args[0], "找不到这个命令",
+			"确认命令名有没有写错;③ 层会搜索真实 PATH 与 Git Bash 的 usr\\bin,可用 winbash -c 'which "+args[0]+"' 自查"))
+		return interp.ExitStatus(errs.ExitNotFound)
+	}
+
+	cmd := exec.CommandContext(ctx, abs, args[1:]...)
+	cmd.Dir = hc.Dir
+	cmd.Stdin = hc.Stdin
+	cmd.Stdout = hc.Stdout
+	cmd.Stderr = hc.Stderr
+	cmd.Env = envList(hc.Env)
+
+	err := cmd.Run()
+	if err == nil {
+		return nil
+	}
+
+	// 子进程自己的非零退出码原样带回去 —— 这是 bash 的语义(`grep 没匹配 → 1`),
+	// 也是 ③ 层与 ④ 层的分界:跑起来了就不该替它改写结果。
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return interp.ExitStatus(ee.ExitCode())
+	}
+
+	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
+		fmt.Fprintln(hc.Stderr, errs.Errorf(args[0], err.Error(), "文件已经不在了(它可能在两条命令之间被删掉或被换掉)"))
+		return interp.ExitStatus(errs.ExitNotFound)
+	}
+
+	fmt.Fprintln(hc.Stderr, errs.Errorf(args[0], err.Error(), "确认它是不是可执行文件,以及当前用户有没有权限运行它"))
+	return interp.ExitStatus(errs.ExitNoExec)
+}
+
+// envList 把 interp 的环境展开成 os/exec 要的形式。
+//
+// 用 hc.Env 而不是 os.Environ():shell 里的 `export FOO=bar` 必须对 ③ 层的子进程可见 ——
+// 否则「在 winbash 里导出变量再跑 git」会是**静默无效**的,而那正是本项目要消灭的失败形态。
+// 只带导出过的变量,与 POSIX 的语义一致(局部变量不给子进程)。
+func envList(env expand.Environ) []string {
+	var out []string
+	env.Each(func(name string, vr expand.Variable) bool {
+		if name == "" || !vr.Exported || !vr.IsSet() {
+			return true
+		}
+		out = append(out, name+"="+vr.String())
+		return true
+	})
+	return out
 }
 
 // psEngine 返回 ② 层的常驻 pwsh,第一次真的用到时才启动。
