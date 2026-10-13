@@ -28,16 +28,24 @@ type Builtin func(ctx context.Context, cwd string, argv []string, out io.Writer,
 // 新增 ① 层命令时在这里加一行。
 var Registry = map[string]Builtin{
 	"ls":   Ls,
-	"cat":  Cat,
+	"cat":  catBuiltin,
 	"grep": grepBuiltin,
 }
 
-// grepBuiltin 是 Grep 的适配器:把 Registry 里统一的 Builtin 形状(没有 stdin)
-// 补上 grep 需要的那一个参数。
+// catBuiltin / grepBuiltin 把 Registry 里统一的 Builtin 形状(没有 stdin)
+// 补上这两个命令需要的那一个参数。
 //
 // stdin 从 interp.HandlerCtx 取 —— 也就是「注册表里的命令只会由 ExecHandler 调用」
 // 这个前提(routeExec 本来就是这么用 HandlerCtx 的)。
-// 有了它,`cat x | grep y` 的管道完全在 daemon 进程内流转,不落盘、不 spawn。
+// 有了它,`cat x | grep y`、`echo hi | cat` 的管道完全在 daemon 进程内流转,
+// 不落盘、不 spawn。
+//
+// 两个命令各自需要一个薄适配器,而不是把 Builtin 放宽成"差不多能兼容"的形状 ——
+// 后者会让 Registry 失去意义(见 registry.go 顶部的说明)。
+func catBuiltin(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int {
+	return Cat(ctx, cwd, argv, interp.HandlerCtx(ctx).Stdin, out, errw)
+}
+
 func grepBuiltin(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int {
 	return Grep(ctx, cwd, argv, interp.HandlerCtx(ctx).Stdin, out, errw)
 }

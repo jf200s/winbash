@@ -9,25 +9,29 @@ import (
 	"winbash/internal/errs"
 )
 
-// Cat 实现 bash 风格的 cat:把文件内容原样写到 stdout。
+// Cat 实现 bash 风格的 cat:把输入原样写到 stdout。
 //
 // 用 io.Copy 而不是 os.ReadFile + string 转换。后者会经手一次字符串,
 // 而 Windows 上的文本文件未必是 UTF-8(GBK 编码的中文文件很常见)——
 // 任何一次「这应该是文本」的假设都会静默改写字节。二进制安全不是加分项,
 // 它是「值保证」的前置条件:值被改过了,后面所有解析都是在错误的地基上做的。
-func Cat(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int {
+//
+// 输入来源与 grep 对齐(这一致性原先不一致 —— Task 6 记下的遗留,现已统一成 bash 语义):
+//   - 给文件名 → 读那些文件
+//   - `-`      → 读标准输入;可以出现在文件列表中间,按出现顺序读
+//   - 不给参数 → 读标准输入
+func Cat(ctx context.Context, cwd string, argv []string, in io.Reader, out, errw io.Writer) int {
 	if len(argv) == 0 {
-		fmt.Fprintln(errw, errs.Errorf("cat", "没有指定文件", "用法: cat 文件 [文件...]"))
-		return errs.ExitUsage
+		argv = []string{"-"}
 	}
 
 	code := errs.ExitOK
 	for _, name := range argv {
 		if name == "-" {
-			// bash 惯例里 "-" 表示 stdin。① 层的 cat 不接 stdin,
-			// 明确报错好过把它当成一个名叫 "-" 的文件去打开。
-			fmt.Fprintln(errw, errs.Errorf("cat", "暂不支持从 stdin 读(-)", "直接用文件名: cat 文件"))
-			code = errs.ExitUsage
+			if _, err := io.Copy(out, SafeStdin(in)); err != nil {
+				fmt.Fprintln(errw, errs.Errorf("cat", err.Error(), "读标准输入时出错"))
+				code = errs.ExitError
+			}
 			continue
 		}
 

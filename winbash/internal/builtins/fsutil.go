@@ -1,6 +1,7 @@
 package builtins
 
 import (
+	"io"
 	"path/filepath"
 	"strings"
 )
@@ -44,3 +45,23 @@ func splitPOSIXDrive(p string) (drive, rest string, ok bool) {
 func isASCIILetter(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
+
+// SafeStdin 把一个可能是 nil 的 stdin 变成"空输入"。
+//
+// nil 的 io.Reader 读起来是 **panic**,不是 EOF —— 实测过:`interp.StdIO(nil, …)` 下
+// `winbash -c 'grep xyz'`(无文件、无管道)直接把 daemon 打崩,client 只看到一句
+// "An existing connection was forcibly closed by the remote host",完全指不到根因。
+//
+// 内建这一层兜住它,是因为 stdin 还可能从别的路径变回 nil。
+// shell 侧也做了同样的防护(给 interp 一个真正的空 reader) —— 两处是各自的边界。
+func SafeStdin(in io.Reader) io.Reader {
+	if in == nil {
+		return eofReader{}
+	}
+	return in
+}
+
+// eofReader 立即返回 EOF。
+type eofReader struct{}
+
+func (eofReader) Read([]byte) (int, error) { return 0, io.EOF }

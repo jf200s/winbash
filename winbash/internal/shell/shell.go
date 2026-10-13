@@ -91,7 +91,13 @@ func NewSession() *Session {
 	runner, err := interp.New(
 		interp.Dir(cwd),
 		interp.Env(expand.ListEnviron(os.Environ()...)),
-		interp.StdIO(nil, s.stdout, s.stderr),
+		// stdin:daemon 目前没有把 client 的 stdin 转发过来,所以这里给一个**真正的空输入**,
+		// 而不是 nil。nil 的 io.Reader 读起来是 panic —— 实测 `winbash -c 'grep xyz'`
+		// (无文件、无管道)就是这样把 daemon 打崩的,client 只看到一句
+		// "connection was forcibly closed",完全指不到根因。
+		// 空输入则立即 EOF:读 stdin 的命令(`cat`、`grep`)立刻结束,不挂住、不报错。
+		// 将来若要支持 `echo x | winbash -c 'cat'`,把这里换成从 client 转发的内容即可。
+		interp.StdIO(bytes.NewReader(nil), s.stdout, s.stderr),
 		interp.ExecHandler(s.execHandler),
 		interp.CallHandler(printfGuard),
 	)

@@ -256,7 +256,7 @@ type grepResult struct {
 // 这里保持一致,而不是替使用者做「这应该是文本行」的假设。
 func grepStream(r io.Reader, re *regexp.Regexp, opts *grepOpts, label string, showName bool, out io.Writer) (grepResult, error) {
 	var res grepResult
-	br := bufio.NewReaderSize(r, 64*1024)
+	br := bufio.NewReaderSize(SafeStdin(r), 64*1024)
 	lineNo := 0
 
 	for {
