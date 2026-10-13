@@ -76,6 +76,18 @@ func (s *switchWriter) Write(p []byte) (int, error) {
 	return s.w.Write(p)
 }
 
+// EnvNested 是「正跑在 winbash 会话里」的标记,由 ② 层与 ③ 层派生给子进程。
+//
+// 为什么需要它:daemon 一条连接串行处理(见 daemon.Serve),会话里某条命令正在跑时,
+// 若它又去连同一个 daemon,两边会互相等到 client 的 300s 超时 —— 实测
+// `winbash -c 'winbash -c echo'` 正是这样挂住的。真 bash 的嵌套 bash 是两个独立进程,
+// 所以这里也照办:带着标记的 client 改走本地一次性会话(client.Run 的嵌套分支)。
+//
+// 加一个环境变量不违反 Global Constraints 的「不修改用户的环境变量」:改的只是
+// **我们派生的子进程**的 cmd.Env(与 envList 里把 PATH 换成 searchPath 是同一件事),
+// 进程自己的 os.Environ() 一点没动;而且只有 winbash client 读这个名字。
+const EnvNested = "WINBASH_SESSION"
+
 // NewSession 建立一个会话,初始工作目录为当前进程的目录。
 func NewSession() *Session {
 	cwd, err := os.Getwd()
@@ -89,9 +101,21 @@ func NewSession() *Session {
 		searchPath: BuildSearchPath(os.Getenv("PATH")),
 	}
 
+	// 滤掉继承来的嵌套标记。daemon 是 client 用 os/exec 拉起来的,而**嵌套里的**
+	// client 拉起的 daemon 会带着这个标记启动 —— 若它进了 ① 层环境,标记就会经 daemon
+	// 漏进之后每一条命令的子进程,于是「嵌套」成了常态:没嵌套的调用也走本地一次性会话,
+	// 白白丢掉常驻带来的速度。
+	env := os.Environ()
+	kept := make([]string, 0, len(env))
+	for _, kv := range env {
+		if !envNameIs(kv, EnvNested) {
+			kept = append(kept, kv)
+		}
+	}
+
 	runner, err := interp.New(
 		interp.Dir(cwd),
-		interp.Env(expand.ListEnviron(os.Environ()...)),
+		interp.Env(expand.ListEnviron(kept...)),
 		// stdin:daemon 目前没有把 client 的 stdin 转发过来,所以这里给一个**真正的空输入**,
 		// 而不是 nil。nil 的 io.Reader 读起来是 panic —— 实测 `winbash -c 'grep xyz'`
 		// (无文件、无管道)就是这样把 daemon 打崩的,client 只看到一句
@@ -486,7 +510,7 @@ func (s *Session) runExternal(ctx context.Context, args []string, hc interp.Hand
 // 因为 xargs 要 exec 的 `echo` 只在 Git Bash 的 usr\bin 里。
 // 这**不是**改进程环境:改的只是我们派生的子进程的 cmd.Env(Global Constraints 管的是前者)。
 //
-// 另外补一条 `MSYS=noglob`,理由见 msysWithNoGlob。
+// 另外补两条:`MSYS=noglob`(理由见 msysWithNoGlob)与 EnvNested(理由见其文档)。
 func envList(env expand.Environ, searchPath string) []string {
 	var out []string
 	sawPath := false
@@ -502,6 +526,9 @@ func envList(env expand.Environ, searchPath string) []string {
 		case strings.EqualFold(name, "MSYS"):
 			// 先留着不写出去:下面要往这个值里加 noglob,调用方已有的选项得保留。
 			msys = vr.String()
+		case strings.EqualFold(name, EnvNested):
+			// 跳过:下面统一补一条规范值。不跳的话会出现两条同名变量,
+			// 而 Windows 上重复变量取哪一条没有保证。
 		default:
 			out = append(out, name+"="+vr.String())
 		}
@@ -511,7 +538,15 @@ func envList(env expand.Environ, searchPath string) []string {
 		// 环境里没有 PATH 时也得给一条,否则子进程连 system32 都找不到。
 		out = append(out, "PATH="+searchPath)
 	}
-	return append(out, "MSYS="+msysWithNoGlob(msys))
+	return append(out, "MSYS="+msysWithNoGlob(msys), EnvNested+"=1")
+}
+
+// envNameIs 判断 "NAME=value" 里的名字是不是 want(Windows 上环境变量名不区分大小写)。
+func envNameIs(kv, want string) bool {
+	if i := strings.IndexByte(kv, '='); i >= 0 {
+		return strings.EqualFold(kv[:i], want)
+	}
+	return false
 }
 
 // msysWithNoGlob 把 noglob 加进 MSYS 选项串(保留调用方已有的选项)。

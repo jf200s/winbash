@@ -2,6 +2,7 @@
 package client
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"winbash/internal/ipc"
+	"winbash/internal/shell"
 )
 
 const (
@@ -29,7 +31,12 @@ func Run(endpoint, script, cwd string, jsonOut bool) (ipc.Response, error) {
 }
 
 // RunTimeout 同 Run,但给整个往返设一个上限(timeout<=0 表示不设限)。
+//
+// 嵌套里(见 inSession)不走 daemon,直接在本进程执行 —— 理由见 runLocal。
 func RunTimeout(endpoint, script, cwd string, jsonOut bool, timeout time.Duration) (ipc.Response, error) {
+	if inSession() {
+		return runLocal(script, jsonOut)
+	}
 	return oneShot(endpoint, ipc.Request{Script: script, Cwd: cwd, JSON: jsonOut}, false, timeout)
 }
 
@@ -38,6 +45,11 @@ func RunTimeout(endpoint, script, cwd string, jsonOut bool, timeout time.Duratio
 // mustExist 的语义在这里很要紧:daemon 没在跑时**不把它拉起来** ——
 // 「停一个没在跑的 daemon」不该先把 daemon 启动、再把它停掉。
 func Stop(endpoint string) error {
+	if inSession() {
+		// 要停的正是**自己所在的**那个 daemon —— 停掉它,跑着这次调用的会话也就没了。
+		return fmt.Errorf("client: 你正跑在一个 winbash 会话里,不能停掉自己所在的 daemon" +
+			"(嵌套的 winbash 是独立的,它不连 daemon);要停请在外面执行 winbash --stop")
+	}
 	resp, err := oneShot(endpoint, ipc.Request{Op: "stop"}, true, 0)
 	if err != nil {
 		return err
@@ -50,6 +62,11 @@ func Stop(endpoint string) error {
 
 // Status 取 daemon 的状态(pid / cwd / ② 层引擎)。同样不拉起 daemon。
 func Status(endpoint string) (string, error) {
+	if inSession() {
+		// 嵌套里看不了 daemon 状态:去连它只会等到 300s 超时(理由见 EnvNested)。
+		return "", fmt.Errorf("client: 你正跑在一个 winbash 会话里,看不到 daemon 状态" +
+			"(嵌套的 winbash 不连 daemon);要看状态请在外面执行 winbash --status")
+	}
 	resp, err := oneShot(endpoint, ipc.Request{Op: "status"}, true, 0)
 	if err != nil {
 		return "", err
@@ -214,4 +231,33 @@ func spawnDaemon(endpoint string) error {
 		CreationFlags: createNoWindow,
 	}
 	return cmd.Start()
+}
+
+// inSession 报告「这次调用是不是从 winbash 会话里发起的」。
+//
+// 判据就是 EnvNested:它由 ②/③ 层派生给子进程,所以只在「winbash 里的命令又调
+// winbash」时为真。daemon 自己不会带着它 —— NewSession 会把继承来的滤掉,否则
+// 从嵌套里拉起的那个 daemon 会让之后**所有**调用都误判成嵌套。
+func inSession() bool {
+	return os.Getenv(shell.EnvNested) != ""
+}
+
+// runLocal 在**本进程内**跑一段脚本,不连 daemon。
+//
+// 为什么嵌套必须走这条路:daemon 一条连接串行处理(daemon.Serve),而这次调用正是
+// 从某条**正在 daemon 里跑着的**命令派生出来的。去连它 = 外层等内层、内层等外层,
+// 两边僵到 client 的 300s 超时才散场。真 bash 的嵌套 bash 是两个独立进程,
+// 这里照样:起一个一次性会话,跑完就收。
+//
+// 代价是这一次丢掉常驻带来的速度(新建 ① 层状态;用到 ② 层时引擎再起,~350ms)。
+// 嵌套本来就不是热路径,而且这里的取舍很明确:**正确**优先于快。
+//
+// 关于 cwd:唯一调用方是 cmd/winbash,它传的就是本进程的 cwd,而 NewSession 本来
+// 就以进程 cwd 起始,所以这里不需要再切一次。
+func runLocal(script string, jsonOut bool) (ipc.Response, error) {
+	sess := shell.NewSession()
+	defer sess.Close()
+
+	out, exit, errs := sess.Run(context.Background(), script, jsonOut)
+	return ipc.Response{OK: exit == 0, Out: []byte(out), Errors: errs, Exit: exit}, nil
 }
