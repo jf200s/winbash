@@ -16,6 +16,8 @@ import (
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
+
+	"winbash/internal/builtins"
 )
 
 // Session 是一次命令行"会话":它跨多次 Run 保持变量、cwd 与函数。
@@ -69,6 +71,7 @@ func NewSession() *Session {
 		interp.Dir(cwd),
 		interp.Env(expand.ListEnviron(os.Environ()...)),
 		interp.StdIO(nil, s.stdout, s.stderr),
+		interp.ExecHandler(routeExec),
 	)
 	if err != nil {
 		// interp.New 只在 RunnerOption 非法时报错;上面的选项都是常量,出错即编程错误。
@@ -76,6 +79,32 @@ func NewSession() *Session {
 	}
 	s.runner = runner
 	return s
+}
+
+// routeExec 是四层路由的入口。
+//
+// 计划里的四层是:① 纯 Go 内建 → ② Go 内建但底层转常驻 pwsh → ③ 真实 PATH → ④ 报错 + 建议。
+// Task 4 只接上 ① 层,其余三层由后续任务依次接进来。
+//
+// 之所以在 ExecHandler 这一层做路由,而不是改写 AST:路由要能看见「这条命令
+// 是否真的跑起来了」,这个信息只有执行期才有。
+func routeExec(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return nil
+	}
+
+	if b, ok := builtins.Registry[args[0]]; ok {
+		hc := interp.HandlerCtx(ctx)
+		if code := b(ctx, hc.Dir, args[1:], hc.Stdout, hc.Stderr); code != 0 {
+			return interp.ExitStatus(code)
+		}
+		return nil
+	}
+
+	// 未命中 ① 层:暂时交回 mvdan/sh 的默认 handler(走进程 PATH)。
+	// Task 12 会用自定义 handler 替换掉它 —— 默认 handler 不认 searchPath,
+	// 而 Global Constraints 不允许我们改环境变量。
+	return interp.DefaultExecHandler(0)(ctx, args)
 }
 
 // Dir 返回会话当前的工作目录。cd 之后它会跟着变。
