@@ -4,7 +4,8 @@ bash 语法 + pwsh 能力的常驻 shell,给在 Windows 上干活的 AI 用。
 
 > 解决的问题:AI 熟悉 bash 但 bash 管不了 Windows;pwsh 管得了但不熟、而且每次冷启约 480 ms。
 > winbash 让 `ls | grep go` 这种命令照常跑,需要 Windows 能力时(服务、注册表、进程、系统信息)
-> 不用换语法;上百条命令的总耗时从分钟级降到秒级。
+> 不用换语法;上百条命令的总耗时从分钟级降到秒级。**连 `pwsh` 本身也被接管**,
+> 所以 AI 顺手写的 `pwsh -Command '...'` 同样不再每次付 ~350 ms 的启动成本。
 
 ## 快速开始
 
@@ -46,7 +47,7 @@ winbash.exe --stop      # 停掉 daemon(不会为了停掉它而先把它拉起�
 |---|---|
 | `ls` | `[-l -a -h] [路径...]` |
 | `cat` | `[文件...]`;无参数 = 读 stdin,`-` 也是 stdin |
-| `grep` | `[-i -n -v -c -l -r -E] PATTERN [文件...]`;无文件 = 读 stdin |
+| `grep` | `[-i -n -v -c -l -r -E -F -q] PATTERN [文件...]`;无文件 = 读 stdin |
 | `which` | `名字 [名字...]`;认识下面**四层**,①/② 层报名字,③ 层报绝对路径 |
 
 `grep` 的方言:默认**字面匹配**(`grep '\d' x` 找的是 `\d` 这两个字符);`-E` 走 POSIX ERE。
@@ -61,8 +62,20 @@ winbash.exe --stop      # 停掉 daemon(不会为了停掉它而先把它拉起�
 | `reg` | `get <键> [值名] [--header]` · `set <键> <值名> <数据> [--type T]` · `del <键> [值名]` · `keys <键>` |
 | `ps` | `[名称或PID] [--header]` |
 | `sys` | `[os\|cpu\|mem\|disk] [--header]` |
+| `pwsh` | `-c '<脚本>'` · `-Command '<脚本>'` · `<脚本文件.ps1>`(可带 `-NoProfile` / `-NoLogo` / `-NonInteractive`) |
 
 默认输出 TSV 且**列序固定**;`--header` 给表头。要类型化 JSON 用全局的 `--json`。
+
+**`pwsh` 接管了 pwsh 本身**:AI 顺手写的 `pwsh -Command '...'` 走常驻引擎,不再每次付
+~350 ms 启动成本。它与其它 ② 层命令有一处不同 —— 列**来自数据本身**(PowerShell 对象的属性),
+所以列名按字母序固定,而不是事先声明:单个标量给裸值(不套列名)、标量数组一行一个、对象成表。
+
+- 被接管的形式:**只有** `-c` / `-Command` / 脚本文件。其它形式(`-File` 之外的 `-EncodedCommand`、
+  `-Version`、交互式)一律**报错并指路**,不悄悄换成原生 pwsh —— 两者差 20 倍启动成本,
+  静默切换会让人以为"反正都一样"(不认识的 flag 必须报错,这条在 ② 层也同样成立)。
+- 兜底是**原生 pwsh 的全路径**(路径:`where.exe pwsh`);要交互式 shell 就直接用它。
+- bash 的 `export` 对它是可见的(每次调用同步环境)。所以写 `pwsh -c '$env:X'` 要**用单引号**:
+  双引号会被 bash 先展开 `$env` —— 这一点与真 bash 完全一致。
 
 ### ③ 层:真实工具
 
@@ -100,6 +113,9 @@ MSYS 的 `/v` 参数改写、把 POSIX 路径喂给 Windows 工具)会在原错�
 | `${#关联数组[@]}` | mvdan/sh 的缺口:恒返回 `1`(键列表 `${!m[@]}` 与取值都是对的) |
 | `more` | Git Bash 里没有,我们用了 Windows 的——多一个工具,不是缺陷 |
 | `grep -E '\d'` | 真 bash **静默**按字面处理(`\d` 退化成 `d`);我们**明确拒收**并给 POSIX 替代 |
+| `pwsh` 只有三种形式被接管 | `-c` / `-Command` / 脚本文件;其余形式报错并指路到原生 pwsh(不静默回落) |
+| `pwsh -c "$env:X"` | 双引号里的 `$env` 会被 bash 先展开成空 —— **与真 bash 一致**,要写单引号 |
+| `pwsh` 的列名按字母序 | 真实 PowerShell 会按对象属性定义顺序排版;我们排序是为了让两次运行的列序一致 |
 
 **会话级状态**(常驻会话的必然结果,不是 bug):`set -e`、`trap`、`alias`、变量、`cd` 都**跨命令持久**。
 `bash -c` 每条都是新进程,所以这一点与它不同——一条命令里的 `set -e` 会影响**后续所有命令**。

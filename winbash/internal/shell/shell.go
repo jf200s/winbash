@@ -139,6 +139,11 @@ func (s *Session) execHandler(ctx context.Context, args []string) error {
 				"② 层靠 PowerShell 7 干活;先确认 pwsh 可用: winbash -c 'pwsh -NoProfile -c $PSVersionTable.PSVersion'"))
 			return interp.ExitStatus(errs.ExitError)
 		}
+		// 把 ① 层当前的环境也带给 ② 层。常驻引擎继承的是**它启动那一刻**的环境,
+		// 而 shell 里的 export 发生在之后 —— 不同步的话 `export X=1; pwsh -c '$env:X'`
+		// 会静默给出空值(见 winmgmt/pwshcmd.go)。
+		// 复用同一个 envList:③ 层子进程的环境与 ② 层的 $env: 因此保持一致。
+		ctx = winmgmt.WithEnv(ctx, envList(hc.Env, s.searchPath))
 		if code := winmgmt.Registry[args[0]](ctx, conn, args[1:], s.jsonOut, hc.Stdout, hc.Stderr); code != 0 {
 			return interp.ExitStatus(code)
 		}

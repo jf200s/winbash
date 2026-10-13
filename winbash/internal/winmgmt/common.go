@@ -33,10 +33,11 @@ type Cmd func(ctx context.Context, conn *pwsh.Conn, argv []string, jsonOut bool,
 // 与 ① 层用同一套命名习惯:紧跟 bash 的命令名,不引入 `Get-Service` 这种词。
 // 新增 ② 层命令时在这里加一行。
 var Registry = map[string]Cmd{
-	"svc": Svc,
-	"reg": Reg,
-	"ps":  Ps,
-	"sys": Sys,
+	"svc":  Svc,
+	"reg":  Reg,
+	"ps":   Ps,
+	"sys":  Sys,
+	"pwsh": Pwsh, // 接管 pwsh 本身:见 pwshcmd.go
 }
 
 // runRecords 执行一段 PowerShell 脚本,把它返回的 JSON 解析成记录集。

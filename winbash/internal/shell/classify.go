@@ -10,7 +10,7 @@ type layer int
 
 const (
 	layerBuiltin layer = iota // ① 纯 Go 内建:ls / cat / grep …
-	layerWinmgmt              // ② Go 内建,底层转常驻 pwsh:svc / reg / ps / sys
+	layerWinmgmt              // ② Go 内建,底层转常驻 pwsh:svc / reg / ps / sys / pwsh
 	layerPath                 // ③ 真实 PATH(含 Git Bash 的 usr\bin)
 	layerMissing              // ④ 都没有:报错 + 可操作建议
 )
