@@ -7,6 +7,8 @@ package builtins
 import (
 	"context"
 	"io"
+
+	"mvdan.cc/sh/v3/interp"
 )
 
 // Builtin 是 ① 层命令的**唯一**形状。
@@ -23,8 +25,19 @@ type Builtin func(ctx context.Context, cwd string, argv []string, out io.Writer,
 // 这类重名冲突 —— 使用者敲 find 时拿到的语义由这里定义,而不是由一个碰巧在
 // PATH 里排得更前面的 exe 决定。
 //
-// 新增 ① 层命令时在这里加一行。Task 6 会补上 grep。
+// 新增 ① 层命令时在这里加一行。
 var Registry = map[string]Builtin{
-	"ls":  Ls,
-	"cat": Cat,
+	"ls":   Ls,
+	"cat":  Cat,
+	"grep": grepBuiltin,
+}
+
+// grepBuiltin 是 Grep 的适配器:把 Registry 里统一的 Builtin 形状(没有 stdin)
+// 补上 grep 需要的那一个参数。
+//
+// stdin 从 interp.HandlerCtx 取 —— 也就是「注册表里的命令只会由 ExecHandler 调用」
+// 这个前提(routeExec 本来就是这么用 HandlerCtx 的)。
+// 有了它,`cat x | grep y` 的管道完全在 daemon 进程内流转,不落盘、不 spawn。
+func grepBuiltin(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int {
+	return Grep(ctx, cwd, argv, interp.HandlerCtx(ctx).Stdin, out, errw)
 }
