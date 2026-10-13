@@ -97,7 +97,7 @@ func renderRecords(records []map[string]any, header []string, withHeader, jsonOu
 			return err
 		}
 		_, err = io.WriteString(out, s+"\n")
-		return err
+		return pipeClosedIsOK(err)
 	}
 
 	rows := make([][]string, 0, len(records))
@@ -109,6 +109,27 @@ func renderRecords(records []map[string]any, header []string, withHeader, jsonOu
 		rows = append(rows, row)
 	}
 	_, err := io.WriteString(out, output.TSV(header, rows, withHeader))
+	return pipeClosedIsOK(err)
+}
+
+// pipeClosedIsOK 把「下游已经关闭了管道」当成正常结束。
+//
+// `svc list | head -1` 里 head 读完就走,bash 的上游这时是安静退出的(SIGPIPE);
+// 而 Windows 上拿不到 SIGPIPE,管道 writer 会给一个 `write |1: The pipe has been ended.`。
+// 把它当错误报出去,使用者会看到"命令失败"的样子,而其实结果已经拿到了。
+//
+// 这里按错误文本认,可接受的理由:它只会让**本来该安静**的情况安静下来,
+// 不会掩盖真正的写失败 —— 其余错误照旧往上抛。
+func pipeClosedIsOK(err error) error {
+	if err == nil {
+		return nil
+	}
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "pipe has been ended") ||
+		strings.Contains(s, "broken pipe") ||
+		strings.Contains(s, "pipe is being closed") {
+		return nil
+	}
 	return err
 }
 

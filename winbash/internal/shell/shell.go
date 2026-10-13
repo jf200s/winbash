@@ -319,6 +319,21 @@ func (s *Session) Close() error {
 	return err
 }
 
+// EngineStatus 报告 ② 层引擎的现状,给 --status 用。
+//
+// 「引擎起没起」是排错时第一个要问的问题:懒启动意味着一个只跑 ① 层的会话
+// 根本没有 pwsh 子进程,而使用者看到的只是"svc 很慢"。
+func (s *Session) EngineStatus() string {
+	switch {
+	case s.engine != nil:
+		return fmt.Sprintf("pwsh=pid=%d calls=%d", s.engine.Pid(), s.engine.Calls())
+	case s.engineErr != nil:
+		return "pwsh=unavailable(" + s.engineErr.Error() + ")"
+	default:
+		return "pwsh=not-started"
+	}
+}
+
 // Dir 返回会话当前的工作目录。cd 之后它会跟着变。
 func (s *Session) Dir() string { return s.runner.Dir }
 

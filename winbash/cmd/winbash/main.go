@@ -23,8 +23,11 @@ func run() int {
 		script   string
 		jsonOut  bool
 		serve    bool
+		stop     bool
+		status   bool
 		endpoint string
 		idle     time.Duration
+		timeout  time.Duration
 	)
 
 	flag.StringVar(&script, "c", "", "要执行的脚本")
@@ -32,8 +35,11 @@ func run() int {
 	flag.BoolVar(&jsonOut, "json", false, "输出类型化 JSON")
 	flag.BoolVar(&jsonOut, "j", false, "输出类型化 JSON(同 --json)")
 	flag.BoolVar(&serve, "serve", false, "前台运行 daemon")
+	flag.BoolVar(&stop, "stop", false, "停止 daemon")
+	flag.BoolVar(&status, "status", false, "打印 daemon 状态")
 	flag.StringVar(&endpoint, "endpoint", defaultEndpoint(), "daemon 的端口文件路径")
 	flag.DurationVar(&idle, "idle", 30*time.Minute, "空闲多久后 daemon 自行退出(0 = 永不)")
+	flag.DurationVar(&timeout, "timeout", 300*time.Second, "单次请求的超时(0 = 不设限)")
 	flag.Parse()
 
 	if serve {
@@ -41,6 +47,25 @@ func run() int {
 			fmt.Fprintln(os.Stderr, "winbash: serve:", err)
 			return 1
 		}
+		return 0
+	}
+
+	// --stop / --status 都不会把 daemon 拉起来:为了停掉它而先启动它、
+	// 或者为了看状态而启动一个,都不合理(engine 那边踩过同类的坑)。
+	if stop {
+		if err := client.Stop(endpoint); err != nil {
+			fmt.Fprintln(os.Stderr, "winbash:", err)
+			return 1
+		}
+		return 0
+	}
+	if status {
+		out, err := client.Status(endpoint)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "winbash:", err)
+			return 1
+		}
+		fmt.Print(out)
 		return 0
 	}
 
@@ -57,7 +82,7 @@ func run() int {
 		cwd = ""
 	}
 
-	resp, err := client.Run(endpoint, script, cwd, jsonOut)
+	resp, err := client.RunTimeout(endpoint, script, cwd, jsonOut, timeout)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "winbash:", err)
 		return 1
