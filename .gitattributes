@@ -1,0 +1,9 @@
+# 换行统一锁成 LF。
+# 理由：Windows 上 git 默认 core.autocrlf=true 会把检出文件转成 CRLF，
+# 而 Git Bash 遇到 CRLF 的 .sh 会报 `\r: command not found` —— winbash 的
+# smoke-gitbash.sh 必须能直接跑，所以这条不是洁癖，是功能依赖。
+* text=auto eol=lf
+
+# 二进制不参与换行转换
+*.exe binary
+*.png binary
