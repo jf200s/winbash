@@ -34,6 +34,9 @@ func Serve(endpoint string, idleTimeout time.Duration) error {
 
 	tcpLn := ln.(*net.TCPListener)
 	sess := shell.NewSession()
+	// 会话持有 ② 层的常驻 pwsh 与 ① 层的状态,退出时一定要收干净 ——
+	// 否则每重启一次 daemon 就留下一个 pwsh 进程。
+	defer func() { _ = sess.Close() }()
 
 	for {
 		if idleTimeout > 0 {
@@ -86,10 +89,10 @@ func handle(conn net.Conn, sess *shell.Session) (quit bool, err error) {
 	ctx := context.Background()
 	if req.Cwd != "" {
 		// client 传来 cwd 时先切过去；失败不致命，继续在旧目录执行。
-		sess.Run(ctx, "cd "+shellQuote(req.Cwd))
+		sess.Run(ctx, "cd "+shellQuote(req.Cwd), false)
 	}
 
-	out, exit, errs := sess.Run(ctx, req.Script)
+	out, exit, errs := sess.Run(ctx, req.Script, req.JSON)
 	return false, writeResponse(conn, ipc.Response{
 		OK:     exit == 0,
 		Out:    []byte(out),

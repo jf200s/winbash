@@ -68,6 +68,19 @@ func TestPwshNonTerminatingErrorBecomesError(t *testing.T) {
 	}
 }
 
+// 同一条错误只能报一次。实测 `Get-Service -Name 不存在 -ErrorAction Stop` 的终止错误
+// 会同时出现在 catch 与 $Error 里,不去重就会报两遍 —— 使用者会以为有两处错误。
+func TestPwshTerminatingErrorReportedOnce(t *testing.T) {
+	c := startConn(t)
+	_, err := c.Run(context.Background(), "Get-Service -Name definitely-not-a-service-xyz -ErrorAction Stop")
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if n := strings.Count(err.Error(), "definitely-not-a-service-xyz"); n != 1 {
+		t.Fatalf("error message mentions the service %d times (want 1): %v", n, err)
+	}
+}
+
 // ConvertTo-Json 对**单元素**数组会退化成对象,调用方拿到的形状会随数据条数变化。
 // 那正是「值保证」要消灭的歧义:条数不该改变结构。
 func TestPwshSingleElementIsStillJsonArray(t *testing.T) {

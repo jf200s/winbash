@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -18,6 +19,9 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 
 	"winbash/internal/builtins"
+	"winbash/internal/errs"
+	"winbash/internal/pwsh"
+	"winbash/internal/winmgmt"
 )
 
 // Session 是一次命令行"会话":它跨多次 Run 保持变量、cwd 与函数。
@@ -28,6 +32,16 @@ type Session struct {
 
 	outBuf, errBuf bytes.Buffer
 	stdout, stderr *switchWriter
+
+	// jsonOut 是全局的 --json 开关,② 层命令据此决定输出 TSV 还是类型化 JSON。
+	// 放在 Session 上而不是每次 Run 传下去:命令实现只拿到 ctx,
+	// 而开关属于"这一次调用",由调用方在 Run 时设定。
+	jsonOut bool
+
+	// engine 是 ② 层的常驻 pwsh,第一次真的用到才启动(见 psEngine)。
+	// engineErr 缓存启动失败,避免每次调用都重付一次启动超时。
+	engine    *pwsh.Conn
+	engineErr error
 }
 
 // switchWriter 是一个输出目标可替换的 io.Writer。
@@ -71,7 +85,7 @@ func NewSession() *Session {
 		interp.Dir(cwd),
 		interp.Env(expand.ListEnviron(os.Environ()...)),
 		interp.StdIO(nil, s.stdout, s.stderr),
-		interp.ExecHandler(routeExec),
+		interp.ExecHandler(s.execHandler),
 	)
 	if err != nil {
 		// interp.New 只在 RunnerOption 非法时报错;上面的选项都是常量,出错即编程错误。
@@ -81,30 +95,73 @@ func NewSession() *Session {
 	return s
 }
 
-// routeExec 是四层路由的入口。
+// execHandler 是四层路由的入口。
 //
 // 计划里的四层是:① 纯 Go 内建 → ② Go 内建但底层转常驻 pwsh → ③ 真实 PATH → ④ 报错 + 建议。
-// Task 4 只接上 ① 层,其余三层由后续任务依次接进来。
-//
 // 之所以在 ExecHandler 这一层做路由,而不是改写 AST:路由要能看见「这条命令
 // 是否真的跑起来了」,这个信息只有执行期才有。
-func routeExec(ctx context.Context, args []string) error {
+func (s *Session) execHandler(ctx context.Context, args []string) error {
 	if len(args) == 0 {
 		return nil
 	}
+	hc := interp.HandlerCtx(ctx)
 
-	if b, ok := builtins.Registry[args[0]]; ok {
-		hc := interp.HandlerCtx(ctx)
-		if code := b(ctx, hc.Dir, args[1:], hc.Stdout, hc.Stderr); code != 0 {
+	switch classify(args[0]) {
+	case layerBuiltin:
+		if code := builtins.Registry[args[0]](ctx, hc.Dir, args[1:], hc.Stdout, hc.Stderr); code != 0 {
+			return interp.ExitStatus(code)
+		}
+		return nil
+
+	case layerWinmgmt:
+		conn, err := s.psEngine()
+		if err != nil {
+			fmt.Fprintln(hc.Stderr, errs.Errorf(args[0], err.Error(),
+				"② 层靠 PowerShell 7 干活;先确认 pwsh 可用: winbash -c 'pwsh -NoProfile -c $PSVersionTable.PSVersion'"))
+			return interp.ExitStatus(errs.ExitError)
+		}
+		if code := winmgmt.Registry[args[0]](ctx, conn, args[1:], s.jsonOut, hc.Stdout, hc.Stderr); code != 0 {
 			return interp.ExitStatus(code)
 		}
 		return nil
 	}
 
-	// 未命中 ① 层:暂时交回 mvdan/sh 的默认 handler(走进程 PATH)。
-	// Task 12 会用自定义 handler 替换掉它 —— 默认 handler 不认 searchPath,
-	// 而 Global Constraints 不允许我们改环境变量。
+	// ③ 层:暂由 mvdan/sh 的默认 handler 兜着(走进程 PATH)。
+	// Task 12 会换成自定义 handler —— 默认 handler 只认进程 PATH,而我们要能加上
+	// Git Bash 的 usr\bin,同时不改环境变量(Global Constraints)。
 	return interp.DefaultExecHandler(0)(ctx, args)
+}
+
+// psEngine 返回 ② 层的常驻 pwsh,第一次真的用到时才启动。
+//
+// 惰性是有意的:只跑 ① 层的会话(例如 `ls | grep x`)不该付那次 ~350ms 的启动成本。
+// 失败结果同样缓存 —— 否则 `svc list; svc status x` 会为同一个错误各等一次超时。
+func (s *Session) psEngine() (*pwsh.Conn, error) {
+	if s.engine != nil {
+		return s.engine, nil
+	}
+	if s.engineErr != nil {
+		return nil, s.engineErr
+	}
+	conn, err := pwsh.Start()
+	if err != nil {
+		s.engineErr = err
+		return nil, err
+	}
+	s.engine = conn
+	return conn, nil
+}
+
+// Close 释放会话持有的资源(目前只有 ② 层的 pwsh 引擎)。
+//
+// daemon 退出时必须调用:否则每重启一次 daemon 就留下一个常驻 pwsh 进程。
+func (s *Session) Close() error {
+	if s.engine == nil {
+		return nil
+	}
+	err := s.engine.Close()
+	s.engine = nil
+	return err
 }
 
 // Dir 返回会话当前的工作目录。cd 之后它会跟着变。
@@ -113,7 +170,10 @@ func (s *Session) Dir() string { return s.runner.Dir }
 // Run 执行一段脚本,返回 stdout、退出码和错误行。
 //
 // 退出码沿用 shell 惯例:0 成功,非零失败;语法解析失败返回 2。
-func (s *Session) Run(ctx context.Context, script string) (stdout string, exit int, errs []string) {
+// jsonOut 是本次调用的 --json 开关,② 层命令据此改用类型化 JSON 输出。
+func (s *Session) Run(ctx context.Context, script string, jsonOut bool) (stdout string, exit int, errs []string) {
+	s.jsonOut = jsonOut
+
 	s.outBuf.Reset()
 	s.errBuf.Reset()
 	s.stdout.Set(&s.outBuf)

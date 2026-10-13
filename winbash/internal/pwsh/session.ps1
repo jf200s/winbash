@@ -65,17 +65,22 @@ while ($true) {
         $__wb_out = $null
         if ($__wb_cwdOk) {
             $Error.Clear()
+            $__wb_terminating = ''
             try {
                 # dot-source 进当前作用域,变量才会跨调用保持 —— 这正是常驻的意义。
                 $__wb_sb = [scriptblock]::Create([string]$__wb_req.script)
                 $__wb_out = . $__wb_sb
             } catch {
-                # 终止性错误,例如 throw。
-                $__wb_errors += $_.Exception.Message
+                # 终止性错误,例如 throw 或 -ErrorAction Stop。
+                $__wb_terminating = $_.Exception.Message
             }
             # 非终止性错误:PowerShell 默认不改退出码,那是「看起来成功了」的典型。
             # 这里显式收集,交给 Go 侧判定失败(spec §7 第 1 条)。
-            $__wb_errors += @($Error | ForEach-Object { $_.ToString() })
+            #
+            # 排除掉终止性错误那一条:它同时也在 $Error 里,不去重的话同一句话会被报两遍
+            # (实测 `Get-Service -Name 不存在 -ErrorAction Stop` 就是这样)。
+            $__wb_errors += @($Error | ForEach-Object { $_.ToString() } | Where-Object { $_ -ne $__wb_terminating })
+            if ($__wb_terminating) { $__wb_errors += $__wb_terminating }
             $Error.Clear()
         }
 

@@ -2,13 +2,21 @@ package shell
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 )
 
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
+}
+
 func TestSessionRunsEchoVerbatim(t *testing.T) {
 	s := NewSession()
-	out, exit, errs := s.Run(context.Background(), "echo hello")
+	out, exit, errs := s.Run(context.Background(), "echo hello", false)
 	if exit != 0 || strings.TrimSpace(out) != "hello" || len(errs) != 0 {
 		t.Fatalf("out=%q exit=%d errs=%v", out, exit, errs)
 	}
@@ -19,8 +27,8 @@ func TestSessionKeepsCwdAcrossRuns(t *testing.T) {
 	// Task 4 的 ResolvePath，Task 2 还没有。先用 Windows 原生形式验证"cwd 跨 Run 保持"，
 	// POSIX 形式的断言留给 Task 4。
 	s := NewSession()
-	s.Run(context.Background(), "cd C:/")
-	out, _, _ := s.Run(context.Background(), "pwd")
+	s.Run(context.Background(), "cd C:/", false)
+	out, _, _ := s.Run(context.Background(), "pwd", false)
 	if !strings.Contains(out, "C:") {
 		t.Fatalf("cwd not kept: %q", out)
 	}
@@ -28,7 +36,7 @@ func TestSessionKeepsCwdAcrossRuns(t *testing.T) {
 
 func TestSessionReportsExitCodeNotZeroOnFailure(t *testing.T) {
 	s := NewSession()
-	_, exit, errs := s.Run(context.Background(), "exit 3")
+	_, exit, errs := s.Run(context.Background(), "exit 3", false)
 	if exit != 3 {
 		t.Fatalf("exit=%d want 3", exit)
 	}
@@ -60,9 +68,41 @@ func TestBashSemanticsMatchRealBash(t *testing.T) {
 	}
 	for _, c := range cases {
 		s := NewSession()
-		out, exit, _ := s.Run(context.Background(), c.script)
+		out, exit, _ := s.Run(context.Background(), c.script, false)
 		if exit != 0 || strings.TrimSpace(out) != c.want {
 			t.Errorf("script %q: got %q (exit %d) want %q", c.script, strings.TrimSpace(out), exit, c.want)
 		}
+	}
+}
+
+// ② 层的接线:名字在 winmgmt.Registry 里 → 用常驻 pwsh 执行 → 固定列序的 TSV。
+func TestSessionRoutesWinmgmtCommandsToPwsh(t *testing.T) {
+	s := NewSession()
+	defer s.Close()
+
+	out, exit, errs := s.Run(context.Background(), "svc list --running --header", false)
+	if exit != 0 {
+		t.Fatalf("exit=%d errs=%v", exit, errs)
+	}
+	if firstLine(out) != "Name\tStatus\tStartType" {
+		t.Fatalf("header: %q", firstLine(out))
+	}
+}
+
+// --json 必须一路传到 ② 层,而不是在路上被丢掉(丢了会静默给 TSV)。
+func TestSessionJSONFlagReachesLayerTwo(t *testing.T) {
+	s := NewSession()
+	defer s.Close()
+
+	out, exit, errs := s.Run(context.Background(), "svc status W32Time", true)
+	if exit != 0 {
+		t.Fatalf("exit=%d errs=%v", exit, errs)
+	}
+	var items []map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &items); err != nil {
+		t.Fatalf("--json did not reach ② 层: %v (%q)", err, out)
+	}
+	if len(items) != 1 || items[0]["Status"] == nil {
+		t.Fatalf("unexpected record: %q", out)
 	}
 }
