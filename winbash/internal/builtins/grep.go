@@ -28,8 +28,19 @@ import (
 func Grep(ctx context.Context, cwd string, argv []string, in io.Reader, out, errw io.Writer) int {
 	opts, pattern, files, aerr := parseGrepArgs(argv)
 	if aerr != nil {
-		fmt.Fprintln(errw, errs.Errorf("grep", aerr.Error(), "用法: grep [-i -n -v -c -l -r -E] PATTERN [文件...]"))
+		fmt.Fprintln(errw, errs.Errorf("grep", aerr.Error(), "用法: grep [-i -n -v -c -l -r -E -F -q] PATTERN [文件...]"))
 		return errs.ExitUsage
+	}
+
+	// -q:只要退出码,不要输出。用 io.Discard 顶掉输出端,而不是在每个打印点加判断 ——
+	// 这样 -q 与 -c/-l/-n 叠加时的行为自动与 bash 一致(静默)。
+	//
+	// 为什么值得单列一条:`grep -q` 是 AI 做条件判断的标准写法
+	// (`if grep -q x f; then`),而我们原来把它当"不认识的参数"报 exit 2 ——
+	// exit 2 在 if 里既不是真也不是假,分支直接走错,而且是静默的。
+	// 来源:oils spec `spec/vars-special.test.sh`(`echo $PWD | grep -q /`)。
+	if opts.quiet {
+		out = io.Discard
 	}
 
 	re, problem, remedy := compileGrep(pattern, opts)
@@ -114,6 +125,8 @@ type grepOpts struct {
 	namesOnly  bool
 	recursive  bool
 	extended   bool
+	fixed      bool
+	quiet      bool
 }
 
 // parseGrepArgs 吃开关,返回 opts、pattern 与文件名列表。
@@ -154,6 +167,13 @@ func parseGrepArgs(argv []string) (*grepOpts, string, []string, error) {
 				opts.recursive = true
 			case 'E':
 				opts.extended = true
+				// -E 与 -F 互斥:后出现的那个胜,与 bash 一致(`grep -EF` 按字面)。
+				opts.fixed = false
+			case 'F':
+				opts.fixed = true
+				opts.extended = false
+			case 'q':
+				opts.quiet = true
 			default:
 				// 不认识的开关必须报错:静默忽略会让使用者以为它生效了。
 				return nil, "", nil, fmt.Errorf("不认识的参数: -%c", c)

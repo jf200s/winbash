@@ -38,6 +38,8 @@ func init() {
 		"ls":    Ls,
 		"cat":   catBuiltin,
 		"grep":  grepBuiltin,
+		"egrep": egrepBuiltin,
+		"fgrep": fgrepBuiltin,
 		"which": WhichCmd,
 	}
 }
@@ -64,4 +66,19 @@ func catBuiltin(ctx context.Context, cwd string, argv []string, out, errw io.Wri
 
 func grepBuiltin(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int {
 	return Grep(ctx, cwd, argv, interp.HandlerCtx(ctx).Stdin, out, errw)
+}
+
+// egrepBuiltin / fgrepBuiltin 是 grep 的两个历史同义词:egrep = grep -E、fgrep = grep -F。
+//
+// 为什么不交给 ③ 层去找 Git Bash 里那两个:它们在 usr\bin 里是**无扩展名**的 28 字节
+// wrapper 脚本,而 Windows 的 CreateProcess 执行不了无扩展名的文件 —— 找到了也跑不起来。
+// 映射到我们自己的 grep 既省一次 spawn,又是同一套方言处理(含 Perl 简写的显式拒收)。
+//
+// 来源:oils spec 的 `spec/pipeline.test.sh`(`echo a | egrep '[0-9]+'`)。
+func egrepBuiltin(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int {
+	return Grep(ctx, cwd, append([]string{"-E"}, argv...), interp.HandlerCtx(ctx).Stdin, out, errw)
+}
+
+func fgrepBuiltin(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int {
+	return Grep(ctx, cwd, append([]string{"-F"}, argv...), interp.HandlerCtx(ctx).Stdin, out, errw)
 }

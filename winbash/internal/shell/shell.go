@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -182,7 +183,83 @@ func (s *Session) callGuard(ctx context.Context, args []string) ([]string, error
 		}
 	}
 
+	// `echo -en …`:mvdan/sh 的 echo 只认单个 -n/-e/-E,拿到组合会把整串当**文本**打印。
+	if expanded, ok := splitEchoFlags(args); ok {
+		return expanded, nil
+	}
+
+	// `cd /c/Users` 与 `cd /`:cd 是 mvdan/sh 的内建,走不到我们的 OpenHandler,
+	// 于是 POSIX 路径在这里一直失效(细则见 normalizeCdPath)。
+	if len(args) == 2 && args[0] == "cd" {
+		if fixed, ok := normalizeCdPath(interp.HandlerCtx(ctx).Dir, args[1]); ok {
+			return []string{"cd", fixed}, nil
+		}
+	}
+
 	return args, nil
+}
+
+// splitEchoFlags 把 `echo -en` 这类**组合开关**拆成 `-e -n`。
+//
+// mvdan/sh 的 echo 只认单个 -n/-e/-E;拿到组合它会把它当普通文本打印出来:
+//
+//	echo -en "a\nb"   →  "-en a\nb"     (真 bash 给两行 a / b)
+//
+// 这是静默错值,而 echo 是 AI 用得最多的命令。这里只动参数、不改 echo 的行为,
+// 所以拆开之后走的还是 mvdan/sh 自己那套语义。
+// 来源:oils spec `spec/builtin-echo.test.sh`。
+func splitEchoFlags(args []string) ([]string, bool) {
+	if len(args) < 2 || args[0] != "echo" {
+		return nil, false
+	}
+	flags := args[1]
+	if len(flags) < 3 || flags[0] != '-' {
+		return nil, false // 单个 -n/-e/-E 本来就能用,不碰
+	}
+	for _, c := range flags[1:] {
+		switch c {
+		case 'e', 'n', 'E':
+		default:
+			return nil, false // 混了别的字符(例如 `-enx`)—— 交给 echo 自己报错
+		}
+	}
+
+	out := make([]string, 0, len(args)+len(flags)-1)
+	out = append(out, "echo")
+	for _, c := range flags[1:] {
+		out = append(out, "-"+string(c))
+	}
+	return append(out, args[2:]...), true
+}
+
+// normalizeCdPath 把 `cd` 的 POSIX 路径参数换成 Windows 形式。
+//
+// 为什么要在这里做:spec §8 要求"两种写法都接受",但**文件层**的两种写法是靠
+// OpenHandler 拦的 —— `cd` 到不了那里,它是 mvdan/sh 的内建,直接改 runner 的当前目录。
+// 实测后果(两条都是 oils spec 抓出来的):
+//
+//	cd /c/Users  →  cd: no such file or directory: "/c/Users"
+//	cd /         →  **静默什么都不做**(`cd / && pwd` 打印的还是原目录)
+//
+// 只处理"以 / 开头"的写法:相对路径、`-`、`~`、以及 Windows 形式全部原样放行。
+func normalizeCdPath(cwd, arg string) (string, bool) {
+	if !strings.HasPrefix(arg, "/") {
+		return "", false
+	}
+	if arg == "/" {
+		// 单个 / 视作当前盘根:`cd /` 在 Windows 上最接近的语义就是它。
+		if vol := filepath.VolumeName(cwd); vol != "" {
+			return vol + `\`, true
+		}
+		return "", false
+	}
+	// `/c/Users/…` 这类 POSIX 盘符写法交给 ResolvePath —— 它已经被 ①/② 层共用,
+	// 不必在这里再写一份路径规则。
+	abs, err := builtins.ResolvePath(cwd, arg)
+	if err != nil {
+		return "", false
+	}
+	return abs, true
 }
 
 // printfGuard 拦住 mvdan/sh 在 Windows 上的静默缺口:`printf -v` 不被支持,// 而它**不报错** —— 会把 `-v` 当成普通参数原样输出,stdout 变成 "-v",
