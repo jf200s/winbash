@@ -215,7 +215,7 @@ AI 会写 `/c/Users/Test User` 也可能写 `C:\Users\Test User`。文件层通�
 
 ```
 winbash -c '…'      ← client 进程，每次新建，~15ms
-      │  named pipe（复用 pwshx 协议：4 字节小端长度 + UTF-8 JSON）
+      │  TCP loopback（协议：4 字节小端长度 + UTF-8 JSON）
       ▼
 winbash daemon       ← 常驻，进程内持有 mvdan/sh interp 实例
       ├─ interp 状态：变量、cwd
@@ -234,7 +234,7 @@ winbash daemon       ← 常驻，进程内持有 mvdan/sh interp 实例
 
 ## 10. 测试策略
 
-本项目的核心承诺是"不翻车",因此它**必须可被测试抓住**,否则只是口号。四类回归:
+本项目的核心承诺是"不翻车",因此它**必须可被测试抓住**,否则只是口号。五类回归:
 
 | 类别 | 断言什么 | 例 |
 |---|---|---|
@@ -242,12 +242,13 @@ winbash daemon       ← 常驻，进程内持有 mvdan/sh interp 实例
 | **值正确性** | 不出现有歧义的值 | 断言拿到 `10` 而非 `0xa`(第二类是灵魂) |
 | **管道一致性** | ① 层命令在管道里的行为与 bash 一致 | `ls \| wc -l` 的数对得上 |
 | **错误路径** | 退出码非零 + 错误三行式 | 不存在的命令、路径、权限不足 |
+| **bash 内建语义一致性** | 纯 shell 语义逐个与真 bash 一致 | 语料取 `pure-bash-bible` 的字符串/数组/参数展开章节 |
 
 测试从 Git Bash 调用执行(沿用 pwshx 的 `smoke-gitbash.sh` 模式)。
 
 ## 11. 工程结构
 
-- Go,单二进制,**唯一第三方依赖 `mvdan.cc/sh/v3`**
+- Go,单二进制,**唯一直接依赖 `mvdan.cc/sh/v3`**(实测会带入 `golang.org/x/sys`、`golang.org/x/term` 两个间接依赖)
 - PowerShell 侧脚本用 `go:embed` 编进 exe(沿用 pwshx 做法,exe 可单独拷走)
 - 目录划分:`client` / `daemon` / `builtins`(① 层)/ `winmgmt`(② 层)/ `pwsh`(子进程管理)
 - **依赖镜像必须配 `goproxy.cn`**:`proxy.golang.org` 在本机不通(实测超时)
@@ -265,6 +266,14 @@ winbash daemon       ← 常驻，进程内持有 mvdan/sh interp 实例
    若 Git Bash 缺失,这些命令会落到 ④ 层报错(明确提示,不静默)。
 2. **② 层比纯 Win32 调用慢** —— 转 pwsh 的往返约 1–2 ms。可接受;若将来某个命令成为
    热点,可单独下移到纯 Go 实现,接口不变。
-3. **`mvdan/sh` 的行为与真 bash 存在已知差异** —— 主判据是"AI 熟悉的子集",不承诺
-   全兼容。差异若影响 AI 常用写法,以测试用例固化并逐个修。
+3. **`mvdan/sh` 与真 bash 存在已实测的缺口** —— 用 `pure-bash-bible` 的字符串/数组/参数展开章节
+   当语料实测 40 条,**38 条一致,2 条不一致**,且**两条的失败方式都是静默的**:
+
+   | 写法 | mvdan/sh v3.14.1 | 真 bash |
+   |---|---|---|
+   | `printf -v out '%s-%s' a b` | 静默输出 `-v` | `a-b` |
+   | `diff <(echo a) <(echo a)` | 把 `TODO: support process substitution on Windows` 打到 stdout | `same` |
+
+   这两条必须由 ④ 层**明确报错**拦住,不允许静默降级——它们正是"看起来成功了"的那类失败。
+   其余差异若影响 AI 常用写法,以测试用例固化后逐个补。
 4. **本机特有性** —— 路径、编码、进程启动成本都强依赖平台,只在 Windows 11 上验证过。
