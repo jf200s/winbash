@@ -65,6 +65,16 @@ else
 fi
 check "Git Bash 的 sed 可用" "world" "$($EXE -c 'echo hello | sed s/hello/world/')"
 
+echo "-- 语料扫描发现的缺口(逐条与真 bash 对照,自动化版见 internal/shell/corpus_test.go)"
+check "find 来自 Git Bash 的 usr/bin" "1" "$($EXE -c 'which find' | grep -c 'usr.bin.find')"
+check "find -name 不被 MSYS 再展开"   "./go.mod" "$($EXE -c "find . -maxdepth 1 -name '*.mod'")"
+check "sort 是 GNU 的(不是 System32 的)" "1" "$($EXE -c 'sort --version 2>&1 | head -1 | grep -c GNU')"
+check "printf | sort 不乱码"          "a"  "$($EXE -c "printf 'b\na\n' | sort | head -1")"
+check "xargs 能 exec echo"            "2"  "$($EXE -c 'echo a b | xargs -n1 echo | wc -l' | tr -d ' ')"
+check "command -v 认得 ① 层内建"      "ls" "$($EXE -c 'command -v ls')"
+check "which 认得四层"                "3"  "$($EXE -c 'which ls svc git | wc -l' | tr -d ' ')"
+check "锚定替换被拦下"                "2"  "$($EXE -c 'v=prefix-x; echo "${v/#prefix/root}"' >/dev/null 2>&1; echo $?)"
+
 echo "-- 第四类:错误路径"
 check "未知命令 → 127"       "127"   "$($EXE -c 'definitely-not-a-command-xyz' >/dev/null 2>&1; echo $?)"
 check "grep 无匹配 → 1"      "1"     "$($EXE -c 'ls | grep zzz' >/dev/null 2>&1; echo $?)"
