@@ -1,0 +1,6 @@
+# 构建产物
+winbash/winbash.exe
+*.test
+
+# agent 框架的本地运行状态（非源码）
+.reasonix/
