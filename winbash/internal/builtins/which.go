@@ -42,11 +42,15 @@ func Which(cmd, searchPath string) (string, bool) {
 	return "", false
 }
 
-// findExecutable 检查 base 本身或 base+<扩展名> 是否存在。
+// findExecutable 依次尝试:自带扩展名的写法、PATHEXT 拼出来的名字、无扩展名的 shebang 脚本。
 //
-// 只认 PATHEXT 里列出的扩展名(跟 cmd.exe 一致):PATH 目录里同名的普通文件
-// (README、许可证之类)不该被当成命令,那会让 ③ 层"找到一个跑不起来的东西"。
-// 自带扩展名的写法(probe-tool.exe)则只查它本身,不去拼第二个扩展名。
+// PATHEXT 那条跟 cmd.exe 一致:PATH 目录里同名的普通文件(README、许可证之类)
+// 不该被当成命令,那会让 ③ 层"找到一个跑不起来的东西"。
+//
+// 无扩展名那条是本轮补的:Git Bash 的 usr\bin 里有 **44 个**这种脚本
+// (ldd、bzgrep、c_rehash、bzless …),它们靠 shebang 说明自己是什么。
+// 判据就是头两个字节是 `#!` —— 比"在 PATH 里就当命令"稳得多。
+// (找到只是第一步,执行它们还得靠 Git Bash,见 shell.runExternal。)
 func findExecutable(base string, exts []string) (string, bool) {
 	if filepath.Ext(base) != "" {
 		if st, err := os.Stat(base); err == nil && !st.IsDir() {
@@ -61,7 +65,29 @@ func findExecutable(base string, exts []string) (string, bool) {
 			return p, true
 		}
 	}
+
+	if isScript(base) {
+		return base, true
+	}
 	return "", false
+}
+
+// isScript 报告 p 是不是一个以 shebang 开头的文件。
+//
+// 只读头两个字节,所以再大的文件也不会被拖进来;文件不存在、读不出来、
+// 或者比两个字节还短,一律当"不是脚本"(那种情况下去执行它本来也没意义)。
+func isScript(p string) bool {
+	f, err := os.Open(p)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	var head [2]byte
+	if _, err := io.ReadFull(f, head[:]); err != nil {
+		return false
+	}
+	return head[0] == '#' && head[1] == '!'
 }
 
 // pathExts 返回可执行扩展名列表(小写、带点)。读不到 PATHEXT 就用默认值。

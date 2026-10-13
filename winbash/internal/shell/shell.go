@@ -396,10 +396,39 @@ func (s *Session) runExternal(ctx context.Context, args []string, hc interp.Hand
 		return interp.ExitStatus(errs.ExitNotFound)
 	}
 
+	// MSYS 的**无扩展名脚本**(usr\bin 里有 44 个)不能直接交给 CreateProcess ——
+	// Windows 只认 PE 文件。它们得由 MSYS 自己的 env.exe 启动:env 会读 shebang 找解释器,
+	// 而这件事**不能**靠扩展名猜 —— `c_rehash` 是 Perl、`bzgrep` 是 sh。
+	//
+	// 试过但**不行**的两条路(都实测过):
+	//
+	//	`bash <script>`            → 强行用 shell 解析它,Perl 脚本会得到
+	//	                              `line 15: my: command not found`
+	//	`bash -c 'exec "$0" "$@"'` → 那串里的双引号在 Windows 命令行转义下会被搞坏,
+	//	                              bash 报出 `cwd/$0 $@\` 这种怪名字
+	//
+	// 只在"目标没有扩展名"时才走这条,所以 .exe/.bat 的常规路径一点没被碰。
+	argv0 := abs
+	var leading []string
+	if filepath.Ext(abs) == "" {
+		envExe := ""
+		if usrBin := gitBashUsrBin(); usrBin != "" {
+			envExe = filepath.Join(usrBin, "env.exe")
+		}
+		if envExe == "" {
+			fmt.Fprintln(hc.Stderr, errs.Errorf(args[0],
+				"这是一个靠 shebang 运行的脚本(没有 .exe 扩展名),而 Windows 自己执行不了它",
+				"这台机器上找不到 Git Bash;装上它(或让 "+`C:\Program Files\Git\usr\bin\env.exe`+" 存在)再试"))
+			return interp.ExitStatus(errs.ExitNoExec)
+		}
+		// 反斜杠转成正斜杠:MSYS 认 `C:/…`。
+		argv0, leading = envExe, []string{filepath.ToSlash(abs)}
+	}
+
 	// stderr 边转发边留尾:已知坑的识别靠它(见下),但输出不能延迟。
 	tail := tailWriter(hc.Stderr, 4<<10)
 
-	cmd := exec.CommandContext(ctx, abs, args[1:]...)
+	cmd := exec.CommandContext(ctx, argv0, append(append([]string{}, leading...), args[1:]...)...)
 	cmd.Dir = hc.Dir
 	cmd.Stdin = hc.Stdin
 	cmd.Stdout = hc.Stdout
