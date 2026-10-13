@@ -75,3 +75,18 @@ func DecodeResponse(b []byte) (Response, error) {
 	err := json.Unmarshal(b, &resp)
 	return resp, err
 }
+
+// EncodeResponse 把响应序列化成 JSON。
+//
+// Ruling R8：Task 1 只给了 Encode(请求) / DecodeResponse(响应)，方向不对称 ——
+// daemon 没有请求解码器、client 没有响应编码器。Task 2 补齐这两个方向。
+func EncodeResponse(resp Response) ([]byte, error) {
+	return json.Marshal(resp)
+}
+
+// DecodeRequest 解析客户端发来的请求。
+func DecodeRequest(b []byte) (Request, error) {
+	var req Request
+	err := json.Unmarshal(b, &req)
+	return req, err
+}
