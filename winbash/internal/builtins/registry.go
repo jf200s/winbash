@@ -26,10 +26,26 @@ type Builtin func(ctx context.Context, cwd string, argv []string, out io.Writer,
 // PATH 里排得更前面的 exe 决定。
 //
 // 新增 ① 层命令时在这里加一行。
-var Registry = map[string]Builtin{
-	"ls":   Ls,
-	"cat":  catBuiltin,
-	"grep": grepBuiltin,
+// Registry 是 ① 层的命令表。
+//
+// 用 init 赋值而不是 `var Registry = map[…]` 字面量:WhichCmd 是表里的一员,
+// 而它要问「这个名字是不是 ① 层命令」—— 字面量形式与 IsBuiltin 一起构成
+// 包级**初始化循环**(Go 的循环检测把函数体内的引用也算进去)。
+var Registry map[string]Builtin
+
+func init() {
+	Registry = map[string]Builtin{
+		"ls":    Ls,
+		"cat":   catBuiltin,
+		"grep":  grepBuiltin,
+		"which": WhichCmd,
+	}
+}
+
+// IsBuiltin 报告 name 是不是 ① 层的命令名。
+func IsBuiltin(name string) bool {
+	_, ok := Registry[name]
+	return ok
 }
 
 // catBuiltin / grepBuiltin 把 Registry 里统一的 Builtin 形状(没有 stdin)

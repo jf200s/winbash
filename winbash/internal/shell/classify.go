@@ -31,7 +31,7 @@ func classify(cmd string, searchPath string) layer {
 	if _, ok := winmgmt.Registry[cmd]; ok {
 		return layerWinmgmt
 	}
-	if _, ok := Which(cmd, searchPath); ok {
+	if _, ok := builtins.Which(cmd, searchPath); ok {
 		return layerPath
 	}
 	return layerMissing

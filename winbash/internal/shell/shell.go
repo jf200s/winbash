@@ -99,7 +99,7 @@ func NewSession() *Session {
 		// 将来若要支持 `echo x | winbash -c 'cat'`,把这里换成从 client 转发的内容即可。
 		interp.StdIO(bytes.NewReader(nil), s.stdout, s.stderr),
 		interp.ExecHandler(s.execHandler),
-		interp.CallHandler(printfGuard),
+		interp.CallHandler(s.callGuard),
 	)
 	if err != nil {
 		// interp.New 只在 RunnerOption 非法时报错;上面的选项都是常量,出错即编程错误。
@@ -119,6 +119,10 @@ func (s *Session) execHandler(ctx context.Context, args []string) error {
 		return nil
 	}
 	hc := interp.HandlerCtx(ctx)
+
+	// 把会话的搜索路径交给 ① 层(目前只有 `which` 需要它)。
+	// 走 ctx 而不是改 Builtin 的形状 —— Registry 里只有一种形状是它的价值所在。
+	ctx = builtins.WithSearchPath(ctx, s.searchPath)
 
 	switch classify(args[0], s.searchPath) {
 	case layerBuiltin:
@@ -147,8 +151,41 @@ func (s *Session) execHandler(ctx context.Context, args []string) error {
 	return s.runExternal(ctx, args, hc)
 }
 
-// printfGuard 拦住 mvdan/sh 在 Windows 上的静默缺口:`printf -v` 不被支持,
-// 而它**不报错** —— 会把 `-v` 当成普通参数原样输出,stdout 变成 "-v",
+// callGuard 是所有简单命令在执行前都会经过的一道窄门。
+//
+// 它只做两件事,而且都限定在「mvdan/sh 的内建会**静默给出错结果**」这一种情况下:
+//
+//  1. `printf -v`:Windows 上不支持,原逻辑会把 `-v` 当普通参数原样输出。
+//  2. `command -v X`:原逻辑只查**进程 PATH** 与它自己的内建表 —— 于是对
+//     winbash 自己的内建(`ls`)和只在 Git Bash usr\bin 里的工具(`sed`)都会说"没有"。
+//     AI 常写 `command -v X >/dev/null && …` 做存在性判断,这一误判是**静默**的。
+//     这里把这种"必然答错"的调用改写成我们的 `which X`(它认识四层)——
+//     其余一律不动,所以不存在语义回归。
+func (s *Session) callGuard(ctx context.Context, args []string) ([]string, error) {
+	if guarded, err := printfGuard(ctx, args); err != nil || len(guarded) == 0 {
+		return guarded, err
+	}
+
+	if len(args) == 3 && args[0] == "command" && args[1] == "-v" {
+		name := args[2]
+		_, isBuiltin := builtins.Registry[name]
+		_, isWinmgmt := winmgmt.Registry[name]
+		if isBuiltin || isWinmgmt {
+			return []string{"which", name}, nil
+		}
+		if _, err := exec.LookPath(name); err != nil {
+			// 进程 PATH 里没有,但我们的搜索路径(git bash 的 usr\bin)里有:
+			// 原逻辑会说"没有",而 winbash 明明跑得动它。
+			if _, found := builtins.Which(name, s.searchPath); found {
+				return []string{"which", name}, nil
+			}
+		}
+	}
+
+	return args, nil
+}
+
+// printfGuard 拦住 mvdan/sh 在 Windows 上的静默缺口:`printf -v` 不被支持,// 而它**不报错** —— 会把 `-v` 当成普通参数原样输出,stdout 变成 "-v",
 // 使用者看到命令"成功"了。这类"看起来成功了"的失败远比"命令找不到"恶劣(spec §13.3)。
 //
 // 用 CallHandler 而不是 ExecHandler:printf 是 mvdan/sh 的**内建**,
@@ -190,6 +227,53 @@ func rejectProcessSubstitution(prog *syntax.File) error {
 	return found
 }
 
+// rejectUnsupportedParamExpansion 拦住 mvdan/sh 没有实现、而且**会静默给错值**的参数展开。
+//
+// 当前只有一条:bash 4 的锚定替换 —— `${v/#前缀/替换}`(只替换开头)与
+// `${v/%后缀/替换}`(只替换结尾)。实测 mvdan/sh 把 `#前缀` 当成字面去找,
+// 找不到就**原样输出未改动的值**、退出码为 0:语料扫描里 `v=prefix-x; echo ${v/#prefix/root}`
+// 得到 `prefix-x`,而真 bash 给 `root-x`。
+//
+// 与 `<(cmd)` 同一类:不报错的失败比报错恶劣得多。所以拦在解析之后、运行之前。
+// 注意别误伤 mvdan/sh **确实支持**的邻居:`${v#pre}`(去前缀)、`${v%post}`(去后缀)、
+// `${v/x/y}`(普通替换)都不带这个锚定标记,不会命中这里。
+func rejectUnsupportedParamExpansion(prog *syntax.File) error {
+	var found error
+	syntax.Walk(prog, func(node syntax.Node) bool {
+		if found != nil {
+			return false
+		}
+		pe, ok := node.(*syntax.ParamExp)
+		if !ok || pe.Repl == nil {
+			return true
+		}
+		switch wordHead(pe.Repl.Orig) {
+		case "#":
+			found = errors.New(errs.Errorf("shell",
+				"这台机器上不支持 ${变量/#前缀/替换} 这类锚定替换(mvdan/sh 未实现,而且会静默原样输出)",
+				`改用两步表达同一个意思: v=prefix-x; echo "root${v#prefix}"`))
+		case "%":
+			found = errors.New(errs.Errorf("shell",
+				"这台机器上不支持 ${变量/%后缀/替换} 这类锚定替换(mvdan/sh 未实现,而且会静默原样输出)",
+				`改用两步表达同一个意思: v=x-suffix; echo "${v%suffix}tail"`))
+		}
+		return true
+	})
+	return found
+}
+
+// wordHead 取一个词开头的字面首字符(只处理以字面开头的常见写法)。
+func wordHead(w *syntax.Word) string {
+	if w == nil || len(w.Parts) == 0 {
+		return ""
+	}
+	lit, ok := w.Parts[0].(*syntax.Lit)
+	if !ok || lit.Value == "" {
+		return ""
+	}
+	return lit.Value[:1]
+}
+
 // tailWriter 把写出的内容原样转发,同时留下最后 limit 字节备用。
 //
 // 用途是**识别已知坑**:判断 `bash` 是不是那个损坏的 WSL relay,得看它说了什么。
@@ -226,12 +310,12 @@ func (t *tailBuffer) String() string {
 
 // runExternal 是 ③ 层(命中真实 PATH)与 ④ 层(哪个都没有)的实现。
 func (s *Session) runExternal(ctx context.Context, args []string, hc interp.HandlerContext) error {
-	abs, ok := Which(args[0], s.searchPath)
+	abs, ok := builtins.Which(args[0], s.searchPath)
 	if !ok {
 		// ④ 层:明确报错 + 下一步。不是静默失败,也不是让 mvdan/sh 丢一句
 		// "command not found" 了事 —— 那句话没告诉使用者接下来该做什么。
 		fmt.Fprintln(hc.Stderr, errs.Errorf(args[0], "找不到这个命令",
-			"确认命令名有没有写错;③ 层会搜索真实 PATH 与 Git Bash 的 usr\\bin,可用 winbash -c 'which "+args[0]+"' 自查"))
+			"确认命令名有没有写错;③ 层会搜索 Git Bash 的 usr\\bin 与真实 PATH,可用 winbash -c 'which "+args[0]+"' 自查"))
 		return interp.ExitStatus(errs.ExitNotFound)
 	}
 
@@ -243,7 +327,7 @@ func (s *Session) runExternal(ctx context.Context, args []string, hc interp.Hand
 	cmd.Stdin = hc.Stdin
 	cmd.Stdout = hc.Stdout
 	cmd.Stderr = tail
-	cmd.Env = envList(hc.Env)
+	cmd.Env = envList(hc.Env, s.searchPath)
 
 	err := cmd.Run()
 	if err == nil {
@@ -276,21 +360,73 @@ func (s *Session) runExternal(ctx context.Context, args []string, hc interp.Hand
 	return interp.ExitStatus(errs.ExitNoExec)
 }
 
-// envList 把 interp 的环境展开成 os/exec 要的形式。
+// envList 把 interp 的环境展开成 os/exec 要的形式,并把 PATH 换成我们构造的 searchPath。
 //
 // 用 hc.Env 而不是 os.Environ():shell 里的 `export FOO=bar` 必须对 ③ 层的子进程可见 ——
 // 否则「在 winbash 里导出变量再跑 git」会是**静默无效**的,而那正是本项目要消灭的失败形态。
 // 只带导出过的变量,与 POSIX 的语义一致(局部变量不给子进程)。
-func envList(env expand.Environ) []string {
+//
+// PATH 必须换成 searchPath:③ 层用 searchPath **定位**命令,而子进程若拿到进程 PATH,
+// 就会出现「定位用一条路径、执行用另一条」的分裂。实测后果:
+//
+//	`xargs -n1 echo`  →  /usr/bin/xargs: echo: No such file or directory
+//	`ls | xargs -n1 echo | wc -l`  →  0(静默!应当是列数)
+//
+// 因为 xargs 要 exec 的 `echo` 只在 Git Bash 的 usr\bin 里。
+// 这**不是**改进程环境:改的只是我们派生的子进程的 cmd.Env(Global Constraints 管的是前者)。
+//
+// 另外补一条 `MSYS=noglob`,理由见 msysWithNoGlob。
+func envList(env expand.Environ, searchPath string) []string {
 	var out []string
+	sawPath := false
+	msys := ""
 	env.Each(func(name string, vr expand.Variable) bool {
 		if name == "" || !vr.Exported || !vr.IsSet() {
 			return true
 		}
-		out = append(out, name+"="+vr.String())
+		switch {
+		case strings.EqualFold(name, "PATH"):
+			sawPath = true
+			out = append(out, name+"="+searchPath)
+		case strings.EqualFold(name, "MSYS"):
+			// 先留着不写出去:下面要往这个值里加 noglob,调用方已有的选项得保留。
+			msys = vr.String()
+		default:
+			out = append(out, name+"="+vr.String())
+		}
 		return true
 	})
-	return out
+	if !sawPath && searchPath != "" {
+		// 环境里没有 PATH 时也得给一条,否则子进程连 system32 都找不到。
+		out = append(out, "PATH="+searchPath)
+	}
+	return append(out, "MSYS="+msysWithNoGlob(msys))
+}
+
+// msysWithNoGlob 把 noglob 加进 MSYS 选项串(保留调用方已有的选项)。
+//
+// Cygwin/MSYS2 的 runtime 在「调用方不是 Cygwin 程序」时会**自己把 argv 里的通配符
+// 展开一遍** —— 它怕原生 Windows 调用方漏了展开。我们从原生进程启动 /usr/bin/find,
+// 于是引号本该保护的模式被它展开掉了:
+//
+//	find . -maxdepth 1 -name '*.go'
+//	→ /usr/bin/find: paths must precede expression: `classify_test.go'
+//	→ /usr/bin/find: possible unquoted pattern after predicate `-name'?
+//
+// 同一个命令在 Git Bash 里是好的:调用方也是 Cygwin 进程,runtime 不重复展开。
+// `noglob` 关掉的正是这一层 —— 关掉之后 argv 由**我们**(真正的 shell)展开,
+// MSYS 工具只负责收,行为与它们在真 bash 下一致。
+func msysWithNoGlob(cur string) string {
+	cur = strings.TrimSpace(cur)
+	if cur == "" {
+		return "noglob"
+	}
+	for _, opt := range strings.Split(cur, ":") {
+		if strings.EqualFold(strings.TrimSpace(opt), "noglob") {
+			return cur
+		}
+	}
+	return cur + ":noglob"
 }
 
 // psEngine 返回 ② 层的常驻 pwsh,第一次真的用到时才启动。
@@ -363,8 +499,11 @@ func (s *Session) Run(ctx context.Context, script string, jsonOut bool) (stdout 
 	if perr != nil {
 		return "", 2, []string{perr.Error()}
 	}
-	// 解析之后、运行之前:拦住 Windows 上会静默降级的语法(进程替换)。
+	// 解析之后、运行之前:拦住 Windows 上会静默降级的语法(进程替换、未实现的参数展开)。
 	if rerr := rejectProcessSubstitution(prog); rerr != nil {
+		return "", 2, []string{rerr.Error()}
+	}
+	if rerr := rejectUnsupportedParamExpansion(prog); rerr != nil {
 		return "", 2, []string{rerr.Error()}
 	}
 

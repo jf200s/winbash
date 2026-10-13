@@ -6,9 +6,6 @@ import (
 	"strings"
 )
 
-// defaultPathExt 是没有 PATHEXT 时的可执行扩展名顺序(与 cmd.exe 的默认值一致)。
-const defaultPathExt = ".COM;.EXE;.BAT;.CMD"
-
 // gitBashUsrBinCandidates 是 Git Bash 的 usr\bin 可能所在的位置。
 //
 // 本机实测(spec 第 1 节):真 Git Bash 在 `C:\Program Files\Git\bin\bash.exe`,
@@ -19,34 +16,43 @@ var gitBashUsrBinCandidates = []string{
 	`C:\Program Files (x86)\Git\usr\bin`,
 }
 
-// BuildSearchPath 在真实 PATH 之后追加 Git Bash 的 usr\bin(若存在)。
+// BuildSearchPath 构造 ③ 层的搜索路径:Git Bash 的 usr\bin **在最前**,后面跟真实 PATH。
 //
-// 为什么要加它:sed / awk / xargs 这些是硬骨头,重写不划算,而 Git Bash 里
-// 现成有一套(而且 AI 要跑 git,Git Bash 必然在这台机器上)。
+// 顺序不是小事 —— 这是语料扫描实测出来的:
+// Windows 的 System32 里也有 `sort.exe` 与 `find.exe`,而它们与 Unix 同名工具**语义完全不同**。
+// 把它们排在前面等于让 AI 的肌肉记忆必然失效:
 //
-// **返回新字符串,绝不改进程环境**:Global Constraints 明令不改 os.Environ() ——
-// 从 winbash 里启动的其他进程不该被我们塞进 Git Bash 的路径。
-// 这个函数的全部作用域就是「给 Which 用」。
+//	`find . -maxdepth 1 -name '*.mod'`  →  FIND: 参数格式不正确   (Windows 的 find 是"在文件里找字符串")
+//	`printf 'b\na\n' | sort`            →  乱码                    (Windows 的 sort 按本地代码页处理)
+//
+// 依据不是偏好,是**与 Git Bash 保持一致**:实测 Git Bash 自己解析 `sort`/`find` 拿到的是
+// `/usr/bin/{sort,find}`,而 AI 对这些工具长相的预期正是从 Git Bash 来的。
+//
+// 仍然**返回新字符串,绝不改进程环境**(Global Constraints):这条路径只活在 Session 里,
+// 以及我们派生的 ③ 层子进程的 cmd.Env 里(见 envList)。
 func BuildSearchPath(realPath string) string {
 	extra := gitBashUsrBin()
 	if extra == "" {
 		return realPath
 	}
 
-	// 已经在 PATH 里就不追加。重复追加会让搜索路径每调用一次长一截。
-	for _, dir := range filepath.SplitList(realPath) {
-		if dir == "" {
+	// 把输入里的同一个目录去掉,再前置 —— 这样无论输入是什么样,
+	// 结果都是「usr\bin 恰好出现一次,而且在最前」。
+	parts := filepath.SplitList(realPath)
+	kept := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p == "" {
 			continue
 		}
-		if strings.EqualFold(filepath.Clean(dir), filepath.Clean(extra)) {
-			return realPath
+		if strings.EqualFold(filepath.Clean(p), filepath.Clean(extra)) {
+			continue
 		}
+		kept = append(kept, p)
 	}
-
-	if realPath == "" {
+	if len(kept) == 0 {
 		return extra
 	}
-	return realPath + string(filepath.ListSeparator) + extra
+	return extra + string(filepath.ListSeparator) + strings.Join(kept, string(filepath.ListSeparator))
 }
 
 // gitBashUsrBin 返回存在的 Git Bash usr\bin,没有则返回空串。
@@ -57,76 +63,4 @@ func gitBashUsrBin() string {
 		}
 	}
 	return ""
-}
-
-// Which 在给定的搜索路径里定位一个可执行文件,返回它的绝对位置。
-//
-// 刻意**不用** exec.LookPath:后者只认进程 PATH,而我们构造的搜索路径
-// (真实 PATH + Git Bash 的 usr\bin)不写回环境。这一条是 R3 决定的核心 ——
-// ③ 层能看见的工具集由这里决定,与进程环境无关。
-func Which(cmd, searchPath string) (string, bool) {
-	if cmd == "" {
-		return "", false
-	}
-	exts := pathExts()
-
-	// 自带路径的写法:只查它本身,不去 PATH 里找(与 bash 的语义一致)。
-	if strings.ContainsAny(cmd, `/\`) {
-		return findExecutable(cmd, exts)
-	}
-
-	for _, dir := range filepath.SplitList(searchPath) {
-		if dir == "" {
-			continue
-		}
-		if p, ok := findExecutable(filepath.Join(dir, cmd), exts); ok {
-			return p, true
-		}
-	}
-	return "", false
-}
-
-// findExecutable 检查 base 本身或 base+<扩展名> 是否存在。
-//
-// 只认 PATHEXT 里列出的扩展名(跟 cmd.exe 一致):PATH 目录里同名的普通文件
-// (README、许可证之类)不该被当成命令,那会让 ③ 层"找到一个跑不起来的东西"。
-// 自带扩展名的写法(probe-tool.exe)则只查它本身,不去拼第二个扩展名。
-func findExecutable(base string, exts []string) (string, bool) {
-	if filepath.Ext(base) != "" {
-		if st, err := os.Stat(base); err == nil && !st.IsDir() {
-			return base, true
-		}
-		return "", false
-	}
-
-	for _, e := range exts {
-		p := base + e
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			return p, true
-		}
-	}
-	return "", false
-}
-
-// pathExts 返回可执行扩展名列表(小写、带点)。读不到 PATHEXT 就用默认值。
-func pathExts() []string {
-	raw := os.Getenv("PATHEXT")
-	if raw == "" {
-		raw = defaultPathExt
-	}
-	var out []string
-	for _, e := range strings.Split(raw, ";") {
-		e = strings.TrimSpace(e)
-		if e == "" {
-			continue
-		}
-		if !strings.HasPrefix(e, ".") {
-			e = "." + e
-		}
-		out = append(out, strings.ToLower(e))
-	}
-	if len(out) == 0 {
-		return strings.Split(strings.ToLower(defaultPathExt), ";")
-	}
-	return out
 }

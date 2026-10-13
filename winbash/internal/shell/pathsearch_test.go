@@ -7,13 +7,22 @@ import (
 	"testing"
 )
 
-// 计划里的 4 个用例照抄自 plan Task 12;后面两条是本轮补的。
+// 计划里的 4 个用例来自 plan Task 12,其中第一条的名称与断言按下面的理由改过;
+// 另外两条是本轮补的。
 
-func TestBuildSearchPathAppendsGitBashUsrBinWhenPresent(t *testing.T) {
+// 这条原名 TestBuildSearchPathAppendsGitBashUsrBinWhenPresent(断言"追加")。
+// 语料扫描实测:追加会让 Windows System32 里的 sort.exe/find.exe 抢先,而它们与
+// Unix 同名工具语义完全不同(`find . -name` 直接报参数格式不正确)。
+// 改为断言**前置** —— 依据是 Git Bash 自己的解析顺序也是 usr\bin 优先。
+func TestBuildSearchPathPutsGitBashUsrBinFirst(t *testing.T) {
 	got := BuildSearchPath(`C:\Windows\system32`)
-	if !strings.Contains(got, filepath.FromSlash("C:/Program Files/Git/usr/bin")) &&
-		!strings.Contains(strings.ToLower(got), `program files\git\usr\bin`) {
-		t.Skipf("Git Bash not installed at the standard location on this machine; path=%q", got)
+	usrBin := gitBashUsrBin()
+	if usrBin == "" {
+		t.Skipf("这台机器上没有标准位置的 Git Bash;path=%q", got)
+	}
+	parts := filepath.SplitList(got)
+	if len(parts) == 0 || !strings.EqualFold(filepath.Clean(parts[0]), filepath.Clean(usrBin)) {
+		t.Fatalf("Git Bash 的 usr\\bin 必须在最前:got=%q want first=%q", got, usrBin)
 	}
 }
 
@@ -25,45 +34,66 @@ func TestBuildSearchPathDoesNotMutateEnviron(t *testing.T) {
 	}
 }
 
-func TestWhichFindsCommandPresentOnPath(t *testing.T) {
-	dir := t.TempDir()
-	exe := filepath.Join(dir, "probe-tool.exe")
-	os.WriteFile(exe, []byte("MZ"), 0o755)
-	if got, ok := Which("probe-tool", dir); !ok || got != exe {
-		t.Fatalf("got %q ok=%v", got, ok)
+// 无论输入里有没有那个目录,结果都必须是「usr\bin 恰好出现一次、而且在最前」。
+// (旧实现是"已有就不追加",现在是从输入里摘掉再前置 —— 两种情况下都不能出现两份。)
+func TestBuildSearchPathKeepsUsrBinExactlyOnceAtFront(t *testing.T) {
+	usrBin := gitBashUsrBin()
+	if usrBin == "" {
+		t.Skip("这台机器上没有标准位置的 Git Bash")
 	}
-}
-
-func TestWhichReportsMissForAbsentCommand(t *testing.T) {
-	if _, ok := Which("definitely-not-installed-xyz", t.TempDir()); ok {
-		t.Fatal("expected a miss")
-	}
-}
-
-// 搜索路径的顺序必须被尊重:同名工具取先出现的那个(NNNN 惯例,PATH 顺序即优先级)。
-func TestWhichRespectsPathOrder(t *testing.T) {
-	first, second := t.TempDir(), t.TempDir()
-	os.WriteFile(filepath.Join(first, "probe-tool.exe"), []byte("MZ"), 0o755)
-	os.WriteFile(filepath.Join(second, "probe-tool.exe"), []byte("MZ"), 0o755)
 
 	sep := string(filepath.ListSeparator)
-	got, ok := Which("probe-tool", first+sep+second)
-	if !ok {
-		t.Fatal("expected a hit")
-	}
-	if got != filepath.Join(first, "probe-tool.exe") {
-		t.Fatalf("PATH order ignored: got %q", got)
+	for _, in := range []string{
+		`C:\Windows\system32`,
+		`C:\Windows\system32` + sep + usrBin,
+		usrBin + sep + `C:\Windows\system32`,
+	} {
+		got := BuildSearchPath(in)
+		n := 0
+		for _, p := range filepath.SplitList(got) {
+			if strings.EqualFold(filepath.Clean(p), filepath.Clean(usrBin)) {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Fatalf("usr\\bin 出现了 %d 次(输入 %q → %q)", n, in, got)
+		}
+		if parts := filepath.SplitList(got); !strings.EqualFold(filepath.Clean(parts[0]), filepath.Clean(usrBin)) {
+			t.Fatalf("usr\\bin 不在最前(输入 %q → %q)", in, got)
+		}
 	}
 }
 
-// 重复追加没有意义,而且会让 PATH 越用越长(每次调用都长一截)。
-func TestBuildSearchPathDoesNotDuplicateExistingEntry(t *testing.T) {
-	base := BuildSearchPath(`C:\Windows\system32`)
-	if base == `C:\Windows\system32` {
-		t.Skip("Git Bash usr\\bin not present on this machine")
+// 这一条钉住整个顺序改动的**主张**:Git Bash 的 usr\bin 必须在 System32 之前,
+// 否则 `sort`/`find` 会被 Windows 的同名工具抢走。
+func TestBuildSearchPathPrefersGitBashOverWindowsSystem32(t *testing.T) {
+	usrBin := gitBashUsrBin()
+	if usrBin == "" {
+		t.Skip("这台机器上没有标准位置的 Git Bash")
 	}
-	again := BuildSearchPath(base)
-	if again != base {
-		t.Fatalf("Git Bash entry was appended twice:\n base=%q\nagain=%q", base, again)
+	got := BuildSearchPath(`C:\Windows\system32`)
+	lower := strings.ToLower(got)
+
+	iUsr := strings.Index(lower, strings.ToLower(usrBin))
+	iSys := strings.Index(lower, `c:\windows\system32`)
+	if iUsr < 0 || iSys < 0 {
+		t.Fatalf("两个目录都该在结果里: %q", got)
+	}
+	if iUsr > iSys {
+		t.Fatalf("Git Bash 的 usr\\bin 排在 System32 之后 —— 这会让 find/sort 被 Windows 版抢走: %q", got)
+	}
+}
+
+// 本机实测:usr\bin 里确实有 sort 与 find;没有它们就说明这台机器的情况不同,
+// 那么上面的顺序主张也就不适用于它。
+func TestGitBashUsrBinCarriesTheConflictingTools(t *testing.T) {
+	usrBin := gitBashUsrBin()
+	if usrBin == "" {
+		t.Skip("这台机器上没有标准位置的 Git Bash")
+	}
+	for _, name := range []string{"sort", "find", "sed", "awk"} {
+		if _, err := os.Stat(filepath.Join(usrBin, name+".exe")); err != nil {
+			t.Skipf("%s 不在 %s 里,跳过(这台机器的 Git Bash 布局不同)", name, usrBin)
+		}
 	}
 }

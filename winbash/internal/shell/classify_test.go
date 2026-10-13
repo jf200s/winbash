@@ -122,3 +122,54 @@ func TestPosixPathTrapIsRecognized(t *testing.T) {
 		t.Fatal("problem line must not be empty")
 	}
 }
+
+// 语料扫描实测的静默缺口:mvdan/sh 不支持 bash 4 的**锚定替换**
+// `${v/#前缀/替换}` 与 `${v/%后缀/替换}`,而且**不报错** ——
+// 它把 `#前缀` 当字面去找,找不到就原样输出未改动的值。
+// 使用者看到的是"替换没生效"?不,他看到的是"值没变但命令成功了",这正是要拦的那一类。
+func TestAnchoredParamReplacementIsRejectedNotSilentlyIgnored(t *testing.T) {
+	for _, script := range []string{
+		`v=prefix-x; echo "${v/#prefix/root}"`,
+		`v=x-suffix; echo "${v/%suffix/tail}"`,
+	} {
+		s := NewSession()
+		out, exit, errsOut := s.Run(context.Background(), script, false)
+		joined := strings.Join(errsOut, "\n")
+
+		if exit == 0 {
+			t.Fatalf("script %q: expected non-zero exit (silently ignored), stdout=%q", script, out)
+		}
+		if out != "" {
+			t.Fatalf("script %q: nothing should reach stdout when rejected, got %q", script, out)
+		}
+		if !strings.Contains(joined, "不支持") {
+			t.Fatalf("script %q: expected an explicit unsupported message, got %q", script, joined)
+		}
+		if !strings.Contains(joined, "#") && !strings.Contains(joined, "%") {
+			t.Fatalf("script %q: the message should name the offending syntax: %q", script, joined)
+		}
+	}
+}
+
+// 与之相邻的、**mvdan/sh 确实支持**的写法不能被误伤:
+// `${v#pre}` 去掉前缀、`${v/x/y}` 普通替换、`${v%post}` 去掉后缀。
+func TestSupportedParamExpansionsStillWork(t *testing.T) {
+	cases := []struct{ script, want string }{
+		{`v=prefix-x; echo "${v#prefix}"`, "-x"},
+		{`v=prefix-x; echo "${v%%-x}"`, "prefix"},
+		{`v=aXbXc; echo "${v/X/-}"`, "a-bXc"},
+		{`v=aXbXc; echo "${v//X/-}"`, "a-b-c"},
+		{`v=abc; echo "${v/a}"`, "bc"},
+	}
+	for _, c := range cases {
+		s := NewSession()
+		out, exit, errsOut := s.Run(context.Background(), c.script, false)
+		if exit != 0 {
+			t.Errorf("script %q: exit=%d errs=%v", c.script, exit, errsOut)
+			continue
+		}
+		if strings.TrimSpace(out) != c.want {
+			t.Errorf("script %q: got %q want %q", c.script, strings.TrimSpace(out), c.want)
+		}
+	}
+}
