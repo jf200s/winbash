@@ -93,6 +93,7 @@ func NewSession() *Session {
 		interp.Env(expand.ListEnviron(os.Environ()...)),
 		interp.StdIO(nil, s.stdout, s.stderr),
 		interp.ExecHandler(s.execHandler),
+		interp.CallHandler(printfGuard),
 	)
 	if err != nil {
 		// interp.New 只在 RunnerOption 非法时报错;上面的选项都是常量,出错即编程错误。
@@ -140,21 +141,102 @@ func (s *Session) execHandler(ctx context.Context, args []string) error {
 	return s.runExternal(ctx, args, hc)
 }
 
+// printfGuard 拦住 mvdan/sh 在 Windows 上的静默缺口:`printf -v` 不被支持,
+// 而它**不报错** —— 会把 `-v` 当成普通参数原样输出,stdout 变成 "-v",
+// 使用者看到命令"成功"了。这类"看起来成功了"的失败远比"命令找不到"恶劣(spec §13.3)。
+//
+// 用 CallHandler 而不是 ExecHandler:printf 是 mvdan/sh 的**内建**,
+// 内建不经过 ExecHandler(那里只在「既不是函数也不是内建」时才被调用)——
+// 想在交给内建之前插手,只有 CallHandler 这一条路。
+func printfGuard(ctx context.Context, args []string) ([]string, error) {
+	if len(args) >= 2 && args[0] == "printf" && args[1] == "-v" {
+		return nil, errors.New(errs.Errorf("printf",
+			"这台机器上不支持 printf -v(它会静默把 -v 当成普通参数输出)",
+			`改用命令替换: var=$(printf '%s' 值)`))
+	}
+	return args, nil
+}
+
+// rejectProcessSubstitution 在**解析之后、运行之前**挡住 `<(cmd)` / `>(cmd)`。
+//
+// 为什么必须提前:Windows 上 mvdan/sh 未实现进程替换,而且会把
+// `TODO: support process substitution on Windows` **打到 stdout** ——
+// 那是一句看起来像输出、实际是未实现标记的东西,正是最恶劣的失败形态。
+// 等运行到那一步才知道就晚了,所以这里走一遍 AST。
+func rejectProcessSubstitution(prog *syntax.File) error {
+	var found error
+	syntax.Walk(prog, func(node syntax.Node) bool {
+		if found != nil {
+			return false
+		}
+		if ps, ok := node.(*syntax.ProcSubst); ok {
+			form := "<(命令)"
+			if ps.Op == syntax.CmdOut {
+				form = ">(命令)"
+			}
+			found = errors.New(errs.Errorf("shell",
+				"这台机器上不支持进程替换 "+form+"(mvdan/sh 未实现,且会把一句 TODO 打到 stdout)",
+				"改用临时文件: 命令 > 临时文件,再对文件做下一步"))
+			return false
+		}
+		return true
+	})
+	return found
+}
+
+// tailWriter 把写出的内容原样转发,同时留下最后 limit 字节备用。
+//
+// 用途是**识别已知坑**:判断 `bash` 是不是那个损坏的 WSL relay,得看它说了什么。
+// 但转发必须实时(不能等进程结束才把 stderr 吐出来),所以是"边转发边留尾巴"。
+func tailWriter(w io.Writer, limit int) *tailBuffer {
+	return &tailBuffer{w: w, limit: limit}
+}
+
+type tailBuffer struct {
+	mu    sync.Mutex
+	w     io.Writer
+	buf   []byte
+	limit int
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	t.buf = append(t.buf, p...)
+	if len(t.buf) > t.limit {
+		t.buf = append([]byte(nil), t.buf[len(t.buf)-t.limit:]...)
+	}
+	t.mu.Unlock()
+	if t.w == nil {
+		return len(p), nil
+	}
+	return t.w.Write(p)
+}
+
+func (t *tailBuffer) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return string(t.buf)
+}
+
 // runExternal 是 ③ 层(命中真实 PATH)与 ④ 层(哪个都没有)的实现。
 func (s *Session) runExternal(ctx context.Context, args []string, hc interp.HandlerContext) error {
 	abs, ok := Which(args[0], s.searchPath)
 	if !ok {
-		// ④ 层。这里只给最基础的可操作错误;已知坑的翻译表(Task 13)接在同一处。
+		// ④ 层:明确报错 + 下一步。不是静默失败,也不是让 mvdan/sh 丢一句
+		// "command not found" 了事 —— 那句话没告诉使用者接下来该做什么。
 		fmt.Fprintln(hc.Stderr, errs.Errorf(args[0], "找不到这个命令",
 			"确认命令名有没有写错;③ 层会搜索真实 PATH 与 Git Bash 的 usr\\bin,可用 winbash -c 'which "+args[0]+"' 自查"))
 		return interp.ExitStatus(errs.ExitNotFound)
 	}
 
+	// stderr 边转发边留尾:已知坑的识别靠它(见下),但输出不能延迟。
+	tail := tailWriter(hc.Stderr, 4<<10)
+
 	cmd := exec.CommandContext(ctx, abs, args[1:]...)
 	cmd.Dir = hc.Dir
 	cmd.Stdin = hc.Stdin
 	cmd.Stdout = hc.Stdout
-	cmd.Stderr = hc.Stderr
+	cmd.Stderr = tail
 	cmd.Env = envList(hc.Env)
 
 	err := cmd.Run()
@@ -162,19 +244,29 @@ func (s *Session) runExternal(ctx context.Context, args []string, hc interp.Hand
 		return nil
 	}
 
+	// 先翻译已知坑,再决定退出码:错误信息本身不该被改写,
+	// 但使用者需要知道「这不是你写错了,是这台机器的环境有坑」。
+	trapLine := ""
+	if problem, remedy, ok := errs.TranslateKnownTrap(args[0], args[1:], tail.String()); ok {
+		trapLine = "\n" + errs.Errorf(args[0], problem, remedy)
+	}
+
 	// 子进程自己的非零退出码原样带回去 —— 这是 bash 的语义(`grep 没匹配 → 1`),
 	// 也是 ③ 层与 ④ 层的分界:跑起来了就不该替它改写结果。
 	var ee *exec.ExitError
 	if errors.As(err, &ee) {
+		if trapLine != "" {
+			fmt.Fprintln(hc.Stderr, trapLine)
+		}
 		return interp.ExitStatus(ee.ExitCode())
 	}
 
 	if errors.Is(err, exec.ErrNotFound) || errors.Is(err, os.ErrNotExist) {
-		fmt.Fprintln(hc.Stderr, errs.Errorf(args[0], err.Error(), "文件已经不在了(它可能在两条命令之间被删掉或被换掉)"))
+		fmt.Fprintln(hc.Stderr, errs.Errorf(args[0], err.Error(), "文件已经不在了(它可能在两条命令之间被删掉或被换掉)")+trapLine)
 		return interp.ExitStatus(errs.ExitNotFound)
 	}
 
-	fmt.Fprintln(hc.Stderr, errs.Errorf(args[0], err.Error(), "确认它是不是可执行文件,以及当前用户有没有权限运行它"))
+	fmt.Fprintln(hc.Stderr, errs.Errorf(args[0], err.Error(), "确认它是不是可执行文件,以及当前用户有没有权限运行它")+trapLine)
 	return interp.ExitStatus(errs.ExitNoExec)
 }
 
@@ -250,6 +342,10 @@ func (s *Session) Run(ctx context.Context, script string, jsonOut bool) (stdout 
 	if perr != nil {
 		return "", 2, []string{perr.Error()}
 	}
+	// 解析之后、运行之前:拦住 Windows 上会静默降级的语法(进程替换)。
+	if rerr := rejectProcessSubstitution(prog); rerr != nil {
+		return "", 2, []string{rerr.Error()}
+	}
 
 	runErr := s.runner.Run(ctx, prog)
 
@@ -263,8 +359,14 @@ func (s *Session) Run(ctx context.Context, script string, jsonOut bool) (stdout 
 	}
 
 	errs = nonEmptyLines(s.errBuf.String())
+	// 只有**不是** ExitStatus 的错误才追加:ExitStatus 是「命令跑完了、退出码非零」,
+	// 不是 winbash 自己的错误。早先这里会把 mvdan/sh 的 "exit status 1" 当错误行附上去,
+	// 于是 `grep 无匹配`、`exit 3` 这类再正常不过的结果都背了一行噪音(bash 不会这样打)。
 	if runErr != nil && exit != 0 {
-		errs = append(errs, runErr.Error())
+		var status interp.ExitStatus
+		if !errors.As(runErr, &status) {
+			errs = append(errs, runErr.Error())
+		}
 	}
 	return s.outBuf.String(), exit, errs
 }

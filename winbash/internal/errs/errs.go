@@ -46,8 +46,42 @@ func TranslateKnownTrap(cmd string, argv []string, raw string) (problem, remedy 
 			"改用 winbash 的子命令形式,不要转发 pwsh 的参数风格: winbash -c 'reg get <key> <name>'",
 			true
 	}
+	// POSIX 路径交给**外部工具**。winbash 自己的命令(ls/cat)两种写法都认,
+	// 但 git/curl 这些只认 Windows 原生形式 —— 而它们的报错只说"找不到",
+	// 不说"写法不对",于是使用者会在一个不存在的路径上反复试。
+	if hasPosixPathArg(argv) && looksLikeMissingPath(raw) {
+		return "这个外部工具收到的路径是 POSIX 写法(/c/…),它只认 Windows 原生形式",
+			`改用 C:\… 形式;winbash 自己的命令(ls/cat/grep)两种写法都接受,但外部工具只认一种`,
+			true
+	}
 
 	return "", "", false
+}
+
+// hasPosixPathArg 判断参数里有没有 /c/Users/… 这种 POSIX 盘符写法。
+func hasPosixPathArg(argv []string) bool {
+	for _, a := range argv {
+		if len(a) >= 3 && a[0] == '/' && a[2] == '/' && isLetter(a[1]) {
+			return true
+		}
+	}
+	return false
+}
+
+// looksLikeMissingPath 判断一段输出像不像「路径不存在」。
+func looksLikeMissingPath(raw string) bool {
+	for _, s := range []string{
+		"No such file",
+		"cannot change to",
+		"cannot find",
+		"not found",
+		"does not exist",
+	} {
+		if strings.Contains(raw, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // hasSingleSlashFlag 判断参数里有没有会被 MSYS 当成路径的那种单斜杠开关。

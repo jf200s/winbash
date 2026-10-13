@@ -36,13 +36,30 @@ func TestSessionKeepsCwdAcrossRuns(t *testing.T) {
 }
 
 func TestSessionReportsExitCodeNotZeroOnFailure(t *testing.T) {
+	// Ruling R16(第二轮补记):这条原先断言「exit 3 时 errs 非空」,钉的其实是
+	// mvdan/sh 的 "exit status 3" 那行内部错误被当成了错误行。bash 不会这样打 ——
+	// `exit 3` 只改退出码、不往 stderr 写任何东西。而那一行噪音会跟着
+	// `grep 无匹配`(退出码 1 是常态)一起出现,于是 Task 13 收口错误模型时把它修掉了。
+	// 这里改为钉 bash 的真实语义:退出码可靠,且**不产生**任何错误行。
 	s := NewSession()
 	_, exit, errs := s.Run(context.Background(), "exit 3", false)
 	if exit != 3 {
 		t.Fatalf("exit=%d want 3", exit)
 	}
+	if len(errs) != 0 {
+		t.Fatalf("非零退出码不该被当成错误行(bash 不打): %v", errs)
+	}
+}
+
+// 真正属于 winbash 的错误(不是命令的退出码)仍然要作为错误行出现。
+func TestSessionKeepsRealErrorsAsErrorLines(t *testing.T) {
+	s := NewSession()
+	_, exit, errs := s.Run(context.Background(), "definitely-not-a-command-xyz", false)
+	if exit == 0 {
+		t.Fatal("expected non-zero exit")
+	}
 	if len(errs) == 0 {
-		t.Fatal("expected an error line")
+		t.Fatal("a real winbash error must still be reported")
 	}
 }
 
