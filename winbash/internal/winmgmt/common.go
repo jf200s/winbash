@@ -34,6 +34,7 @@ type Cmd func(ctx context.Context, conn *pwsh.Conn, argv []string, jsonOut bool,
 // 新增 ② 层命令时在这里加一行。
 var Registry = map[string]Cmd{
 	"svc": Svc,
+	"reg": Reg,
 }
 
 // runRecords 执行一段 PowerShell 脚本,把它返回的 JSON 解析成记录集。
@@ -132,6 +133,14 @@ func cellString(v any) string {
 		return strconv.FormatFloat(t, 'f', -1, 64)
 	case json.Number:
 		return t.String()
+	case []any:
+		// 多值类型(REG_MULTI_SZ)与二进制(REG_BINARY)在这里落地。
+		// TSV 只有一列,装不下结构 —— 用空格连起来是取舍,需要完整结构就走 --json。
+		parts := make([]string, 0, len(t))
+		for _, e := range t {
+			parts = append(parts, cellString(e))
+		}
+		return sanitizeCell(strings.Join(parts, " "))
 	default:
 		return sanitizeCell(fmt.Sprint(t))
 	}
