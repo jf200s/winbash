@@ -34,7 +34,7 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 		// 长开关整个报出来。拆成单字符会把 "--nope" 报成 "--",
 		// 使用者拿着这个提示没法定位问题。
 		if strings.HasPrefix(a, "--") {
-			fmt.Fprintln(errw, errs.Errorf("ls", "不认识的参数: "+a, "支持的参数: -l -a -h"))
+			fmt.Fprintln(errw, errs.Errorf("ls", "不认识的参数: "+a, "支持的参数: -l -a -h -1"))
 			return errs.ExitUsage
 		}
 		for _, c := range a[1:] {
@@ -45,8 +45,12 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 				all = true
 			case 'h':
 				human = true
+			case '1':
+				// 每行一个 —— 这本来就是我们的默认形态,所以接受它。
+				// 不接受反而更坏:`ls -1` 是极常见的写法,而它在这里的预期行为
+				// 恰好就是现状(给了 -l 时被 -l 压过,与 bash 一致)。
 			default:
-				fmt.Fprintln(errw, errs.Errorf("ls", "不认识的参数: -"+string(c), "支持的参数: -l -a -h"))
+				fmt.Fprintln(errw, errs.Errorf("ls", "不认识的参数: -"+string(c), "支持的参数: -l -a -h -1"))
 				return errs.ExitUsage
 			}
 		}
@@ -91,6 +95,13 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 		}
 
 		for _, e := range entries {
+			// 点文件默认不列。这是 **POSIX 语义**,与 Windows 的"隐藏属性"无关 ——
+			// 真 bash 的 `ls` 也看不到 .hidden,而 AI 对 ls 的输出有极强预期
+			// (常常 `ls` 完就去拼文件名)。原先这里只有一句"少不了 . 和 .."的注释,
+			// 把"列不列点文件"当成了无需处理的细节,于是多出一个静默的差异。
+			if !all && strings.HasPrefix(e.Name(), ".") {
+				continue
+			}
 			info, ierr := e.Info()
 			if ierr != nil {
 				fmt.Fprintln(errw, errs.Errorf("ls", ierr.Error(), "读不到 "+e.Name()+" 的属性,已跳过"))

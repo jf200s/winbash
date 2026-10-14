@@ -2,36 +2,20 @@ package output
 
 import "testing"
 
-func TestFormatDWORDIsDecimalNotHex(t *testing.T) {
-	if got := FormatDWORD(10); got != "10" {
-		t.Fatalf("got %q want \"10\"", got)
-	}
-}
-
 func TestFormatBytesIsPlainNumberByDefault(t *testing.T) {
 	if got := FormatBytes(86488064, false); got != "86488064" {
 		t.Fatalf("got %q", got)
 	}
 }
 
-func TestFormatServiceStateMapsConstantCode(t *testing.T) {
-	got, ok := FormatServiceState(1)
-	if !ok || got != "Stopped" {
-		t.Fatalf("got %q ok=%v", got, ok)
-	}
-}
-
-func TestFormatServiceStateUnknownValueIsNotGuessed(t *testing.T) {
-	// 不认识的状态码不许猜 —— 返回数字本身并标记 ok=false
-	got, ok := FormatServiceState(99)
-	if ok || got != "99" {
-		t.Fatalf("got %q ok=%v", got, ok)
-	}
-}
-
+// StripANSI 是链路里唯一的色码兜底(sanitizeCell / cellText 每个单元格都过它)。
+// 它必须是幂等的、并且对没有色码的输入原样返回 —— 否则会改坏已经正确的值。
 func TestStripANSIRemovesColorCodes(t *testing.T) {
 	if got := StripANSI("\x1b[32;1mName\x1b[0m"); got != "Name" {
 		t.Fatalf("got %q", got)
+	}
+	if got := StripANSI("Running"); got != "Running" {
+		t.Fatalf("无色码的输入被改动了: %q", got)
 	}
 }
 

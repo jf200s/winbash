@@ -284,7 +284,7 @@ func tableOf(v any) (rows [][]string, header []string) {
 				keys[k] = true
 			}
 		}
-		header = sortedKeys(keys)
+		header = sanitizeKeys(sortedKeys(keys))
 		rows = make([][]string, 0, len(items))
 		for _, m := range items {
 			row := make([]string, 0, len(header))
@@ -300,7 +300,7 @@ func tableOf(v any) (rows [][]string, header []string) {
 		for k := range t {
 			keys[k] = true
 		}
-		header = sortedKeys(keys)
+		header = sanitizeKeys(sortedKeys(keys))
 		row := make([]string, 0, len(header))
 		for _, k := range header {
 			row = append(row, cellText(t[k]))
@@ -327,6 +327,19 @@ func sortedKeys(set map[string]bool) []string {
 		out = append(out, k)
 	}
 	sort.Strings(out)
+	return out
+}
+
+// sanitizeKeys 把列名也过一遍单元格清洗。
+//
+// 值侧一直走 cellText → sanitizeCell,表头侧用的却是 sortedKeys 的原始字符串 ——
+// 属性名里若带制表符或换行,列就会错位(值被清洗了、列名没有,一行里的分列数对不上)。
+// PowerShell 的属性名正常不会这样,但"正常不会"不是保证,而这里只多一次函数调用。
+func sanitizeKeys(keys []string) []string {
+	out := make([]string, len(keys))
+	for i, k := range keys {
+		out[i] = sanitizeCell(k)
+	}
 	return out
 }
 

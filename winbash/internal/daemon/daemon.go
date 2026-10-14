@@ -168,16 +168,23 @@ func handle(conn net.Conn, sess *shell.Session, token string, readTimeout time.D
 		defer cancel()
 	}
 
+	// note 收集"不影响主流程、但使用者必须知道"的错误行。
+	var note []string
 	if req.Cwd != "" {
-		// client 传来 cwd 时先切过去；失败不致命，继续在旧目录执行。
-		sess.Run(ctx, "cd "+shellQuote(req.Cwd), false)
+		// client 传来 cwd 时先切过去。失败**不致命**(继续在旧目录执行),但绝不能
+		// 静默 —— 原先这里丢掉了退出码,于是"cd 没成功"与"根本没请求切目录"在输出上
+		// 完全一样,而使用者以为自己在目标目录里。把它作为一条错误行带回去。
+		if _, exit, errs := sess.Run(ctx, "cd "+shellQuote(req.Cwd), false); exit != 0 {
+			note = append(note, errs...)
+			note = append(note, fmt.Sprintf("client: 无法切换到 %s,已在原目录 %s 下执行", req.Cwd, sess.Dir()))
+		}
 	}
 
 	out, exit, errs := sess.Run(ctx, req.Script, req.JSON)
 	return false, writeResponse(conn, ipc.Response{
 		OK:     exit == 0,
 		Out:    []byte(out),
-		Errors: errs,
+		Errors: append(note, errs...),
 		Exit:   exit,
 	})
 }

@@ -3,6 +3,15 @@
 // 本包存在的唯一理由是 spec §6 的「值保证」:
 // 0xa → 10、STATE: 1 → Stopped、86,488 K → 86488064、无 ANSI 色码。
 // 对 AI 来说,确定性的值比"好看的输出"重要得多 —— 人眼能忽略噪音,解析器不能。
+//
+// 关于值保证**在哪实现**:`0xa → 10` 与 `STATE: 1 → Stopped` 实际由 PowerShell 侧
+// 的 `.ToString()` 完成(见 winmgmt/svc.go、reg.go),数据在源头就已经是干净的。
+// 这里原先还留着两个 Go 侧函数做同样的事,但**生产链路从不调用它们** ——
+// 只有它们自己的测试在调。那是一种负债:读代码的人会以为 Go 侧有一层兜底,
+// 而实际上兜底不存在。既然实测值保证确实成立(语料与真机都验过),就删掉空转的那层。
+//
+// 唯一真正**需要**在这里兜的是 ANSI:色码是从 pwsh 的终端检测里漏出来的,
+// 一旦走 ConPTY 这类路径就会直接进到数据里,而它没有任何"源头修复"可言。
 package output
 
 import (
@@ -35,40 +44,15 @@ func FormatBytes(n int64, human bool) string {
 	return strconv.FormatFloat(v, 'f', 1, 64) + units[i]
 }
 
-// FormatDWORD 把注册表 DWORD 渲染成十进制。0x0000000a → "10"。
-//
-// 注册表导出的十六进制在 AI 眼里是个陷阱:0x0000000a 既可能是十进制 10,
-// 也可能被当成字符串 "a"。这里一律落到十进制,不保留原样。
-func FormatDWORD(v uint32) string {
-	return strconv.FormatUint(uint64(v), 10)
-}
-
-var serviceStates = map[int]string{
-	1: "Stopped",
-	2: "StartPending",
-	3: "StopPending",
-	4: "Running",
-	5: "ContinuePending",
-	6: "PausePending",
-	7: "Paused",
-}
-
-// FormatServiceState 把 Windows 服务状态常量码翻译成词。
-//
-// 未知值返回数字本身并标记 ok=false —— 不认识就不猜,
-// 宁可让调用方看到裸数字,也不能编一个看起来很像的状态名。
-func FormatServiceState(v int) (string, bool) {
-	if s, ok := serviceStates[v]; ok {
-		return s, true
-	}
-	return strconv.Itoa(v), false
-}
-
 // ansiRe 匹配 SGR 之类的 CSI 序列。pwsh 7 在终端下会自动上色,
 // 那些字节对 AI 是纯噪音,而且会让同一份数据在有无终端时长得不一样。
 var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 
 // StripANSI 删除 ANSI 转义序列。
+//
+// 它是**链路里唯一**的色码兜底,由 sanitizeCell / cellText 在每个单元格上调用。
+// 当前 pwsh 子进程拿的是 CREATE_NO_WINDOW,通常检测不到终端、不会上色 ——
+// 但"通常"不是保证:换成 ConPTY 或换个 pwsh 版本,色码就会直接进到数据里。
 func StripANSI(s string) string { return ansiRe.ReplaceAllString(s, "") }
 
 // TSV 渲染成 Tab 分隔的表。

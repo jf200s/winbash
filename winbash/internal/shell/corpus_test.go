@@ -30,17 +30,28 @@ func TestBashCorpusMatchesRealBash(t *testing.T) {
 	for _, c := range bashCorpus {
 		c := c
 		t.Run(c.name(), func(t *testing.T) {
-			want, wantExit := runRealBash(t, bash, c.script)
+			// 语料里的临时文件名带 WBTMP 占位符 —— 换成本次测试自己的临时目录。
+			// 原先这些用例把文件写进**包源码目录**(wb-corpus-1.txt 之类),一旦
+			// 某条用例的 rm 失败就会在仓库里留垃圾,而且诊断信息完全看不到。
+			// 替换对两条执行路径一致,不影响可比性。
+			script := strings.ReplaceAll(c.script, "WBTMP", filepath.ToSlash(t.TempDir()))
+
+			want, wantExit := runRealBash(t, bash, script)
 
 			s := NewSession()
-			got, gotExit, errsOut := s.Run(context.Background(), c.script, false)
+			got, gotExit, errsOut := s.Run(context.Background(), script, false)
 			got = strings.TrimRight(got, " \t\r\n")
 
 			if c.known != "" {
-				// 已知且有理由的差异:只要求"两边都没崩" —— 差异本身写在 known 里,
-				// 等哪天真 bash 的行为变成了我们的行为,这条注释就该删掉。
+				// 已知且有理由的差异。这里**必须断言差异仍然存在**:
+				// 原先只在"两边恰好一致"时 Skip、其余情况直接 return —— 那等于一个
+				// 不做任何检查的空壳,一条过期的 known 会永远静静地留在表里,
+				// 而 README 却声称"差异全部有测试钉住"。
+				//
+				// 没有去解析 known 的描述文本(那是自然语言,解析它只会造出脆弱的断言),
+				// 但"差异确实还在"这一点,足以让过期的 known 自己浮出来。
 				if got == want && gotExit == wantExit {
-					t.Skipf("这条已知差异已经不存在了(两边一致),可以把 known 去掉: %s", c.known)
+					t.Errorf("这条 known 差异已经不存在了(两边一致),请把它删掉: %s", c.known)
 				}
 				return
 			}
@@ -175,11 +186,11 @@ var bashCorpus = []corpusCase{
 	{script: `find . -maxdepth 1 -name '*.go' | head -1 | wc -l`},
 
 	// ---- 重定向与文件 ----
-	{script: `echo hi > wb-corpus-1.txt; cat wb-corpus-1.txt; rm -f wb-corpus-1.txt`},
-	{script: `printf 'x\n' | tee wb-corpus-2.txt > /dev/null; cat wb-corpus-2.txt; rm -f wb-corpus-2.txt`},
+	{script: `echo hi > "WBTMP/wb-corpus-1.txt"; cat "WBTMP/wb-corpus-1.txt"; rm -f "WBTMP/wb-corpus-1.txt"`},
+	{script: `printf 'x\n' | tee "WBTMP/wb-corpus-2.txt" > /dev/null; cat "WBTMP/wb-corpus-2.txt"; rm -f "WBTMP/wb-corpus-2.txt"`},
 	{script: `echo hi 2>&1`},
 	{script: `echo out; echo err 1>&2`},
-	{script: `: > wb-corpus-3.txt; wc -c < wb-corpus-3.txt; rm -f wb-corpus-3.txt`},
+	{script: `: > "WBTMP/wb-corpus-3.txt"; wc -c < "WBTMP/wb-corpus-3.txt"; rm -f "WBTMP/wb-corpus-3.txt"`},
 	{script: `cat < go.mod | wc -l`},
 	{script: `v=$(cat <<EOF
 line1

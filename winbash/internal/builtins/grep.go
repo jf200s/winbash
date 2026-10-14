@@ -97,7 +97,7 @@ func Grep(ctx context.Context, cwd string, argv []string, in io.Reader, out, err
 					report(fmt.Errorf("%s 是目录", f), "递归搜索目录请加 -r: grep -r PATTERN "+f)
 					continue
 				}
-				anyMatch = grepTree(abs, re, opts, out, report) || anyMatch
+				anyMatch = grepTree(abs, f, re, opts, out, report) || anyMatch
 				continue
 			}
 
@@ -125,7 +125,6 @@ type grepOpts struct {
 	namesOnly  bool
 	recursive  bool
 	extended   bool
-	fixed      bool
 	quiet      bool
 }
 
@@ -167,10 +166,12 @@ func parseGrepArgs(argv []string) (*grepOpts, string, []string, error) {
 				opts.recursive = true
 			case 'E':
 				opts.extended = true
-				// -E 与 -F 互斥:后出现的那个胜,与 bash 一致(`grep -EF` 按字面)。
-				opts.fixed = false
 			case 'F':
-				opts.fixed = true
+				// -F 是"按字面匹配",而这**本来就是默认方言**(见 compileGrep:
+				// 非 -E 分支用 QuoteMeta)。原先这里还设了一个 opts.fixed 字段,
+				// 但全包没有任何地方读它 —— 那个字段只是让"支持 -F"看起来有实现。
+				// 保留这个 case 有两个理由:-F 必须被接受;它还要把 -E 顶掉
+				// (`grep -EF` 按字面,与 bash 一致:后出现的那个胜)。
 				opts.extended = false
 			case 'q':
 				opts.quiet = true
@@ -215,19 +216,36 @@ func compileGrep(pattern string, opts *grepOpts) (re *regexp.Regexp, problem, re
 			"改用 POSIX 写法: [0-9] / [[:digit:]] / [[:alpha:]] / [[:space:]]"
 	}
 
-	// 先用 POSIX 模式校验方言。这样 `(?i)`、`*?`、`\b` 这类 Perl 语法会被挡在这里,
-	// 而不是等下面用 Perl 引擎编译时「恰好也能过」。
-	if _, err := regexp.CompilePOSIX(pattern); err != nil {
-		return nil, "模式不是合法的 POSIX ERE: " + err.Error(),
+	// `(?...)` 内联开关在 ERE 里没有定义。Perl 引擎会接受它,放过去等于默默换了
+	// 方言,所以先显式挡掉 —— 这是下面那条回退路径唯一的例外。
+	if strings.Contains(pattern, "(?") {
+		return nil, "模式里有 (?...) 内联开关,那是 Perl 语法,POSIX ERE 里没有定义",
+			"-E 的方言是 POSIX ERE;要忽略大小写用 -i,不要把 (?i) 写进模式"
+	}
+
+	// 先用 POSIX 模式校验方言,把 `*?`、`\b` 这类 Perl 语法挡在门外,
+	// 而不是留给 Perl 引擎编译时「恰好也能过」。
+	//
+	// 归一化是必须的:POSIX ERE 里,字符类**内部**的 `\` 不是转义引导符 ——
+	// `[\d]` 的含义是「反斜杠或字母 d」,与 `\d` 这种 Perl 简写毫无关系。而 Go 的
+	// regexp.CompilePOSIX 不认字符类里的 `\`,直接报 invalid escape sequence,
+	// 于是 `grep -E '[\d]'` 这种完全合法的写法在我们这里变成语法错(真 bash 给
+	// exit 1:无匹配)。normalizeEreClasses 把它改写成 `[\\d]`,保留 ERE 的原意。
+	//
+	// 曾经试过"编译失败就回退到 Perl 引擎 + Longest()",那更糟:Perl 把 `[\w]`
+	// 当成词字符,于是它匹配 `b`,而真 bash 不匹配 —— 语义**静默变了**,只有
+	// 内容里正好有词字符时才显形。精确改写比宽泛回退好。
+	normalized := normalizeEreClasses(pattern)
+	if posixErr := func() error { _, err := regexp.CompilePOSIX(normalized); return err }(); posixErr != nil {
+		return nil, "模式不是合法的 POSIX ERE: " + posixErr.Error(),
 			`要按字面匹配特殊字符就转义它(\\. ),字符类用 [[:alpha:]] 这种 POSIX 写法`
 	}
 
 	if opts.ignoreCase {
 		// 实测:Go 的 POSIX 模式不支持内联开关(`(?i)alpha` 报 missing argument),
-		// 所以 -i 与 -E 不能直接叠加。这里用「POSIX 校验 + Perl 引擎 + Longest()」:
-		// 方言已经由上面那一步钉死为 POSIX ERE,Longest() 再把匹配语义还原成
-		// leftmost-longest(ERE 语义: `a|ab` 在 "ab" 上要整段匹配,Perl 默认只匹配 "a")。
-		r, err := regexp.Compile("(?i)" + pattern)
+		// 所以 -i 与 -E 只能叠加成「POSIX 校验 + Perl 引擎 + Longest()」:
+		// 方言已由上面钉死,Longest() 再把匹配语义还原成 leftmost-longest。
+		r, err := regexp.Compile("(?i)" + normalized)
 		if err != nil {
 			return nil, "模式无法编译: " + err.Error(), "检查模式里的括号与转义"
 		}
@@ -235,27 +253,77 @@ func compileGrep(pattern string, opts *grepOpts) (re *regexp.Regexp, problem, re
 		return r, "", ""
 	}
 
-	r, err := regexp.CompilePOSIX(pattern)
+	r, err := regexp.CompilePOSIX(normalized)
 	if err != nil {
-		return nil, "模式不是合法的 POSIX ERE: " + err.Error(),
-			"检查模式里的括号与转义"
+		return nil, "模式不是合法的 POSIX ERE: " + err.Error(), "检查模式里的括号与转义"
 	}
 	return r, "", ""
 }
 
+// normalizeEreClasses 把字符类**内部**的 `\X` 改写成 `\\X`(字面反斜杠 + X)。
+//
+// POSIX ERE 里字符类内部的 `\` 只是个普通字符,所以 `[\d]` 等价于「反斜杠或 d」。
+// Go 的 regexp.CompilePOSIX 却会因为那个 `\` 报 invalid escape sequence ——
+// 这是 Go 的实现比 ERE 窄,不是我们的模式有问题。
+func normalizeEreClasses(pattern string) string {
+	var b strings.Builder
+	inClass := false
+	for i := 0; i < len(pattern); i++ {
+		c := pattern[i]
+		switch {
+		case c == '\\' && i+1 < len(pattern):
+			if inClass {
+				b.WriteString(`\\`) // 字面反斜杠,交给 ERE
+			} else {
+				b.WriteByte(c)
+			}
+			b.WriteByte(pattern[i+1])
+			i++
+			continue
+		case c == '[':
+			inClass = true
+		case c == ']':
+			inClass = false
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
 // firstPerlClass 找出 pattern 里第一个 Perl 简写类,返回它的字面写法。
 //
-// 扫描时成对跳过转义,这样 `\\d`(字面反斜杠 + d)不会被误报成 Perl 类。
+// 两处必须小心:
+//
+//   - 成对跳过转义:`\\d` 是「字面反斜杠 + d」,不是 Perl 类。
+//   - **不进字符类内部**:`[\d]` 在 POSIX ERE 里是合法的,它匹配反斜杠或字母 d。
+//     原先的扫描器只看反斜杠,于是 `grep -E '[\d]'` 被判成 Perl 简写而拒收 ——
+//     一段合法脚本凭空失败(真 bash 给 exit 1:「无匹配」,不是「语法错」)。
 func firstPerlClass(pattern string) (string, bool) {
+	inClass := false
 	for i := 0; i+1 < len(pattern); i++ {
-		if pattern[i] != '\\' {
-			continue
+		switch pattern[i] {
+		case '\\':
+			if !inClass {
+				switch pattern[i+1] {
+				case 'd', 'D', 'w', 'W', 's', 'S':
+					return pattern[i : i+2], true
+				}
+			}
+			i++ // 跳过被转义的那个字符
+		case '[':
+			if !inClass {
+				inClass = true
+				// POSIX:紧跟 `[` 或 `[^` 的 `]` 是字面量,不结束字符类。
+				if i+1 < len(pattern) && pattern[i+1] == '^' {
+					i++
+				}
+				if i+1 < len(pattern) && pattern[i+1] == ']' {
+					i++
+				}
+			}
+		case ']':
+			inClass = false
 		}
-		switch pattern[i+1] {
-		case 'd', 'D', 'w', 'W', 's', 'S':
-			return pattern[i : i+2], true
-		}
-		i++ // 跳过被转义的那个字符
 	}
 	return "", false
 }
@@ -370,7 +438,12 @@ func grepFile(abs string, re *regexp.Regexp, opts *grepOpts, label string, showN
 }
 
 // grepTree 递归搜一棵子树。
-func grepTree(root string, re *regexp.Regexp, opts *grepOpts, out io.Writer, report func(error, string)) bool {
+//
+// display 是**使用者写下的那个路径**(例如 `.`)。输出里的文件名要基于它算,
+// 而不是把 WalkDir 给的绝对路径直接打出去 —— 实测 `grep -r b .` 原本输出
+// `/c/Users/…/d.txt:b`,而真 bash 给 `./d.txt:b`。AI 拿到绝对路径后很难
+// 与它自己的输入对应起来(它写的是 `.`),这是那种"能用但总会让人怀疑"的差异。
+func grepTree(root, display string, re *regexp.Regexp, opts *grepOpts, out io.Writer, report func(error, string)) bool {
 	anyMatch := false
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
 		if werr != nil {
@@ -385,7 +458,7 @@ func grepTree(root string, re *regexp.Regexp, opts *grepOpts, out io.Writer, rep
 			return nil
 		}
 		// 递归输出里的路径用正斜杠:① 层的文本语义按 bash 来。
-		label := filepath.ToSlash(p)
+		label := filepath.ToSlash(displayRel(display, p, root))
 		if matched, ok := grepFile(p, re, opts, label, true, out, report); ok && matched {
 			anyMatch = true
 		}
@@ -395,4 +468,19 @@ func grepTree(root string, re *regexp.Regexp, opts *grepOpts, out io.Writer, rep
 		report(err, "遍历 "+root+" 时出错")
 	}
 	return anyMatch
+}
+
+// displayRel 把 WalkDir 给的绝对路径还原成"使用者视角"的写法。
+//
+// 还原不了(跨盘符等)就退回绝对路径 —— 给一个准确的怪名字,好过给一个错的短名字。
+func displayRel(display, p, root string) string {
+	rel, err := filepath.Rel(root, p)
+	if err != nil {
+		return p
+	}
+	rel = filepath.ToSlash(rel)
+	if display == "" || display == "." {
+		return "./" + rel
+	}
+	return strings.TrimSuffix(filepath.ToSlash(display), "/") + "/" + rel
 }
