@@ -3,6 +3,7 @@ package client
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -22,6 +23,15 @@ const (
 	createNoWindow = 0x08000000 // CREATE_NO_WINDOW
 )
 
+// endpointInfo 是端口文件的内容:daemon 地址 + 鉴权 token。
+//
+// token 为什么要跟地址放一起:只发地址正是修之前那个洞 —— 同机任何能读这个文件的
+// 进程(实测 ACL 里带着沙箱组)都能借 daemon 的身份执行命令。
+type endpointInfo struct {
+	addr  string
+	token string
+}
+
 // Run 连上 endpoint 指向的 daemon 执行 script。
 //
 // daemon 没起来时先拉起它;若 daemon 刚死而端口文件还在,清掉陈旧文件后重拉一次
@@ -31,6 +41,9 @@ func Run(endpoint, script, cwd string, jsonOut bool) (ipc.Response, error) {
 }
 
 // RunTimeout 同 Run,但给整个往返设一个上限(timeout<=0 表示不设限)。
+//
+// 这个上限会同时传给 daemon(见 ipc.Request.TimeoutMS):client 放弃不代表
+// daemon 该继续跑,否则一条无限循环会把后续命令全部饿死。
 //
 // 嵌套里(见 inSession)不走 daemon,直接在本进程执行 —— 理由见 runLocal。
 func RunTimeout(endpoint, script, cwd string, jsonOut bool, timeout time.Duration) (ipc.Response, error) {
@@ -79,12 +92,17 @@ func Status(endpoint string) (string, error) {
 // mustExist=true:daemon 不在就报错(给 --stop/--status 用);
 // false:daemon 不在就把它拉起来(给执行脚本用)。
 func oneShot(endpoint string, req ipc.Request, mustExist bool, timeout time.Duration) (ipc.Response, error) {
-	addr, err := dialAddr(endpoint, mustExist)
+	info, err := dialAddr(endpoint, mustExist)
 	if err != nil {
 		return ipc.Response{}, err
 	}
+	req.Token = info.token
+	if timeout > 0 {
+		// daemon 侧也要知道上限:client 放弃不代表它该继续跑(见 ipc.Request.TimeoutMS)。
+		req.TimeoutMS = int(timeout / time.Millisecond)
+	}
 
-	conn, err := dial(endpoint, addr, mustExist)
+	conn, err := dial(endpoint, info.addr, mustExist)
 	if err != nil {
 		return ipc.Response{}, err
 	}
@@ -92,30 +110,76 @@ func oneShot(endpoint string, req ipc.Request, mustExist bool, timeout time.Dura
 	resp, xerr := exchange(conn, req, timeout)
 	conn.Close()
 	if xerr == nil {
+		if resp.Auth {
+			return retryAfterAuthFailure(endpoint, req, timeout)
+		}
 		return resp, nil
 	}
 
-	// 半路上掉了:daemon 可能刚被 `--stop` 停掉(它还在退出的路上),或者被杀掉了。
-	// 清掉端口文件、重拉一个、原样重试一次 —— 这正是 Review Focus 第 5 条要的行为:
-	// 自行恢复,而不是把 WSAECONNRESET 丢给使用者。
+	// ★ 超时**绝不重试**。
 	//
-	// 只重试一次是有意的:重试可能让脚本执行两遍,而**更常见**的情况是请求根本没送达
-	// (连接被重置)。一次是「从偶发竞态里恢复」和「不在真故障上打转」之间的中点。
-	// mustExist(--stop/--status)不重试:那两个不该把 daemon 拉起来。
+	// 这里原本对任何失败都"清端口文件、重拉 daemon、原样重跑",理由是"请求多半没送达"。
+	// 实测推翻了这个理由:`echo RUN >> f; sleep 6` 配 --timeout 2s,文件里出现**两行** ——
+	// 请求送达了、跑起来了、只是 client 先放弃了。对 mkdir / git commit / 写文件
+	// 这类脚本,重放就是数据损坏。
+	if isTimeout(xerr) {
+		return ipc.Response{}, xerr
+	}
+	// --stop / --status 不该把 daemon 拉起来。
 	if mustExist {
 		return ipc.Response{}, xerr
 	}
-	forgetStaleEndpoint(endpoint, addr)
-	addr2, aerr := ensureDaemon(endpoint)
+
+	// 剩下这类才是"半路上掉了":连接被重置、daemon 刚被杀。这种请求**极可能没送达**,
+	// 重试一次是「从偶发竞态里恢复」和「不在真故障上打转」之间的中点。
+	forgetStaleEndpoint(endpoint, info.addr)
+	info2, aerr := ensureDaemon(endpoint)
 	if aerr != nil {
 		return ipc.Response{}, xerr
 	}
-	conn2, derr := dial(endpoint, addr2, false)
+	conn2, derr := dial(endpoint, info2.addr, false)
 	if derr != nil {
 		return ipc.Response{}, xerr
 	}
 	defer conn2.Close()
+	req.Token = info2.token
 	return exchange(conn2, req, timeout)
+}
+
+// retryAfterAuthFailure 在鉴权失败后重读端口文件再试一次。
+//
+// 为什么这次重试是安全的:鉴权失败意味着 daemon **根本没有执行**请求,
+// 所以不存在"脚本跑两遍"的风险 —— 与上面超时分支形成对照,那里重试才是危险的。
+//
+// 最常见的成因不是攻击,而是竞态:我们读完地址与 token 之后,那个 daemon 恰好退出、
+// 新 daemon 把同一个端口文件改写成了自己的地址与 token。重读一次就拿到新的了。
+//
+// 重试仍失败就把原来的 401 原样交上去 —— 那才可能是真的有人在乱连。
+func retryAfterAuthFailure(endpoint string, req ipc.Request, timeout time.Duration) (ipc.Response, error) {
+	info2, err := readEndpoint(endpoint)
+	if err != nil {
+		return ipc.Response{}, fmt.Errorf("client: daemon 鉴权失败,且端口文件已不可读: %w", err)
+	}
+	conn2, err := dial(endpoint, info2.addr, false)
+	if err != nil {
+		return ipc.Response{}, err
+	}
+	defer conn2.Close()
+	req.Token = info2.token
+	resp, xerr := exchange(conn2, req, timeout)
+	if xerr != nil {
+		return ipc.Response{}, xerr
+	}
+	return resp, nil
+}
+
+// isTimeout 判断错误链里有没有一个超时(连接 deadline 到了)。
+//
+// 必须走 errors.As 而不是字符串比较:exchange 用 %w 包了一层,
+// 而真正带 Timeout() 的是底下的 *net.OpError。
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // dial 建立到 addr 的连接;mustExist 时连不上就直接报"没在运行"。
@@ -129,11 +193,11 @@ func dial(endpoint, addr string, mustExist bool) (net.Conn, error) {
 	}
 	// 端口文件指向的 daemon 已经不在了。清掉陈旧端口再拉一次。
 	forgetStaleEndpoint(endpoint, addr)
-	addr2, aerr := ensureDaemon(endpoint)
+	info, aerr := ensureDaemon(endpoint)
 	if aerr != nil {
 		return nil, aerr
 	}
-	conn, err = net.DialTimeout("tcp", addr2, dialTimeout)
+	conn, err = net.DialTimeout("tcp", info.addr, dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("client: 连接 daemon 失败: %w", err)
 	}
@@ -149,7 +213,8 @@ func forgetStaleEndpoint(endpoint, addr string) {
 	if err != nil {
 		return
 	}
-	if strings.TrimSpace(string(b)) == addr {
+	first := strings.TrimSpace(strings.SplitN(strings.TrimSpace(string(b)), "\n", 2)[0])
+	if first == addr {
 		_ = os.Remove(endpoint)
 	}
 }
@@ -178,45 +243,53 @@ func exchange(conn net.Conn, req ipc.Request, timeout time.Duration) (ipc.Respon
 }
 
 // dialAddr 决定往哪个地址连。mustExist 时只读端口文件,绝不拉起新 daemon。
-func dialAddr(endpoint string, mustExist bool) (string, error) {
+func dialAddr(endpoint string, mustExist bool) (endpointInfo, error) {
 	if !mustExist {
 		return ensureDaemon(endpoint)
 	}
-	addr, err := readEndpoint(endpoint)
+	info, err := readEndpoint(endpoint)
 	if err != nil {
-		return "", fmt.Errorf("client: daemon 没在运行(端口文件 %s 不存在)", endpoint)
+		return endpointInfo{}, fmt.Errorf("client: daemon 没在运行(端口文件 %s 不存在)", endpoint)
 	}
-	return addr, nil
+	return info, nil
 }
 
-// ensureDaemon 返回可拨号地址;daemon 不在就先把它拉起来。
-func ensureDaemon(endpoint string) (string, error) {
-	if addr, err := readEndpoint(endpoint); err == nil {
-		return addr, nil
+// ensureDaemon 返回端口文件内容;daemon 不在就先把它拉起来。
+func ensureDaemon(endpoint string) (endpointInfo, error) {
+	if info, err := readEndpoint(endpoint); err == nil {
+		return info, nil
 	}
 	if err := spawnDaemon(endpoint); err != nil {
-		return "", fmt.Errorf("client: 启动 daemon 失败: %w", err)
+		return endpointInfo{}, fmt.Errorf("client: 启动 daemon 失败: %w", err)
 	}
 	deadline := time.Now().Add(startupBudget)
 	for time.Now().Before(deadline) {
-		if addr, err := readEndpoint(endpoint); err == nil {
-			return addr, nil
+		if info, err := readEndpoint(endpoint); err == nil {
+			return info, nil
 		}
 		time.Sleep(pollInterval)
 	}
-	return "", fmt.Errorf("client: daemon 在 %s 内没有起来", startupBudget)
+	return endpointInfo{}, fmt.Errorf("client: daemon 在 %s 内没有起来", startupBudget)
 }
 
-func readEndpoint(endpoint string) (string, error) {
+// readEndpoint 解析端口文件的两行:地址 + token。
+//
+// token 允许缺失(老 daemon 或外部工具写出来的文件),那时它会被当成空串,
+// daemon 侧会拒绝 —— 这是有意的:缺少凭据应该是"被拒",不是"放行"。
+func readEndpoint(endpoint string) (endpointInfo, error) {
 	b, err := os.ReadFile(endpoint)
 	if err != nil {
-		return "", err
+		return endpointInfo{}, err
 	}
-	addr := strings.TrimSpace(string(b))
-	if addr == "" {
-		return "", fmt.Errorf("client: 端口文件 %s 是空的", endpoint)
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	info := endpointInfo{addr: strings.TrimSpace(lines[0])}
+	if info.addr == "" {
+		return endpointInfo{}, fmt.Errorf("client: 端口文件 %s 是空的", endpoint)
 	}
-	return addr, nil
+	if len(lines) > 1 {
+		info.token = strings.TrimSpace(lines[1])
+	}
+	return info, nil
 }
 
 // spawnDaemon 以 --serve 重新启动自己。隐藏窗口,不打扰使用者。

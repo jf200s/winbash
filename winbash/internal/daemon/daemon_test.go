@@ -32,7 +32,7 @@ func waitForEndpoint(t *testing.T, ep string, budget time.Duration) {
 
 func TestStopActuallyStopsDaemon(t *testing.T) {
 	ep := uniqueEndpoint(t)
-	go Serve(ep, time.Minute)
+	go Serve(ep, time.Minute, DefaultReadTimeout)
 	waitForEndpoint(t, ep, 10*time.Second)
 
 	if err := client.Stop(ep); err != nil {
@@ -56,7 +56,7 @@ func TestDaemonExitsAfterIdleTimeout(t *testing.T) {
 	ep := uniqueEndpoint(t)
 	done := make(chan struct{})
 	go func() {
-		_ = Serve(ep, 300*time.Millisecond)
+		_ = Serve(ep, 300*time.Millisecond, DefaultReadTimeout)
 		close(done)
 	}()
 	select {
@@ -77,7 +77,7 @@ func TestStatusReportsAndDoesNotStartDaemon(t *testing.T) {
 		t.Fatal("Status started a daemon (port file appeared) — it must not")
 	}
 
-	go Serve(ep, time.Minute)
+	go Serve(ep, time.Minute, DefaultReadTimeout)
 	waitForEndpoint(t, ep, 10*time.Second)
 
 	out, err := client.Status(ep)

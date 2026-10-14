@@ -43,7 +43,7 @@ func run() int {
 	flag.Parse()
 
 	if serve {
-		if err := daemon.Serve(endpoint, idle); err != nil {
+		if err := daemon.Serve(endpoint, idle, daemon.DefaultReadTimeout); err != nil {
 			fmt.Fprintln(os.Stderr, "winbash: serve:", err)
 			return 1
 		}

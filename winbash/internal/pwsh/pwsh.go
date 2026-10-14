@@ -254,6 +254,14 @@ func (c *Conn) Calls() int {
 	return c.calls
 }
 
+// Dead 报告这个会话是否已经失效。
+//
+// 失效是**单向**的:一旦帧失步(脚本往主机流写了东西)或读写超时,这个 Conn 就不能再用了
+// —— 继续用它只会拿到"错但看起来对"的结果。调用方(② 层的 psEngine)据此决定**重建**
+// 而不是接着用:换一个全新进程就能恢复,否则一次 Write-Host 会让该 daemon 的
+// 所有 ② 层命令永久瘫痪。重建前仍应先 Close,把这个坏进程收干净。
+func (c *Conn) Dead() bool { return c.dead.Load() }
+
 func writeFrame(w io.Writer, body []byte) error {
 	var hdr [4]byte
 	binary.LittleEndian.PutUint32(hdr[:], uint32(len(body)))

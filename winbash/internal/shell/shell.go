@@ -581,7 +581,16 @@ func msysWithNoGlob(cur string) string {
 // 失败结果同样缓存 —— 否则 `svc list; svc status x` 会为同一个错误各等一次超时。
 func (s *Session) psEngine() (*pwsh.Conn, error) {
 	if s.engine != nil {
-		return s.engine, nil
+		// 引擎坏过一次就永远坏下去吗?不。帧失步(脚本写了主机流)或读写超时会让
+		// 这个 Conn **单向**失效,但它换一个全新进程就能恢复 —— 实测一句
+		// `Write-Host` 曾让该 daemon 的 ② 层此后全部报"会话已失效",只能重启 daemon。
+		// 这里把坏的丢掉,走下面的重建路径。
+		if s.engine.Dead() {
+			_ = s.engine.Close()
+			s.engine = nil
+		} else {
+			return s.engine, nil
+		}
 	}
 	if s.engineErr != nil {
 		return nil, s.engineErr
