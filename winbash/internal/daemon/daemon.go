@@ -189,7 +189,15 @@ func handle(conn net.Conn, sess *shell.Session, token string, readTimeout time.D
 	})
 }
 
+// writeBudget 是单次响应写的上限。
+//
+// 写也要有上限:客户端发完合法请求却不读响应时,daemon 会卡在 write 上直到 TCP
+// 超时 —— 而 handle 是串行的,一条这样的连接就拖住后面所有命令(与 P0-2 同类)。
+// 它需要先持有 token(同用户),所以只算加固项,但代价只有一行。
+const writeBudget = 10 * time.Second
+
 func writeResponse(conn net.Conn, resp ipc.Response) error {
+	_ = conn.SetWriteDeadline(time.Now().Add(writeBudget))
 	b, err := ipc.EncodeResponse(resp)
 	if err != nil {
 		return err

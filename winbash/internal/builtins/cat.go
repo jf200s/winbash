@@ -34,9 +34,13 @@ func Cat(ctx context.Context, cwd string, argv []string, in io.Reader, out, errw
 	}
 
 	code := errs.ExitOK
+	// 行号跨文件**累加**(GNU cat 的语义):`cat -n f1 f2` 里 f2 的第一行接着 f1 的
+	// 编号,而不是每个文件从 1 重新开始。计数器原先放在 copyCat 内部,于是多文件时
+	// 每段都重置 —— 实测 `1 a 2 b | 1 c 2 d`,真 bash 给 `1 a 2 b | 3 c 4 d`。
+	lineNo := 0
 	for _, name := range files {
 		if name == "-" {
-			if cerr := copyCat(out, SafeStdin(in), numbered); cerr != nil {
+			if cerr := copyCat(out, SafeStdin(in), numbered, &lineNo); cerr != nil {
 				fmt.Fprintln(errw, errs.Errorf("cat", cerr.Error(), "读标准输入时出错"))
 				code = errs.ExitError
 			}
@@ -59,7 +63,7 @@ func Cat(ctx context.Context, cwd string, argv []string, in io.Reader, out, errw
 			continue
 		}
 
-		cerr := copyCat(out, f, numbered)
+		cerr := copyCat(out, f, numbered, &lineNo)
 		f.Close()
 		if cerr != nil {
 			fmt.Fprintln(errw, errs.Errorf("cat", cerr.Error(), "写输出时出错"))
@@ -110,19 +114,19 @@ func parseCatArgs(argv []string) (numbered bool, files []string, err error) {
 // copyCat 搬运字节;-n 时给每行加 "     1\t" 前缀(与 bash 的 cat -n 一致:
 // 宽度 6、右对齐、后跟一个制表符)。
 //
+// 行号由调用方持有(*lineNo),这样多个文件之间是**累加**的 —— 与 GNU cat 一致。
 // 逐行读而不是给每行补 \n:最后一行没有换行符时也要原样输出,不能凭空加一个。
-func copyCat(out io.Writer, r io.Reader, numbered bool) error {
+func copyCat(out io.Writer, r io.Reader, numbered bool, lineNo *int) error {
 	if !numbered {
 		_, err := io.Copy(out, r)
 		return err
 	}
-	br := bufio.NewReaderSize(SafeStdin(r), 64*1024)
-	n := 0
+	br := bufio.NewReaderSize(r, 64*1024)
 	for {
 		raw, err := br.ReadBytes('\n')
 		if len(raw) > 0 {
-			n++
-			if _, werr := fmt.Fprintf(out, "%6d\t", n); werr != nil {
+			*lineNo++
+			if _, werr := fmt.Fprintf(out, "%6d\t", *lineNo); werr != nil {
 				return werr
 			}
 			if _, werr := out.Write(raw); werr != nil {

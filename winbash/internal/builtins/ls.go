@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"winbash/internal/errs"
@@ -82,18 +83,15 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 			continue
 		}
 
+		// 收集这一轮要输出的名字,再统一排序。
+		//
+		// 为什么不能"先写 . 与 ..、再写 ReadDir 的结果":bash 把它们放在**同一个排序**里。
+		// 实测目录含 `!x` 时,真 bash 给 `!x . .. .hidden ...`(`!` 是 0x21,排在
+		// `.` 的 0x2E 之前),而先写就得到 `. .. !x ...`,顺序错了。
+		names := make([]string, 0, len(entries)+2)
 		if all {
-			// bash 的 -a 会列出 . 与 ..。Windows 上 os.ReadDir 本来就返回隐藏文件,
-			// 所以这里唯一需要补的就是这两个特殊条目。
-			for _, name := range []string{".", ".."} {
-				info, ierr := os.Stat(filepath.Join(abs, name))
-				if ierr != nil {
-					continue
-				}
-				writeLsEntry(out, name, info, long, human)
-			}
+			names = append(names, ".", "..")
 		}
-
 		for _, e := range entries {
 			// 点文件默认不列。这是 **POSIX 语义**,与 Windows 的"隐藏属性"无关 ——
 			// 真 bash 的 `ls` 也看不到 .hidden,而 AI 对 ls 的输出有极强预期
@@ -102,13 +100,18 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 			if !all && strings.HasPrefix(e.Name(), ".") {
 				continue
 			}
-			info, ierr := e.Info()
+			names = append(names, e.Name())
+		}
+		sort.Strings(names)
+
+		for _, name := range names {
+			info, ierr := os.Stat(filepath.Join(abs, name))
 			if ierr != nil {
-				fmt.Fprintln(errw, errs.Errorf("ls", ierr.Error(), "读不到 "+e.Name()+" 的属性,已跳过"))
+				fmt.Fprintln(errw, errs.Errorf("ls", ierr.Error(), "读不到 "+name+" 的属性,已跳过"))
 				code = errs.ExitError
 				continue
 			}
-			writeLsEntry(out, e.Name(), info, long, human)
+			writeLsEntry(out, name, info, long, human)
 		}
 	}
 	return code

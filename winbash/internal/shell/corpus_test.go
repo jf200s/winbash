@@ -324,9 +324,19 @@ func findRealBash(t *testing.T) string {
 }
 
 // runRealBash 跑一条语料,拿期望的 stdout 与退出码。
+//
+// 给参照子进程一份**显式环境**(见 cleanCorpusEnv):差分测试的价值完全取决于参照物
+// 是否可信,而"真 bash"是会**被宿主环境改写**的 —— 有些 agent 沙箱会导出
+// `safe-delete` 这类 shell 函数来包住 rm(靠 BASH_ENV 注入文件、靠导出的 BASH_FUNC_*
+// 传函数)。一旦被改写,失败信息还会把人引向"winbash 的 rm 行为不对",误导性极强;
+// 而且这类红是环境造成的,在干净机器上复现不了。
+//
+// winbash 侧不读这几个变量,这里只滤参照侧;加这个显式环境是为了让"两边环境一致"
+// 这个意图写在代码里,免得以后有人往一边加环境依赖。
 func runRealBash(t *testing.T, bash, script string) (string, int) {
 	t.Helper()
 	cmd := exec.Command(bash, "-c", script)
+	cmd.Env = cleanCorpusEnv()
 	cmd.Stdin = strings.NewReader("")
 	out, err := cmd.Output()
 	code := 0
@@ -336,4 +346,22 @@ func runRealBash(t *testing.T, bash, script string) (string, int) {
 		t.Fatalf("running %q in %s: %v", script, bash, err)
 	}
 	return strings.TrimRight(string(out), " \t\r\n"), code
+}
+
+// cleanCorpusEnv 去掉会改写"真 bash"行为的启动注入项。
+//
+// BASH_ENV / ENV 是启动脚本,导出的 shell 函数则以 BASH_FUNC_<name>%% 的形式躺在
+// 环境里 —— 只裁前者不够,垫片本身还是会被导入。
+func cleanCorpusEnv() []string {
+	var out []string
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		if strings.EqualFold(name, "BASH_ENV") ||
+			strings.EqualFold(name, "ENV") ||
+			strings.HasPrefix(strings.ToUpper(name), "BASH_FUNC_") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }

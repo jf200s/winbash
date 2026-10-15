@@ -260,32 +260,70 @@ func compileGrep(pattern string, opts *grepOpts) (re *regexp.Regexp, problem, re
 	return r, "", ""
 }
 
-// normalizeEreClasses 把字符类**内部**的 `\X` 改写成 `\\X`(字面反斜杠 + X)。
+// normalizeEreClasses 把字符类**内部**的 `\X` 改写成 ERE 该有的样子。
 //
 // POSIX ERE 里字符类内部的 `\` 只是个普通字符,所以 `[\d]` 等价于「反斜杠或 d」。
-// Go 的 regexp.CompilePOSIX 却会因为那个 `\` 报 invalid escape sequence ——
-// 这是 Go 的实现比 ERE 窄,不是我们的模式有问题。
+// 真 Git Bash 也是如此 —— 实测 `grep -E '[\d]'` 在只含 `\ d ] a z - b w [` 的语料上,
+// 输出正是 `\` 与 `d`(两边逐字相同)。而 Go 的 regexp.CompilePOSIX **不认**类内的 `\`,
+// 直接报 invalid escape sequence。所以把单个 `\X` 写成 `\\X`(字面反斜杠 + X):
+// 保留 ERE 原意,同时让 POSIX 引擎能编译。
+//
+// 两个边界必须守住,**两个都踩过**:
+//
+//	`\\` 是**已经转义**的反斜杠,不能再动 —— 否则 `[\\]` 变成 `[\\\]`(未闭合),
+//	     `[\\d]` 变成不可编译的形态(实测报 invalid escape sequence,exit 2)。
+//	`[` 或 `[^` **紧跟**的 `]` 是字面量,不结束字符类 —— 否则 `[\]]` 被截断成
+//	     "反斜杠后跟 ]"的空集合,静默返回无匹配(exit 1,看着像"真的没有匹配")。
+//
+// 这两条与 firstPerlClass 是同一套字符类规则,那个函数也处理了字面量 `]`。以后若再动
+// 字符类扫描,应当抽一个共用的状态机,别在一个包里放两份规则不同的实现。
 func normalizeEreClasses(pattern string) string {
 	var b strings.Builder
-	inClass := false
+	inClass, head := false, false
 	for i := 0; i < len(pattern); i++ {
 		c := pattern[i]
-		switch {
-		case c == '\\' && i+1 < len(pattern):
-			if inClass {
-				b.WriteString(`\\`) // 字面反斜杠,交给 ERE
-			} else {
+
+		// 类开头允许一个 `^`,以及一个字面量 `]`(紧跟 `[` 或 `[^`)。
+		if inClass && head {
+			if c == '^' {
 				b.WriteByte(c)
+				continue // head 仍为 true:后面还可能跟字面量 `]`
 			}
-			b.WriteByte(pattern[i+1])
-			i++
-			continue
-		case c == '[':
-			inClass = true
-		case c == ']':
-			inClass = false
+			if c == ']' {
+				b.WriteByte(c)
+				head = false
+				continue
+			}
+			head = false
+			// 落到下面的常规处理
 		}
+
+		if c == '\\' && i+1 < len(pattern) {
+			next := pattern[i+1]
+			switch {
+			case !inClass:
+				b.WriteByte(c)
+				b.WriteByte(next)
+			case next == '\\':
+				b.WriteString(`\\`) // 已经是转义的转义,原样保留
+			default:
+				b.WriteString(`\\`) // 类内的 `\X` = 字面反斜杠 + X
+				b.WriteByte(next)
+			}
+			i++
+			head = false
+			continue
+		}
+
 		b.WriteByte(c)
+		switch {
+		case c == '[':
+			inClass, head = true, true
+		case c == ']':
+			inClass, head = false, false
+		default:
+			head = false
+		}
 	}
 	return b.String()
 }

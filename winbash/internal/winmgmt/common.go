@@ -174,10 +174,15 @@ func cellString(v any) string {
 //
 // 去色码这一步原先**没有** —— StripANSI 在 output 包里存在,生产链路却从不调用它,
 // 只有它自己的测试在调。眼下色码确实进不来(pwsh 子进程拿的是 CREATE_NO_WINDOW,
-// 检测不到终端),但那是环境使然,不是保证:换成 ConPTY 或换个 pwsh 版本,
-// 色码就会直接落进数据里,而每格过一遍正则的成本可以忽略。
+// 检测不到终端),但那是环境使然,不是保证:换成 ConPTY 或换个 pwsh 版本,色码就会
+// 直接落进数据里。
+//
+// 先做一次字节扫描再决定要不要跑正则:② 层的**每一格**都过这里,而绝大多数单元格
+// 里没有 ESC —— 正则不该在这条热路径上无条件跑。
 func sanitizeCell(s string) string {
-	s = output.StripANSI(s)
+	if strings.IndexByte(s, 0x1b) >= 0 {
+		s = output.StripANSI(s)
+	}
 	if !strings.ContainsAny(s, "\t\r\n") {
 		return s
 	}

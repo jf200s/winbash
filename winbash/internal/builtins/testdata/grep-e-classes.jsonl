@@ -1,0 +1,8 @@
+{"pattern":"[\\d]","exit":0,"out":["\\","d"]}
+{"pattern":"[\\w]","exit":0,"out":["\\","w"]}
+{"pattern":"[\\\\d]","exit":0,"out":["\\","d"]}
+{"pattern":"[\\\\]","exit":0,"out":["\\"]}
+{"pattern":"[\\]]","exit":1,"out":null}
+{"pattern":"[\\[]","exit":0,"out":["\\","["]}
+{"pattern":"[\\-a]","exit":0,"out":["\\","]","a","^"]}
+{"pattern":"[a\\-z]","exit":0,"out":["\\","d","]","a","z","b","w","^"]}

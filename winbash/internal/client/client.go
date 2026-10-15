@@ -48,7 +48,7 @@ func Run(endpoint, script, cwd string, jsonOut bool) (ipc.Response, error) {
 // 嵌套里(见 inSession)不走 daemon,直接在本进程执行 —— 理由见 runLocal。
 func RunTimeout(endpoint, script, cwd string, jsonOut bool, timeout time.Duration) (ipc.Response, error) {
 	if inSession() {
-		return runLocal(script, jsonOut)
+		return runLocal(script, jsonOut, timeout)
 	}
 	return oneShot(endpoint, ipc.Request{Script: script, Cwd: cwd, JSON: jsonOut}, false, timeout)
 }
@@ -327,10 +327,24 @@ func inSession() bool {
 //
 // 关于 cwd:唯一调用方是 cmd/winbash,它传的就是本进程的 cwd,而 NewSession 本来
 // 就以进程 cwd 起始,所以这里不需要再切一次。
-func runLocal(script string, jsonOut bool) (ipc.Response, error) {
+func runLocal(script string, jsonOut bool, timeout time.Duration) (ipc.Response, error) {
 	sess := shell.NewSession()
 	defer sess.Close()
 
-	out, exit, errs := sess.Run(context.Background(), script, jsonOut)
+	// timeout 在嵌套里也生效。原先这里写死 context.Background(),于是
+	// `winbash --timeout 1s -c 'sleep 5'` 在嵌套下会真的睡满 5 秒 ——
+	// README 说 --timeout 是"单次请求超时",嵌套里却静默失效。
+	ctx := context.Background()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	out, exit, errs := sess.Run(ctx, script, jsonOut)
+	if cerr := ctx.Err(); cerr != nil {
+		// os.ErrDeadlineExceeded 带 Timeout() 方法,与 daemon 路径的超时是同一类,
+		// 上游能一眼认出"这是超时,不是脚本本身失败"。
+		return ipc.Response{}, fmt.Errorf("嵌套执行超过 %s: %w", timeout, os.ErrDeadlineExceeded)
+	}
 	return ipc.Response{OK: exit == 0, Out: []byte(out), Errors: errs, Exit: exit}, nil
 }
