@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"winbash/internal/testenv"
 )
 
 // 这一组测试把 winbash 的**纯 shell 语义**与真 bash 逐条对照 —— 语料取
@@ -336,7 +338,7 @@ func findRealBash(t *testing.T) string {
 func runRealBash(t *testing.T, bash, script string) (string, int) {
 	t.Helper()
 	cmd := exec.Command(bash, "-c", script)
-	cmd.Env = cleanCorpusEnv()
+	cmd.Env = testenv.CleanBashEnv()
 	cmd.Stdin = strings.NewReader("")
 	out, err := cmd.Output()
 	code := 0
@@ -348,20 +350,5 @@ func runRealBash(t *testing.T, bash, script string) (string, int) {
 	return strings.TrimRight(string(out), " \t\r\n"), code
 }
 
-// cleanCorpusEnv 去掉会改写"真 bash"行为的启动注入项。
-//
-// BASH_ENV / ENV 是启动脚本,导出的 shell 函数则以 BASH_FUNC_<name>%% 的形式躺在
-// 环境里 —— 只裁前者不够,垫片本身还是会被导入。
-func cleanCorpusEnv() []string {
-	var out []string
-	for _, kv := range os.Environ() {
-		name, _, _ := strings.Cut(kv, "=")
-		if strings.EqualFold(name, "BASH_ENV") ||
-			strings.EqualFold(name, "ENV") ||
-			strings.HasPrefix(strings.ToUpper(name), "BASH_FUNC_") {
-			continue
-		}
-		out = append(out, kv)
-	}
-	return out
-}
+// cleanCorpusEnv 已挪到 internal/testenv(规则只有一条,实现只该有一份 —— 它原先在
+// builtins 与 shell 两个包里被逐字抄了两遍)。

@@ -83,14 +83,30 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 			continue
 		}
 
-		// 收集这一轮要输出的名字,再统一排序。
+		// 收集条目(名字 + 可选 info),再统一排序。
 		//
-		// 为什么不能"先写 . 与 ..、再写 ReadDir 的结果":bash 把它们放在**同一个排序**里。
-		// 实测目录含 `!x` 时,真 bash 给 `!x . .. .hidden ...`(`!` 是 0x21,排在
-		// `.` 的 0x2E 之前),而先写就得到 `. .. !x ...`,顺序错了。
-		names := make([]string, 0, len(entries)+2)
+		// 两个要点,都是踩过才写下来的:
+		//
+		//  1. `.` 与 `..` 必须**参与同一个排序**,不能先写出去。实测目录含 `!x` 时,
+		//     真 bash 给 `!x . .. .hidden ...`(`!` 是 0x21,排在 `.` 的 0x2E 之前)。
+		//  2. 真实条目走 `DirEntry.Info()`,**不要**换成 `os.Stat`。Windows 上
+		//     os.ReadDir 已经把大小与属性放在 WIN32_FIND_DATA 里带回来了,Info() 直接
+		//     取缓存;而 os.Stat 是一次全新的 GetFileAttributesEx —— 每个条目多一次
+		//     系统调用(同进程 3000 项微基准下 4574×,端到端在热缓存上看不出来,
+		//     但在冷缓存/网络盘上会)。短格式(`ls` 不带 `-l`)**完全不用 info**,
+		//     那条路径上连取都不该取。
+		type lsItem struct {
+			name string
+			info os.FileInfo // 短格式时为 nil,writeLsEntry 不会碰它
+		}
+		items := make([]lsItem, 0, len(entries)+2)
 		if all {
-			names = append(names, ".", "..")
+			// 只有这两个合成条目需要真去问一次(它们不在 entries 里)。
+			for _, n := range []string{".", ".."} {
+				if fi, ierr := os.Stat(filepath.Join(abs, n)); ierr == nil {
+					items = append(items, lsItem{n, fi})
+				}
+			}
 		}
 		for _, e := range entries {
 			// 点文件默认不列。这是 **POSIX 语义**,与 Windows 的"隐藏属性"无关 ——
@@ -100,18 +116,22 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 			if !all && strings.HasPrefix(e.Name(), ".") {
 				continue
 			}
-			names = append(names, e.Name())
-		}
-		sort.Strings(names)
-
-		for _, name := range names {
-			info, ierr := os.Stat(filepath.Join(abs, name))
+			if !long {
+				items = append(items, lsItem{name: e.Name()})
+				continue
+			}
+			fi, ierr := e.Info()
 			if ierr != nil {
-				fmt.Fprintln(errw, errs.Errorf("ls", ierr.Error(), "读不到 "+name+" 的属性,已跳过"))
+				fmt.Fprintln(errw, errs.Errorf("ls", ierr.Error(), "读不到 "+e.Name()+" 的属性,已跳过"))
 				code = errs.ExitError
 				continue
 			}
-			writeLsEntry(out, name, info, long, human)
+			items = append(items, lsItem{e.Name(), fi})
+		}
+		sort.Slice(items, func(i, j int) bool { return items[i].name < items[j].name })
+
+		for _, it := range items {
+			writeLsEntry(out, it.name, it.info, long, human)
 		}
 	}
 	return code

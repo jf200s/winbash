@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"os"
 	"os/exec"
@@ -12,6 +13,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"winbash/internal/testenv"
 )
 
 // grepClassGolden 是一行 JSONL 记录。
@@ -19,6 +22,10 @@ type grepClassGolden struct {
 	Pattern string   `json:"pattern"`
 	Exit    int      `json:"exit"`
 	Out     []string `json:"out"`
+	// Stderr 记"真 grep 有没有往 stderr 写东西"(不是内容:两侧的措辞本来就不同,
+	// winbash 用中文三行式)。它是判据的一部分 —— 只看 exit 与 stdout 会漏掉
+	// "打了 stderr 但退出码仍是 0"那一类形态。
+	Stderr bool `json:"stderr,omitempty"`
 }
 
 // grepClassCorpus 是一字符一行的语料:grep 的**匹配结果本身就是字符集合**,
@@ -33,7 +40,7 @@ const grepClassCorpus = "\\\nd\n]\na\nz\n-\nb\nw\n[\n^\n0\n5\n"
 //	[\]]         类首紧跟的字面量 `]`:不能当成类的结束,否则被截断成空集合。
 //	[\[] [\-a]   类内其它位置的 `\`:同样按字面处理。
 //	[a\-z]       类内的 `\-`:真 grep 也不当区间(区间要么两端都裸,要么都转义)。
-const grepClassPatterns = `["[\\d]","[\\w]","[\\\\d]","[\\\\]","[\\]]","[\\[]","[\\-a]","[a\\-z]"]`
+const grepClassPatterns = `["[\\d]","[\\w]","[\\\\d]","[\\\\]","[\\]]","[\\[]","[\\-a]","[a\\-z]","[[:alpha:]\\d]","[[:alpha:]]","[[:digit:]\\d]"]`
 
 var updateGrepGolden = flag.Bool("update-grep-golden", false,
 	"用真 Git Bash 重新生成 testdata/grep-e-classes.jsonl")
@@ -66,6 +73,10 @@ func TestGrepEClassesMatchRealGrep(t *testing.T) {
 
 			if code != c.Exit {
 				t.Fatalf("退出码 = %d, 真 grep = %d\nwinbash stderr:\n%s", code, c.Exit, errw.String())
+			}
+			if got := errw.Len() > 0; got != c.Stderr {
+				t.Errorf("stderr 的有无与真 grep 不一致: winbash=%v 真grep=%v\nwinbash stderr:\n%s",
+					got, c.Stderr, errw.String())
 			}
 			got := grepClassLines(out.String())
 			if !slices.Equal(got, c.Out) {
@@ -103,22 +114,22 @@ func TestUpdateGrepClassGolden(t *testing.T) {
 		// cmd.Dir + 相对文件名:绕开 Windows 路径与 MSYS 路径的换算,少一个变量。
 		cmd := exec.Command(bash, "-c", "grep -E "+shellSingleQuote(p)+" chars.txt")
 		cmd.Dir = dir
-		// 显式环境,滤掉 BASH_ENV / ENV / BASH_FUNC_*:宿主可能注入 shell 函数垫片,
-		// 那样"真 bash"这个参照物就被改写了,参照物不可信则差分测试没有意义。
-		cmd.Env = cleanBashEnv()
-		var out bytes.Buffer
+		// 显式环境:滤掉 BASH_ENV / ENV / BASH_FUNC_*,并把 MSYS 与 locale 固定下来 ——
+		// "哪些环境项会让参照 bash 不再可信"是一条规则,只在 testenv 里实现一份。
+		cmd.Env = testenv.CleanBashEnv()
+		var out, errb bytes.Buffer
 		cmd.Stdout = &out
-		cmd.Stderr = &out
+		cmd.Stderr = &errb
 		code := 0
 		if err := cmd.Run(); err != nil {
 			var ee *exec.ExitError
-			if !asExitError(err, &ee) {
+			if !errors.As(err, &ee) {
 				t.Fatalf("跑真 bash 失败: %v", err)
 			}
 			code = ee.ExitCode()
 		}
 
-		rec := grepClassGolden{Pattern: p, Exit: code, Out: grepClassLines(out.String())}
+		rec := grepClassGolden{Pattern: p, Exit: code, Out: grepClassLines(out.String()), Stderr: errb.Len() > 0}
 		line, err := json.Marshal(rec)
 		if err != nil {
 			t.Fatal(err)
@@ -188,29 +199,6 @@ func grepClassLines(s string) []string {
 	return strings.Split(s, "\n")
 }
 
-// cleanBashEnv 去掉会让"真 bash"不再是真 bash 的环境项。
-func cleanBashEnv() []string {
-	var out []string
-	for _, kv := range os.Environ() {
-		name, _, _ := strings.Cut(kv, "=")
-		if strings.EqualFold(name, "BASH_ENV") ||
-			strings.EqualFold(name, "ENV") ||
-			strings.HasPrefix(strings.ToUpper(name), "BASH_FUNC_") {
-			continue
-		}
-		out = append(out, kv)
-	}
-	return out
-}
-
 func shellSingleQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
-}
-
-func asExitError(err error, target **exec.ExitError) bool {
-	if ee, ok := err.(*exec.ExitError); ok {
-		*target = ee
-		return true
-	}
-	return false
 }

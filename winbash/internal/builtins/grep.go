@@ -260,6 +260,54 @@ func compileGrep(pattern string, opts *grepOpts) (re *regexp.Regexp, problem, re
 	return r, "", ""
 }
 
+// classEnd 返回从 start(必须指向 `[`)开始的字符类的**闭合 `]` 之后**那个下标。
+// 没有闭合时返回 len(pattern)。
+//
+// 这是字符类规则的**唯一一份实现**。它认三条 POSIX 规则:
+//
+//	`[` 或 `[^` **紧跟**的 `]` 是字面量,不结束字符类(`[]]` 是"含 `]` 的类")
+//	`[:name:]` / `[=ch=]` / `[.ch.]` 是类内的括号子结构,它的 `]` 不结束字符类
+//	(以及)真正的结束是第一个不落在上面两种情况里的 `]`
+//
+// 为什么必须只有一份:原先 normalizeEreClasses 与 firstPerlClass 各写一套,规则不一致 ——
+// 前者认字面量 `]`、后者也认,但**两者都不认 `[:name:]`**。于是 `[[:alpha:]\d]` 里
+// `[:alpha:]` 的收尾 `]` 被当成类的结束,`\d` 就被判成**类外**的 Perl 简写而拒收 ——
+// 而真 grep 给 `\dazbw`(exit 0)。修这一处必须**两个函数同时改**:只放开拒收的话,
+// 类内的 `\d` 会被 Go 当成数字类,变成"静默少匹配",比响亮报错更坏。
+func classEnd(pattern string, start int) int {
+	i := start + 1
+	if i < len(pattern) && pattern[i] == '^' {
+		i++
+	}
+	if i < len(pattern) && pattern[i] == ']' {
+		i++ // 类首的字面量 `]`
+	}
+	for i < len(pattern) {
+		switch pattern[i] {
+		case '\\':
+			i += 2 // 成对消费:转义的那个字符不再单独看
+			continue
+		case '[':
+			// `[:name:]` / `[=ch=]` / `[.ch.]` —— 找配对的 `<mark>]`。
+			if i+1 < len(pattern) && strings.ContainsRune(":=.", rune(pattern[i+1])) {
+				mark := pattern[i+1]
+				j := i + 2
+				for j+1 < len(pattern) && !(pattern[j] == mark && pattern[j+1] == ']') {
+					j++
+				}
+				if j+1 < len(pattern) {
+					i = j + 2
+					continue
+				}
+			}
+		case ']':
+			return i + 1
+		}
+		i++
+	}
+	return len(pattern)
+}
+
 // normalizeEreClasses 把字符类**内部**的 `\X` 改写成 ERE 该有的样子。
 //
 // POSIX ERE 里字符类内部的 `\` 只是个普通字符,所以 `[\d]` 等价于「反斜杠或 d」。
@@ -268,99 +316,83 @@ func compileGrep(pattern string, opts *grepOpts) (re *regexp.Regexp, problem, re
 // 直接报 invalid escape sequence。所以把单个 `\X` 写成 `\\X`(字面反斜杠 + X):
 // 保留 ERE 原意,同时让 POSIX 引擎能编译。
 //
-// 两个边界必须守住,**两个都踩过**:
-//
-//	`\\` 是**已经转义**的反斜杠,不能再动 —— 否则 `[\\]` 变成 `[\\\]`(未闭合),
-//	     `[\\d]` 变成不可编译的形态(实测报 invalid escape sequence,exit 2)。
-//	`[` 或 `[^` **紧跟**的 `]` 是字面量,不结束字符类 —— 否则 `[\]]` 被截断成
-//	     "反斜杠后跟 ]"的空集合,静默返回无匹配(exit 1,看着像"真的没有匹配")。
-//
-// 这两条与 firstPerlClass 是同一套字符类规则,那个函数也处理了字面量 `]`。以后若再动
-// 字符类扫描,应当抽一个共用的状态机,别在一个包里放两份规则不同的实现。
+// 边界用 classEnd 定(类首字面量 `]`、`[:name:]` 收尾的 `]`、已转义的 `\\`),这里只负责
+// **类内**的改写 —— 类外一概不动。曾经的写法自己维护 `inClass`,于是 `[:alpha:]` 的收尾
+// `]` 被误当成类的结束,`\d` 落到"类外"分支原样透传给了 POSIX 引擎(静默少匹配)。
 func normalizeEreClasses(pattern string) string {
 	var b strings.Builder
-	inClass, head := false, false
-	for i := 0; i < len(pattern); i++ {
-		c := pattern[i]
-
-		// 类开头允许一个 `^`,以及一个字面量 `]`(紧跟 `[` 或 `[^`)。
-		if inClass && head {
-			if c == '^' {
-				b.WriteByte(c)
-				continue // head 仍为 true:后面还可能跟字面量 `]`
-			}
-			if c == ']' {
-				b.WriteByte(c)
-				head = false
+	for i := 0; i < len(pattern); {
+		if pattern[i] != '[' {
+			// 类外:原样抄。`\.` 这类转义在类外是有意义的,不能碰。
+			if pattern[i] == '\\' && i+1 < len(pattern) {
+				b.WriteByte(pattern[i])
+				b.WriteByte(pattern[i+1])
+				i += 2
 				continue
 			}
-			head = false
-			// 落到下面的常规处理
-		}
-
-		if c == '\\' && i+1 < len(pattern) {
-			next := pattern[i+1]
-			switch {
-			case !inClass:
-				b.WriteByte(c)
-				b.WriteByte(next)
-			case next == '\\':
-				b.WriteString(`\\`) // 已经是转义的转义,原样保留
-			default:
-				b.WriteString(`\\`) // 类内的 `\X` = 字面反斜杠 + X
-				b.WriteByte(next)
-			}
+			b.WriteByte(pattern[i])
 			i++
-			head = false
 			continue
 		}
-
-		b.WriteByte(c)
-		switch {
-		case c == '[':
-			inClass, head = true, true
-		case c == ']':
-			inClass, head = false, false
-		default:
-			head = false
+		end := classEnd(pattern, i)
+		if end <= i {
+			end = i + 1 // 防御:不该发生
 		}
+		b.WriteString(normalizeClassBody(pattern[i:end]))
+		i = end
+	}
+	return b.String()
+}
+
+// normalizeClassBody 改写一个**完整**字符类(含首尾方括号)内部的 `\X`。
+func normalizeClassBody(body string) string {
+	var b strings.Builder
+	// 类首的 `^` 与字面量 `]` 原样抄过去,它们不参与 `\X` 处理。
+	head := 1
+	if head < len(body) && body[head] == '^' {
+		head++
+	}
+	if head < len(body) && body[head] == ']' {
+		head++
+	}
+	b.WriteString(body[:head])
+	for i := head; i < len(body); {
+		if body[i] == '\\' && i+1 < len(body) {
+			if body[i+1] == '\\' {
+				b.WriteString(`\\`) // 已经是转义的转义,原样保留
+			} else {
+				b.WriteString(`\\`) // 类内的 `\X` = 字面反斜杠 + X
+				b.WriteByte(body[i+1])
+			}
+			i += 2
+			continue
+		}
+		b.WriteByte(body[i])
+		i++
 	}
 	return b.String()
 }
 
 // firstPerlClass 找出 pattern 里第一个 Perl 简写类,返回它的字面写法。
 //
-// 两处必须小心:
+// 两条规则:
 //
-//   - 成对跳过转义:`\\d` 是「字面反斜杠 + d」,不是 Perl 类。
-//   - **不进字符类内部**:`[\d]` 在 POSIX ERE 里是合法的,它匹配反斜杠或字母 d。
-//     原先的扫描器只看反斜杠,于是 `grep -E '[\d]'` 被判成 Perl 简写而拒收 ——
-//     一段合法脚本凭空失败(真 bash 给 exit 1:「无匹配」,不是「语法错」)。
+//   - 成对跳过转义:类外的 `\\d` 是「字面反斜杠 + d」,不是 Perl 类。
+//   - **不进字符类内部**:`[\d]`、`[[:alpha:]\d]` 在 POSIX ERE 里都合法,类内的 `\` 只是
+//     普通字符。整个字符类交给 classEnd 一次跳过 —— 早先自己维护 `inClass` 且不认
+//     `[:name:]`,于是 `[[:alpha:]\d]` 里 `[:alpha:]` 的收尾 `]` 被当成类结束,`\d`
+//     落到"类外"而拒收了一整段合法 ERE(真 grep 给 `\dazbw`,exit 0)。
 func firstPerlClass(pattern string) (string, bool) {
-	inClass := false
 	for i := 0; i+1 < len(pattern); i++ {
 		switch pattern[i] {
 		case '\\':
-			if !inClass {
-				switch pattern[i+1] {
-				case 'd', 'D', 'w', 'W', 's', 'S':
-					return pattern[i : i+2], true
-				}
+			switch pattern[i+1] {
+			case 'd', 'D', 'w', 'W', 's', 'S':
+				return pattern[i : i+2], true
 			}
 			i++ // 跳过被转义的那个字符
 		case '[':
-			if !inClass {
-				inClass = true
-				// POSIX:紧跟 `[` 或 `[^` 的 `]` 是字面量,不结束字符类。
-				if i+1 < len(pattern) && pattern[i+1] == '^' {
-					i++
-				}
-				if i+1 < len(pattern) && pattern[i+1] == ']' {
-					i++
-				}
-			}
-		case ']':
-			inClass = false
+			i = classEnd(pattern, i) - 1 // 整个字符类跳过去(含 `[:alpha:]`)
 		}
 	}
 	return "", false

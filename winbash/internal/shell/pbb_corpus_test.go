@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"os"
 	"os/exec"
@@ -12,6 +13,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"winbash/internal/testenv"
 )
 
 // 本文件的语料取自 pure-bash-bible(https://github.com/dylanaraps/pure-bash-bible)。
@@ -98,12 +101,15 @@ var updatePbb = flag.Bool("update-pbb-corpus", false,
 	"用真 Git Bash 重新生成 testdata/pbb-corpus.jsonl")
 
 type pbbGolden struct {
-	Name   string   `json:"name"`
-	Out    []string `json:"out"`
-	Exit   int      `json:"exit"`
-	Errs   []string `json:"errs,omitempty"`
-	Known  string   `json:"known,omitempty"`
-	Source string   `json:"source,omitempty"`
+	Name string   `json:"name"`
+	Out  []string `json:"out"`
+	Exit int      `json:"exit"`
+	// ErrNonEmpty 记"真 bash 有没有往 stderr 写东西"(不记内容:两侧措辞本来就不同,
+	// winbash 用中文三行式)。这是判据的一部分 —— 回应 §四 特别点出 `printf '%.0s'`
+	// 那条"打了 stderr 但退出码仍是 0"最需要盯住,而只看 exit/stdout 正好漏掉它。
+	ErrNonEmpty bool   `json:"err_non_empty,omitempty"`
+	Known       string `json:"known,omitempty"`
+	Source      string `json:"source,omitempty"`
 }
 
 // TestPbbCorpusMatchesRealBash 拿 pure-bash-bible 的用法压 ① 层,期望值来自真 Git Bash。
@@ -114,8 +120,9 @@ func TestPbbCorpusMatchesRealBash(t *testing.T) {
 		byName[g.Name] = g
 	}
 
-	bash := findRealBash(t) // 没有真 bash 就 Skip(与 corpus_test.go 同一套判断)
-
+	// 本测试**不**需要真 Git Bash:它比的是已提交的 golden 表,真 bash 只在
+	// TestUpdatePbbCorpus 里才要。早先这里调了 findRealBash,于是没有 Git Bash 的
+	// 机器/CI 上 37 条子用例会**整条 skip** —— 回归网静默消失,但表面上还是"绿"的。
 	for _, c := range pbbCases {
 		t.Run(c.name, func(t *testing.T) {
 			want, ok := byName[c.name]
@@ -128,7 +135,8 @@ func TestPbbCorpusMatchesRealBash(t *testing.T) {
 			out, exit, errs := s.Run(context.Background(), c.script, false)
 			gotOut := pbbLines(out)
 
-			same := exit == want.Exit && slices.Equal(gotOut, want.Out)
+			same := exit == want.Exit && slices.Equal(gotOut, want.Out) &&
+				(len(errs) > 0) == want.ErrNonEmpty
 
 			if c.known != "" {
 				// 已知差异:断言"差异**仍然**存在"——哪天它自己一致了就该删掉这条,
@@ -149,8 +157,6 @@ func TestPbbCorpusMatchesRealBash(t *testing.T) {
 			}
 		})
 	}
-
-	_ = bash
 }
 
 // TestUpdatePbbCorpus 用真 Git Bash 重新生成 golden 表。默认跳过。
@@ -166,26 +172,27 @@ func TestUpdatePbbCorpus(t *testing.T) {
 	var buf bytes.Buffer
 	for _, c := range pbbCases {
 		cmd := exec.Command(bash, "-c", c.script)
-		cmd.Env = cleanCorpusEnv()
+		cmd.Env = testenv.CleanBashEnv()
 		cmd.Stdin = strings.NewReader("")
-		var out bytes.Buffer
+		var out, errb bytes.Buffer
 		cmd.Stdout = &out
-		cmd.Stderr = &out
+		cmd.Stderr = &errb
 		code := 0
 		if err := cmd.Run(); err != nil {
-			ee, ok := err.(*exec.ExitError)
-			if !ok {
+			var ee *exec.ExitError
+			if !errors.As(err, &ee) {
 				t.Fatalf("%s: 跑真 bash 失败: %v", c.name, err)
 			}
 			code = ee.ExitCode()
 		}
 
 		rec := pbbGolden{
-			Name:   c.name,
-			Out:    pbbLines(out.String()),
-			Exit:   code,
-			Known:  c.known,
-			Source: c.section,
+			Name:        c.name,
+			Out:         pbbLines(out.String()),
+			Exit:        code,
+			ErrNonEmpty: errb.Len() > 0,
+			Known:       c.known,
+			Source:      c.section,
 		}
 		line, err := json.Marshal(rec)
 		if err != nil {

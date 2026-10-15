@@ -6,3 +6,6 @@
 {"pattern":"[\\[]","exit":0,"out":["\\","["]}
 {"pattern":"[\\-a]","exit":0,"out":["\\","]","a","^"]}
 {"pattern":"[a\\-z]","exit":0,"out":["\\","d","]","a","z","b","w","^"]}
+{"pattern":"[[:alpha:]\\d]","exit":0,"out":["\\","d","a","z","b","w"]}
+{"pattern":"[[:alpha:]]","exit":0,"out":["d","a","z","b","w"]}
+{"pattern":"[[:digit:]\\d]","exit":0,"out":["\\","d","0","5"]}
