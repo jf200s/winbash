@@ -2,6 +2,7 @@ package builtins
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -60,9 +61,12 @@ func Grep(ctx context.Context, cwd string, argv []string, in io.Reader, out, err
 	}
 
 	if len(files) == 0 {
-		res, ierr := grepStream(in, re, opts, "", showName, out)
+		res, binary, ierr := grepStream(in, re, opts, "", showName, out)
 		if ierr != nil {
 			report(ierr, "读输入时出错")
+		}
+		if binary && !opts.namesOnly && !opts.quiet {
+			noteBinary(errw, "")
 		}
 		anyMatch = res.matched
 	} else {
@@ -70,9 +74,12 @@ func Grep(ctx context.Context, cwd string, argv []string, in io.Reader, out, err
 			if f == "-" {
 				// `-` 显式表示标准输入。与无文件名时的区别是:这时它是「文件列表里的一员」,
 				// 多文件输出要给出行归属 —— bash 用的名字就是 "(standard input)"。
-				res, ierr := grepStream(in, re, opts, "(standard input)", showName, out)
+				res, binary, ierr := grepStream(in, re, opts, "(standard input)", showName, out)
 				if ierr != nil {
 					report(ierr, "读标准输入时出错")
+				}
+				if binary && !opts.namesOnly && !opts.quiet {
+					noteBinary(errw, "(standard input)")
 				}
 				anyMatch = anyMatch || res.matched
 				continue
@@ -97,11 +104,11 @@ func Grep(ctx context.Context, cwd string, argv []string, in io.Reader, out, err
 					report(fmt.Errorf("%s 是目录", f), "递归搜索目录请加 -r: grep -r PATTERN "+f)
 					continue
 				}
-				anyMatch = grepTree(abs, f, re, opts, out, report) || anyMatch
+				anyMatch = grepTree(abs, f, re, opts, out, errw, report) || anyMatch
 				continue
 			}
 
-			m, ok := grepFile(abs, re, opts, f, showName, out, report)
+			m, ok := grepFile(abs, re, opts, f, showName, out, errw, report)
 			anyMatch = anyMatch || (ok && m)
 		}
 	}
@@ -412,8 +419,11 @@ type grepResult struct {
 //
 // 行尾只剥 \n,不剥 \r:CRLF 文件在 Git Bash 的 grep 下也会把 \r 带进匹配与输出,
 // 这里保持一致,而不是替使用者做「这应该是文本行」的假设。
-func grepStream(r io.Reader, re *regexp.Regexp, opts *grepOpts, label string, showName bool, out io.Writer) (grepResult, error) {
+//
+// binary 这第三个返回值见 noteBinary:它只用于**提示**,不影响输出内容。
+func grepStream(r io.Reader, re *regexp.Regexp, opts *grepOpts, label string, showName bool, out io.Writer) (grepResult, bool, error) {
 	var res grepResult
+	binary := false
 	br := bufio.NewReaderSize(SafeStdin(r), 64*1024)
 	lineNo := 0
 
@@ -433,12 +443,17 @@ func grepStream(r io.Reader, re *regexp.Regexp, opts *grepOpts, label string, sh
 			}
 
 			if hit {
+				// 匹配到了,而且这行里有 NUL —— 说明"命中"可能只是二进制噪声
+				// (例如压缩包、可执行文件、UTF-16 文本)。**输出照旧**(见 noteBinary)。
+				if bytes.IndexByte(content, 0) >= 0 {
+					binary = true
+				}
 				res.matched = true
 				res.lines++
 				if opts.namesOnly {
 					// -l 每个文件只报一次,不必扫完。
 					fmt.Fprintln(out, nameForListing(label))
-					return res, nil
+					return res, binary, nil
 				}
 				if !opts.count {
 					writeGrepLine(out, label, showName, lineNo, opts, content)
@@ -450,14 +465,39 @@ func grepStream(r io.Reader, re *regexp.Regexp, opts *grepOpts, label string, sh
 			if err == io.EOF {
 				break
 			}
-			return res, err
+			return res, binary, err
 		}
 	}
 
 	if opts.count {
 		writeGrepCount(out, label, showName, res.lines)
 	}
-	return res, nil
+	return res, binary, nil
+}
+
+// noteBinary 说明"这个文件里有匹配行含 NUL"。
+//
+// 为什么只提示、不改写输出:真 GNU grep 检测到 NUL 会切到二进制模式,把内容压成一行
+// `Binary file X matches`。但那套判定是 **libc 内部 buffer 策略**(实测:一个 45KB
+// 的文件,前 40000 字节是纯文本匹配行、后面才有 NUL,GNU 照样判它 binary)——
+// 依赖那个边界等于给使用者一个"像 GNU 但边界不同"的假预期。
+//
+// 更有害的是把 NUL 与 0xFF 直接吐给下游:对面向 AI 的 shell 来说那是污染 token、
+// 破坏解析。所以两头都不要走极端:**输出不动**(规则可解释、行号可复现,`grep -c`
+// 与真 grep 逐字一致),但**不再静默** —— 匹配行里有 NUL 就往 stderr 说一句,
+// 让使用者知道"你刚才拿到的可能不是文本"。
+//
+// 默认参数下真 grep 不会打印内容,所以这条在 stdout 上与真 grep 不同 ——
+// README 的「已知差异」表里记着这一条。
+func noteBinary(errw io.Writer, label string) {
+	name := label
+	if name == "" {
+		name = "(standard input)"
+	}
+	fmt.Fprintln(errw, errs.Errorf("grep",
+		"匹配行里有 NUL 字节("+name+" 是二进制文件)",
+		"真 grep 在这里只打一行 `Binary file ... matches`;我们保持逐行输出以便定位与计数。"+
+			"要跳过二进制文件请用 `grep -l` 先看是哪些,或先用 `file`/`head -c 16 | od -c` 确认内容类型"))
 }
 
 // nameForListing 给出 -l 要打印的名字。从标准输入读时 bash 打印 "(standard input)"。
@@ -491,7 +531,7 @@ func writeGrepCount(out io.Writer, label string, showName bool, n int) {
 //
 // 第二个返回值为 false 表示这个文件根本没读成(已被 report 报了错),
 // 调用方不能把它当「没命中」——否则退出码会从「错误」退化成「没找到」。
-func grepFile(abs string, re *regexp.Regexp, opts *grepOpts, label string, showName bool, out io.Writer, report func(error, string)) (matched, ok bool) {
+func grepFile(abs string, re *regexp.Regexp, opts *grepOpts, label string, showName bool, out io.Writer, errw io.Writer, report func(error, string)) (matched, ok bool) {
 	f, err := os.Open(abs)
 	if err != nil {
 		report(err, "先确认文件存在,或用 winbash -c 'ls 目录' 看有哪些名字")
@@ -499,10 +539,14 @@ func grepFile(abs string, re *regexp.Regexp, opts *grepOpts, label string, showN
 	}
 	defer f.Close()
 
-	res, err := grepStream(f, re, opts, label, showName, out)
+	res, binary, err := grepStream(f, re, opts, label, showName, out)
 	if err != nil {
 		report(err, "读 "+label+" 时出错")
 		return res.matched, false
+	}
+	// -l 与 -q 的输出本来就只是"名字"或"什么都没有",它们不吐内容 —— 不必提示。
+	if binary && !opts.namesOnly && !opts.quiet {
+		noteBinary(errw, label)
 	}
 	return res.matched, true
 }
@@ -513,7 +557,7 @@ func grepFile(abs string, re *regexp.Regexp, opts *grepOpts, label string, showN
 // 而不是把 WalkDir 给的绝对路径直接打出去 —— 实测 `grep -r b .` 原本输出
 // `/c/Users/…/d.txt:b`,而真 bash 给 `./d.txt:b`。AI 拿到绝对路径后很难
 // 与它自己的输入对应起来(它写的是 `.`),这是那种"能用但总会让人怀疑"的差异。
-func grepTree(root, display string, re *regexp.Regexp, opts *grepOpts, out io.Writer, report func(error, string)) bool {
+func grepTree(root, display string, re *regexp.Regexp, opts *grepOpts, out io.Writer, errw io.Writer, report func(error, string)) bool {
 	anyMatch := false
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
 		if werr != nil {
@@ -529,7 +573,7 @@ func grepTree(root, display string, re *regexp.Regexp, opts *grepOpts, out io.Wr
 		}
 		// 递归输出里的路径用正斜杠:① 层的文本语义按 bash 来。
 		label := filepath.ToSlash(displayRel(display, p, root))
-		if matched, ok := grepFile(p, re, opts, label, true, out, report); ok && matched {
+		if matched, ok := grepFile(p, re, opts, label, true, out, errw, report); ok && matched {
 			anyMatch = true
 		}
 		return nil

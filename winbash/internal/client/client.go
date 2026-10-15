@@ -36,8 +36,11 @@ type endpointInfo struct {
 //
 // daemon 没起来时先拉起它;若 daemon 刚死而端口文件还在,清掉陈旧文件后重拉一次
 // (Review Focus 第 5 条:daemon 死后 client 必须自行恢复,不能挂起等待)。
+//
+// idle=0 表示"不指定",由 daemon 侧取自己的默认值 —— 这是给测试与库调用方的入口;
+// 命令行一律走 RunTimeout 并把 --idle 显式传下去。
 func Run(endpoint, script, cwd string, jsonOut bool) (ipc.Response, error) {
-	return RunTimeout(endpoint, script, cwd, jsonOut, 0)
+	return RunTimeout(endpoint, script, cwd, jsonOut, 0, 0)
 }
 
 // RunTimeout 同 Run,但给整个往返设一个上限(timeout<=0 表示不设限)。
@@ -45,12 +48,15 @@ func Run(endpoint, script, cwd string, jsonOut bool) (ipc.Response, error) {
 // 这个上限会同时传给 daemon(见 ipc.Request.TimeoutMS):client 放弃不代表
 // daemon 该继续跑,否则一条无限循环会把后续命令全部饿死。
 //
+// idle 只在**这次调用把 daemon 拉起来**时用得上(见 spawnDaemon)。timeout 与 idle
+// 是两件事:前者是"这一条命令跑多久算超时",后者是"daemon 空着多久就自己走"。
+//
 // 嵌套里(见 inSession)不走 daemon,直接在本进程执行 —— 理由见 runLocal。
-func RunTimeout(endpoint, script, cwd string, jsonOut bool, timeout time.Duration) (ipc.Response, error) {
+func RunTimeout(endpoint, script, cwd string, jsonOut bool, timeout, idle time.Duration) (ipc.Response, error) {
 	if inSession() {
 		return runLocal(script, jsonOut, timeout)
 	}
-	return oneShot(endpoint, ipc.Request{Script: script, Cwd: cwd, JSON: jsonOut}, false, timeout)
+	return oneShot(endpoint, ipc.Request{Script: script, Cwd: cwd, JSON: jsonOut}, false, timeout, idle)
 }
 
 // Stop 让 daemon 退出。
@@ -63,7 +69,7 @@ func Stop(endpoint string) error {
 		return fmt.Errorf("client: 你正跑在一个 winbash 会话里,不能停掉自己所在的 daemon" +
 			"(嵌套的 winbash 是独立的,它不连 daemon);要停请在外面执行 winbash --stop")
 	}
-	resp, err := oneShot(endpoint, ipc.Request{Op: "stop"}, true, 0)
+	resp, err := oneShot(endpoint, ipc.Request{Op: "stop"}, true, 0, 0)
 	if err != nil {
 		return err
 	}
@@ -80,7 +86,7 @@ func Status(endpoint string) (string, error) {
 		return "", fmt.Errorf("client: 你正跑在一个 winbash 会话里,看不到 daemon 状态" +
 			"(嵌套的 winbash 不连 daemon);要看状态请在外面执行 winbash --status")
 	}
-	resp, err := oneShot(endpoint, ipc.Request{Op: "status"}, true, 0)
+	resp, err := oneShot(endpoint, ipc.Request{Op: "status"}, true, 0, 0)
 	if err != nil {
 		return "", err
 	}
@@ -91,8 +97,8 @@ func Status(endpoint string) (string, error) {
 //
 // mustExist=true:daemon 不在就报错(给 --stop/--status 用);
 // false:daemon 不在就把它拉起来(给执行脚本用)。
-func oneShot(endpoint string, req ipc.Request, mustExist bool, timeout time.Duration) (ipc.Response, error) {
-	info, err := dialAddr(endpoint, mustExist)
+func oneShot(endpoint string, req ipc.Request, mustExist bool, timeout, idle time.Duration) (ipc.Response, error) {
+	info, err := dialAddr(endpoint, mustExist, idle)
 	if err != nil {
 		return ipc.Response{}, err
 	}
@@ -102,7 +108,7 @@ func oneShot(endpoint string, req ipc.Request, mustExist bool, timeout time.Dura
 		req.TimeoutMS = int(timeout / time.Millisecond)
 	}
 
-	conn, err := dial(endpoint, info.addr, mustExist)
+	conn, err := dial(endpoint, info.addr, mustExist, idle)
 	if err != nil {
 		return ipc.Response{}, err
 	}
@@ -111,7 +117,7 @@ func oneShot(endpoint string, req ipc.Request, mustExist bool, timeout time.Dura
 	conn.Close()
 	if xerr == nil {
 		if resp.Auth {
-			return retryAfterAuthFailure(endpoint, req, timeout)
+			return retryAfterAuthFailure(endpoint, req, timeout, idle)
 		}
 		return resp, nil
 	}
@@ -133,11 +139,11 @@ func oneShot(endpoint string, req ipc.Request, mustExist bool, timeout time.Dura
 	// 剩下这类才是"半路上掉了":连接被重置、daemon 刚被杀。这种请求**极可能没送达**,
 	// 重试一次是「从偶发竞态里恢复」和「不在真故障上打转」之间的中点。
 	forgetStaleEndpoint(endpoint, info.addr)
-	info2, aerr := ensureDaemon(endpoint)
+	info2, aerr := ensureDaemon(endpoint, idle)
 	if aerr != nil {
 		return ipc.Response{}, xerr
 	}
-	conn2, derr := dial(endpoint, info2.addr, false)
+	conn2, derr := dial(endpoint, info2.addr, false, idle)
 	if derr != nil {
 		return ipc.Response{}, xerr
 	}
@@ -155,12 +161,12 @@ func oneShot(endpoint string, req ipc.Request, mustExist bool, timeout time.Dura
 // 新 daemon 把同一个端口文件改写成了自己的地址与 token。重读一次就拿到新的了。
 //
 // 重试仍失败就把原来的 401 原样交上去 —— 那才可能是真的有人在乱连。
-func retryAfterAuthFailure(endpoint string, req ipc.Request, timeout time.Duration) (ipc.Response, error) {
+func retryAfterAuthFailure(endpoint string, req ipc.Request, timeout, idle time.Duration) (ipc.Response, error) {
 	info2, err := readEndpoint(endpoint)
 	if err != nil {
 		return ipc.Response{}, fmt.Errorf("client: daemon 鉴权失败,且端口文件已不可读: %w", err)
 	}
-	conn2, err := dial(endpoint, info2.addr, false)
+	conn2, err := dial(endpoint, info2.addr, false, idle)
 	if err != nil {
 		return ipc.Response{}, err
 	}
@@ -183,7 +189,9 @@ func isTimeout(err error) bool {
 }
 
 // dial 建立到 addr 的连接;mustExist 时连不上就直接报"没在运行"。
-func dial(endpoint, addr string, mustExist bool) (net.Conn, error) {
+//
+// idle 只在"端口文件指向的 daemon 已经不在了、得重新拉一个"时才用得上。
+func dial(endpoint, addr string, mustExist bool, idle time.Duration) (net.Conn, error) {
 	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
 	if err == nil {
 		return conn, nil
@@ -193,7 +201,7 @@ func dial(endpoint, addr string, mustExist bool) (net.Conn, error) {
 	}
 	// 端口文件指向的 daemon 已经不在了。清掉陈旧端口再拉一次。
 	forgetStaleEndpoint(endpoint, addr)
-	info, aerr := ensureDaemon(endpoint)
+	info, aerr := ensureDaemon(endpoint, idle)
 	if aerr != nil {
 		return nil, aerr
 	}
@@ -243,9 +251,9 @@ func exchange(conn net.Conn, req ipc.Request, timeout time.Duration) (ipc.Respon
 }
 
 // dialAddr 决定往哪个地址连。mustExist 时只读端口文件,绝不拉起新 daemon。
-func dialAddr(endpoint string, mustExist bool) (endpointInfo, error) {
+func dialAddr(endpoint string, mustExist bool, idle time.Duration) (endpointInfo, error) {
 	if !mustExist {
-		return ensureDaemon(endpoint)
+		return ensureDaemon(endpoint, idle)
 	}
 	info, err := readEndpoint(endpoint)
 	if err != nil {
@@ -255,11 +263,16 @@ func dialAddr(endpoint string, mustExist bool) (endpointInfo, error) {
 }
 
 // ensureDaemon 返回端口文件内容;daemon 不在就先把它拉起来。
-func ensureDaemon(endpoint string) (endpointInfo, error) {
+//
+// idle 会原样转给新起的 daemon。**这件事必须做到**:不转发的话,使用者写的
+// `--idle 3s` 会被静默丢弃,自动拉起的 daemon 永远用默认的 30 分钟 ——
+// 属于"文档承诺了、实现没转发",而这类落差最伤信任(实测:不转发时等 6s 后
+// daemon 仍在、端口文件仍在)。
+func ensureDaemon(endpoint string, idle time.Duration) (endpointInfo, error) {
 	if info, err := readEndpoint(endpoint); err == nil {
 		return info, nil
 	}
-	if err := spawnDaemon(endpoint); err != nil {
+	if err := spawnDaemon(endpoint, idle); err != nil {
 		return endpointInfo{}, fmt.Errorf("client: 启动 daemon 失败: %w", err)
 	}
 	deadline := time.Now().Add(startupBudget)
@@ -293,17 +306,37 @@ func readEndpoint(endpoint string) (endpointInfo, error) {
 }
 
 // spawnDaemon 以 --serve 重新启动自己。隐藏窗口,不打扰使用者。
-func spawnDaemon(endpoint string) error {
+func spawnDaemon(endpoint string, idle time.Duration) error {
 	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command(exe, "--serve", "--endpoint", endpoint)
+	cmd := exec.Command(exe, serveArgs(endpoint, idle)...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: createNoWindow,
 	}
 	return cmd.Start()
+}
+
+// serveArgs 拼出拉起的 daemon 的命令行。抽成纯函数是为了能测 ——
+// spawnDaemon 自己必须构建真 exe 才跑得起来(测试进程里 os.Executable() 是
+// winbash.test,它不认识 --serve),但"参数有没有拼对"是这里最容易出错、
+// 也最值得钉的一环。
+//
+// idle>0 时把 `--idle <时长>` 拼进去。**这一条不能省**:不拼的话使用者显式写的
+// `--idle 3s` 会被静默丢掉,自动拉起的 daemon 永远用默认的 30 分钟 ——
+// 实测过:不转发时 `winbash --idle 3s -c 'echo x'` 等 7s 后 daemon 仍在、
+// 端口文件仍在;转发后同一命令 7s 内自己走干净。
+//
+// idle<=0 时**不传**这个开关:`--idle 0` 是另一个意思("永不退出"),
+// 传过去会改变 daemon 的默认行为,而不是表达"没指定"。
+func serveArgs(endpoint string, idle time.Duration) []string {
+	args := []string{"--serve", "--endpoint", endpoint}
+	if idle > 0 {
+		args = append(args, "--idle", idle.String())
+	}
+	return args
 }
 
 // inSession 报告「这次调用是不是从 winbash 会话里发起的」。

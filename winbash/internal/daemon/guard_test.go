@@ -172,11 +172,11 @@ func TestTimedOutRequestStopsRunningInDaemon(t *testing.T) {
 	ep := startDaemon(t, DefaultReadTimeout)
 
 	// 无限循环,客户端 600ms 就放弃
-	_, _ = client.RunTimeout(ep, "while :; do :; done", "", false, 600*time.Millisecond)
+	_, _ = client.RunTimeout(ep, "while :; do :; done", "", false, 600*time.Millisecond, 0)
 
 	// daemon 侧应当在请求自带的超时到点后自己收手,于是下一条命令很快就能跑
 	start := time.Now()
-	if _, err := client.RunTimeout(ep, "echo second", "", false, 10*time.Second); err != nil {
+	if _, err := client.RunTimeout(ep, "echo second", "", false, 10*time.Second, 0); err != nil {
 		t.Fatalf("第二条失败了: %v", err)
 	}
 	if el := time.Since(start); el > 5*time.Second {
@@ -195,7 +195,7 @@ func TestTimeoutDoesNotReplayTheScript(t *testing.T) {
 	marker := filepath.Join(t.TempDir(), "runs.txt")
 	script := "echo RUN >> '" + marker + "'; sleep 4"
 
-	_, _ = client.RunTimeout(ep, script, "", false, 800*time.Millisecond)
+	_, _ = client.RunTimeout(ep, script, "", false, 800*time.Millisecond, 0)
 	// 等 daemon 侧也跑完(它会因为请求超时而收手,但给足时间以免误判)
 	time.Sleep(6 * time.Second)
 

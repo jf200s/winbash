@@ -182,10 +182,11 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 | `${#关联数组[@]}` | mvdan/sh 的缺口:恒返回 `1`(键列表 `${!m[@]}` 与取值都是对的) |
 | `IFS` 给**多字符** | mvdan/sh 把整个串当分隔符,真 bash 只取**第一个字符**(`IFS=BC` 等价 `IFS=B`)。**静默**差异,光看输出看不出对错 —— 要按多字符分,请用 `IFS=,` 这类单字符,或先 `tr` 转换 |
 | `printf '%.0s'` 这类宽度为 0 的格式 | mvdan/sh 的内建 printf 不认(打 `invalid format char`),而且**退出码仍是 0** —— 唯一"有 stderr 但退出码不非零"的形态,靠退出码判断成败的调用方要当心 |
-| `more` | Git Bash 里没有,我们用了 Windows 的——多一个工具,不是缺陷 |
+| `grep` 遇到含 NUL 的文件 | **输出策略与真 grep 不同**:真 grep 一旦看到 NUL 就切二进制模式,只打一行 `Binary file X matches`;我们**保持逐行输出**(这样 `-c` 的计数与行号都可复现 —— 真 grep 在二进制模式下 `-c` 会给出另一个数),但匹配行里含 NUL 时**往 stderr 说一句**,不静默。`-l` / `-q` 不吐内容,不提示 |
 | `grep -E '\d'`、`(?i)` | 真 bash **静默**按字面处理(`\d` 退化成 `d`);我们**明确拒收**并给 POSIX 替代 |
 | `grep -E 'a*?'` | **接受**,按 ERE 语义(`*` 后跟字面 `?`)。它是**已知差异**:真 bash 也接受,但两边对同一输入的匹配数不同(winbash 2 / 真 bash 0)—— Perl 的"懒惰量词"在这里没意义。早先 README 把它写成"拒收",与实际实现不符,已改正 |
-| `grep -E '[\d]'` | **支持**,按 ERE 原意匹配「反斜杠或字母 d」。Go 的 `regexp.CompilePOSIX` 不认字符类里的 `\`,内部归一化成 `\\` 再编译,而不是退化成 Perl 语义。两个边界同样按 ERE 处理:**已转义**的 `\\` 不会再转一次(`[\\d]`、`[\\]` 仍合法),`[` / `[^` 后**紧跟**的 `]` 是字面量(`[\]]` 不被截断)。这 8 个形状有 golden 表钉住,期望值由真 Git Bash 生成(`go test ./internal/builtins/ -update-grep-golden`),不手写 |
+| `grep -E '[\d]'` | **支持**,按 ERE 原意匹配「反斜杠或字母 d」。Go 的 `regexp.CompilePOSIX` 不认字符类里的 `\`,内部归一化成 `\\` 再编译,而不是退化成 Perl 语义。两个边界同样按 ERE 处理:**已转义**的 `\\` 不会再转一次(`[\\d]`、`[\\]` 仍合法),`[` / `[^` 后**紧跟**的 `]` 是字面量(`[\]]` 不被截断)。这 11 个形状有 golden 表钉住,期望值由真 Git Bash 生成(`go test ./internal/builtins/ -update-grep-golden`),不手写 |
+| `more` | Git Bash 里没有,我们用了 Windows 的——多一个工具,不是缺陷 |
 | `ls` 默认不列点文件 | **与 bash 一致**(POSIX 语义)。要列用 `-a`;`-a` 时 `.` / `..` **参与同一个排序**(与 bash 一致),不是恒在最前 |
 | `ls -l` 只有四列 | 权限 大小 修改时间 名字;没有属主/组/链接数(Windows 上没有 POSIX 属主),时间格式也不同 |
 | `grep -r` 的输出路径 | 基于**你写的那个路径**算(`grep -r b .` → `./d.txt:b`),与 bash 一致 |

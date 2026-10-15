@@ -3,7 +3,9 @@ package client
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // 本文件补的是"凭据读取"与"陈旧端口文件的删除条件"这两段 —— 纯文件级、不需要 daemon。
@@ -103,5 +105,38 @@ func TestForgetStaleEndpointOnlyRemovesItsOwnAddress(t *testing.T) {
 
 	t.Run("文件不存在也不能炸", func(t *testing.T) {
 		forgetStaleEndpoint(filepath.Join(t.TempDir(), "nope.port"), "127.0.0.1:1")
+	})
+}
+
+// serveArgs 决定"自动拉起的 daemon 拿到什么命令行"。**这是本轮修的那条**:
+// 原先它只拼 `--serve --endpoint`,使用者写的 `--idle` 被静默丢掉,自动拉起的
+// daemon 永远用默认的 30 分钟(实测:不转发时 `winbash --idle 3s -c 'echo x'`
+// 等 7s 后 daemon 仍在、端口文件仍在)。
+//
+// 抽成纯函数就是为了能在这里钉住它 —— spawnDaemon 自己必须构建真 exe 才跑得起来
+// (测试进程里 os.Executable() 是 winbash.test,它不认识 --serve),于是这条最容易
+// 出错的一环原先完全没有回归网。
+func TestServeArgsForwardsIdle(t *testing.T) {
+	t.Run("给了 idle 就转过去", func(t *testing.T) {
+		got := serveArgs("C:/tmp/wb.port", 3*time.Second)
+		want := []string{"--serve", "--endpoint", "C:/tmp/wb.port", "--idle", "3s"}
+		if strings.Join(got, " ") != strings.Join(want, " ") {
+			t.Errorf("serveArgs = %q, 期望 %q", got, want)
+		}
+	})
+
+	t.Run("idle<=0 不传这个开关", func(t *testing.T) {
+		// `--idle 0` 是另一个意思("永不退出"),不能当成"没指定"传过去。
+		for _, idle := range []time.Duration{0, -time.Second} {
+			got := serveArgs("C:/tmp/wb.port", idle)
+			for _, a := range got {
+				if a == "--idle" {
+					t.Errorf("idle=%v 时不该传 --idle: %q", idle, got)
+				}
+			}
+			if len(got) != 3 {
+				t.Errorf("idle=%v 时 args = %q, 期望 3 项", idle, got)
+			}
+		}
 	})
 }

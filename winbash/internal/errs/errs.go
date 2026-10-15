@@ -69,7 +69,16 @@ func hasPosixPathArg(argv []string) bool {
 }
 
 // looksLikeMissingPath 判断一段输出像不像「路径不存在」。
+//
+// **大小写不敏感**:`no such file or directory` 在大量工具里是小写开头的
+// (Node.js 的 ENOENT、许多 Go/Python 库、GNU 工具在非首句位置)。实测同一个
+// POSIX 路径交给两个外部工具:`git` 给 "No such file"(大写) → 提示触发了;
+// `node` 给 "ENOENT: no such file"(小写) → 提示**没**触发。两条是同一个坑,
+// 只差大小写,而这条翻译存在的唯一理由就是把那个坑说清楚。
+//
+// 大写形式仍然保留在表里:它们是原文,列出来比全部转小写更好读。
 func looksLikeMissingPath(raw string) bool {
+	low := strings.ToLower(raw)
 	for _, s := range []string{
 		"No such file",
 		"cannot change to",
@@ -77,7 +86,7 @@ func looksLikeMissingPath(raw string) bool {
 		"not found",
 		"does not exist",
 	} {
-		if strings.Contains(raw, s) {
+		if strings.Contains(low, strings.ToLower(s)) {
 			return true
 		}
 	}

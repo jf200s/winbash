@@ -49,7 +49,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&stop, "stop", false, "停止 daemon")
 	fs.BoolVar(&status, "status", false, "打印 daemon 状态")
 	fs.StringVar(&endpoint, "endpoint", defaultEndpoint(), "daemon 的端口文件路径")
-	fs.DurationVar(&idle, "idle", 30*time.Minute, "空闲多久后 daemon 自行退出(0 = 永不)")
+	fs.DurationVar(&idle, "idle", 30*time.Minute, "空闲多久后 daemon 自行退出(0 = 永不);自动拉起 daemon 时也会转给它")
 	fs.DurationVar(&timeout, "timeout", 300*time.Second, "单次请求的超时(0 = 不设限)")
 	if err := fs.Parse(args); err != nil {
 		// 不认识的 flag 一律非零退出(项目底线)。用法已经由 FlagSet 打到 stderr。
@@ -96,7 +96,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		cwd = ""
 	}
 
-	resp, err := client.RunTimeout(endpoint, script, cwd, jsonOut, timeout)
+	resp, err := client.RunTimeout(endpoint, script, cwd, jsonOut, timeout, idle)
 	if err != nil {
 		fmt.Fprintln(stderr, "winbash:", err)
 		return 1
