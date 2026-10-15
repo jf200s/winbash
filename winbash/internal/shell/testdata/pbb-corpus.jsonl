@@ -1,0 +1,37 @@
+{"name":"trim 两端空白","out":["[example   ]"],"exit":0,"source":"STRINGS / Trim leading and trailing white-space"}
+{"name":"trim 全部并压缩","out":["[a b c]"],"exit":0,"source":"STRINGS / Trim all white-space and truncate spaces"}
+{"name":"strip_all 去掉全部","out":["abcd"],"exit":0,"source":"STRINGS / Strip all instances of pattern"}
+{"name":"strip 只去第一处","out":["ab-c-d"],"exit":0,"source":"STRINGS / Strip first occurrence of pattern"}
+{"name":"lstrip 去开头","out":["b-c"],"exit":0,"source":"STRINGS / Strip pattern from start"}
+{"name":"rstrip 去结尾","out":["a-b"],"exit":0,"source":"STRINGS / Strip pattern from end"}
+{"name":"去引号","out":["quoted"],"exit":0,"source":"STRINGS / Trim quotes from a string"}
+{"name":"小写","out":["hello"],"exit":0,"source":"STRINGS / Change a string to lowercase"}
+{"name":"大写","out":["HELLO"],"exit":0,"source":"STRINGS / Change a string to uppercase"}
+{"name":"翻转大小写","out":["hEllO"],"exit":0,"known":"mvdan/sh 不支持 `${v~~}`;我们**明确报错**(exit 2),而不是静默原样输出 —— 与项目底线一致,故只记账","source":"STRINGS / Reverse a string case"}
+{"name":"首字母大写","out":["Hello world"],"exit":0,"source":"STRINGS / (参数扩展变体)"}
+{"name":"按单字符分开","out":["3|b"],"exit":0,"source":"STRINGS / Split a string on a delimiter"}
+{"name":"按多字符分开","out":["a||b"],"exit":0,"known":"IFS 给多字符时,winbash 把**整个串**当分隔符,真 bash 只取**第一个字符**(IFS=BC 等价 IFS=B)。mvdan/sh 的缺口,而且**静默**给出不同结果 —— 光看输出看不出这是错的","source":"STRINGS / Split (multi char delimiters)"}
+{"name":"子串长度与切片","out":["8|cde|gh"],"exit":0,"source":"STRINGS / (字符计数)"}
+{"name":"包含子串","out":["yes"],"exit":0,"source":"STRINGS / Check if string contains a sub-string"}
+{"name":"按正则匹配抓组","out":["2026|10"],"exit":0,"source":"STRINGS / Use regex on a string"}
+{"name":"替换全部","out":["-p-a-b"],"exit":0,"source":"STRINGS / (参数扩展替换)"}
+{"name":"只替换开头","out":["Xaa"],"exit":0,"known":"mvdan/sh 不支持 `${v/#pat/rep}`(报 not supported);我们把它变成**明确报错**(exit 2),而不是静默原样输出","source":"STRINGS / (参数扩展替换)"}
+{"name":"默认值空值","out":["[fallback][set][]"],"exit":0,"source":"STRINGS / (参数扩展默认值)"}
+{"name":"赋值默认值","out":["[filled][filled]"],"exit":0,"source":"STRINGS / (参数扩展:=)"}
+{"name":"取前 N / 去前 N","out":["abc|def"],"exit":0,"source":"STRINGS / (前缀修剪)"}
+{"name":"printf 重复字符","out":["====="],"exit":0,"known":"mvdan/sh 的内建 printf 不认 `%.0s`(报 invalid format char),而且**退出码仍是 0** —— 这是这批语料里唯一「打了 stderr 但退出码不非零」的一条,值得单独盯着","source":"OTHERS / (printf 技巧)"}
+{"name":"去掉目录名","out":["/etc/x"],"exit":0,"source":"FILE PATHS / Get the directory name of a file path"}
+{"name":"取文件名","out":["y.conf"],"exit":0,"source":"FILE PATHS / Get the basename of a file path"}
+{"name":"取扩展名","out":["gz"],"exit":0,"source":"FILE PATHS / Get the extension of a file"}
+{"name":"去掉扩展名","out":["/etc/x/y"],"exit":0,"source":"FILE PATHS / Get the filename without extension"}
+{"name":"数组元素与长度","out":["p|r|3"],"exit":0,"source":"ARRAYS / (基础)"}
+{"name":"数组遍历","out":["\u003cx\u003e\u003cy\u003e\u003cz\u003e"],"exit":0,"source":"ARRAYS / Loop over an array"}
+{"name":"数组切片","out":["b","c","d"],"exit":0,"source":"ARRAYS / (数组切片)"}
+{"name":"数组反转","out":["cba"],"exit":0,"source":"ARRAYS / Reverse an array"}
+{"name":"数组去重","out":["a b c"],"exit":0,"source":"ARRAYS / Remove duplicate array elements"}
+{"name":"关联数组键","out":["2"],"exit":0,"known":"README 的已知差异里已记:${#关联数组[@]} 恒返回 1(mvdan/sh 的缺口) —— 键列表与取值都是对的,只有计数不对","source":"ARRAYS / (关联数组)"}
+{"name":"间接引用","out":["indirect-ok"],"exit":0,"source":"VARIABLES / Indirect expansion"}
+{"name":"变量是否存在","out":["yes|"],"exit":0,"source":"VARIABLES / (判断已定义)"}
+{"name":"IFS 影响 $*","out":["a-b-c"],"exit":0,"source":"OTHERS / (IFS 与位置参数)"}
+{"name":"here-string 与 read","out":["one|two three"],"exit":0,"source":"OTHERS / (here-string)"}
+{"name":"命令替换嵌套","out":["deep"],"exit":0,"source":"OTHERS / (命令替换)"}
