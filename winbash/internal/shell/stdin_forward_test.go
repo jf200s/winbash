@@ -184,6 +184,72 @@ func TestStdinClearedAcrossManyRuns(t *testing.T) {
 	}
 }
 
+// TestStdinPipeCallerFeeds 钉住流式入口:写端交给调用方自己喂,内容同样到达
+// runner;Run 结束后读端回到 /dev/null —— 与一次性入口共享同一份收尾。
+func TestStdinPipeCallerFeeds(t *testing.T) {
+	s := NewSession()
+	defer s.Close()
+
+	pw, err := s.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		_, _ = pw.Write([]byte("streamed\n"))
+		_ = pw.Close()
+	}()
+
+	out, exit, errs := s.Run(context.Background(), "cat", false)
+	if exit != 0 {
+		t.Fatalf("流式 cat exit=%d errs=%v", exit, errs)
+	}
+	if out != "streamed\n" {
+		t.Fatalf("流式内容未到达:out=%q", out)
+	}
+
+	// Run 之后必须回到空输入,否则下一条不带 stdin 的命令会炸
+	// (file already closed) —— 这条与一次性入口是同一份收尾逻辑,但要独立钉住。
+	out2, exit2, errs2 := s.Run(context.Background(), "cat", false)
+	if exit2 != 0 || out2 != "" {
+		t.Fatalf("流式之后未回到空输入:out=%q exit=%d errs=%v", out2, exit2, errs2)
+	}
+}
+
+// TestStdinPipeSessionClosesForgottenWriteEnd 钉住写端兜底:调用方**漏关**写端时,
+// Run 的 defer 必须替它关掉(fd 兜底),否则写端泄漏会一直撑着管道。
+//
+// 为什么这条能测而不挂死:用 `read` 而不是 `cat` —— read 读到**一行**就返回,
+// 不等 EOF,所以 Run 会正常结束,漏关的写端才轮到 closeStdin 去收。
+func TestStdinPipeSessionClosesForgottenWriteEnd(t *testing.T) {
+	s := NewSession()
+	defer s.Close()
+
+	pw, err := s.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pw.Write([]byte("hi\n")); err != nil {
+		t.Fatal(err)
+	}
+	// 故意不 pw.Close()
+
+	out, exit, errs := s.Run(context.Background(), "read line; echo \"got:$line\"", false)
+	if exit != 0 {
+		t.Fatalf("read exit=%d errs=%v", exit, errs)
+	}
+	if strings.TrimSpace(out) != "got:hi" {
+		t.Fatalf("流式内容未到达 read:out=%q", out)
+	}
+
+	// closeStdin 必须已兜底关掉写端,并把读端换回 /dev/null。
+	if s.stdinW != nil {
+		t.Fatal("漏关的写端没有被兜底关闭(closeStdin 未关 stdinW)")
+	}
+	if out2, exit2, _ := s.Run(context.Background(), "cat", false); exit2 != 0 || out2 != "" {
+		t.Fatalf("兜底之后仍有残留:out=%q exit=%d", out2, exit2)
+	}
+}
+
 // TestStdinPipeDoesNotLeakHandles 钉住资源面:每请求关掉读端就不会累积句柄。
 // 阈值给得宽(300 次允许 20 个),因为 GetProcessHandleCount 会被无关线程扰动;
 // 真回归(改成每请求新建 pipe 却不关)会是几十到几百的量级,一定穿阈值。
