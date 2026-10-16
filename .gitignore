@@ -4,3 +4,7 @@ winbash/winbash.exe
 
 # agent 框架的本地运行状态（非源码）
 .reasonix/
+.workbuddy/
+
+# 并行/异步开发用的隔离工作区（AGENTS.md §2）
+.worktrees/
