@@ -25,8 +25,10 @@ import (
 	"io"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
+	"time"
 	"unsafe"
 
 	"mvdan.cc/sh/v3/interp"
@@ -75,25 +77,62 @@ func runWithStdin(t *testing.T, s *Session, content string) string {
 	return out
 }
 
+// drainingReader 是「抽干已完成」可被观测的 reader。
+//
+// mvdan/sh 对非 *os.File 的 reader 在**构造期**就起一支 goroutine 把它读干
+// (interp/stdin_os.go 的 newStdinFile)。那支 goroutine 与测试 goroutine 并发,
+// 于是「先填数据还是先读干」本是个**调度竞态**:实测同一条测试在单跑时绿、
+// 在全量跑(前面的测试留下调度负载)时会间歇性给出 `[late-data]` 而不是 `[]`。
+//
+// 一条间歇性红的门禁测试比没有测试更糟 —— 它会训练人忽略红灯。所以这里用
+// EOF 事件做**确定性同步**,把「构造期已抽干」从事实断言变成被观测到的事实。
+type drainingReader struct {
+	buf     bytes.Buffer
+	EOFSeen chan struct{}
+	once    sync.Once
+}
+
+func newDrainingReader() *drainingReader {
+	return &drainingReader{EOFSeen: make(chan struct{})}
+}
+
+func (r *drainingReader) Read(p []byte) (int, error) {
+	n, err := r.buf.Read(p)
+	if err == io.EOF {
+		r.once.Do(func() { close(r.EOFSeen) })
+	}
+	return n, err
+}
+
 // TestStdinLateFillIsSilentlyDropped 钉住根因：构造期的空 reader 之后再填内容，
 // 脚本读到的是**空**，而且**不报错** —— 这正是要修的那个 bug 的形态。
 //
 // 用内建 read 而不是外部 cat：interp.New 默认没有 ExecHandler，cat 会走外部进程
 // 而 127（探针第一版就栽在这，测成了「找不到 cat」）。
 func TestStdinLateFillIsSilentlyDropped(t *testing.T) {
-	buf := new(bytes.Buffer)
+	dr := newDrainingReader()
 	var out bytes.Buffer
-	r, err := newRunner(buf, &out)
+	r, err := newRunner(dr, &out)
 	if err != nil {
 		t.Fatal(err)
 	}
-	buf.WriteString("late-data\n") // 构造之后才填 —— 太迟了
+
+	// 等抽干 goroutine 真的读到 EOF —— 这一步把竞态变成确定事实。
+	// 超时同样是有意义的信号：说明 mvdan/sh 不再在构造期抽干，
+	// 那时本文件的承载方案可以简化，测试应当显式喊出来而不是静默 PASS。
+	select {
+	case <-dr.EOFSeen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("5s 内没等到构造期抽干的 EOF —— mvdan/sh 的构造期行为可能已变，" +
+			"本文件的 pipe 承载方案需重新评估（SetStdinBytes 的注释一起看）")
+	}
+
+	dr.buf.WriteString("late-data\n") // 确定太迟：抽干已经结束，EOFSeen 已关闭
 	if err := r.Run(context.Background(), parseProbe(t, `read line; printf '[%s]' "$line"`)); err != nil {
 		t.Fatal(err)
 	}
 	if out.String() != "[]" {
-		t.Fatalf("mvdan/sh 的构造期行为变了？期望 `[]`（read 立刻 EOF、$line 为空），得到 %q。"+
-			"若上游已改为支持后填 stdin，本文件的承载方案可以简化", out.String())
+		t.Fatalf("构造期抽干后填入的数据仍被读到：期望 `[]`（read 立刻 EOF、$line 为空），得到 %q", out.String())
 	}
 }
 
