@@ -63,6 +63,18 @@ type Session struct {
 	// 它在构造时算一次,存下来 —— 进程环境不动(Global Constraints),
 	// 所以这条路径只活在 Session 里。
 	searchPath string
+
+	// stdin 是本次 Run 的输入源(管道读端),Run 结束即关。见 SetStdinBytes。
+	stdin *os.File
+
+	// stdinW 是那根管道的**写端**,由 closeStdin 兜底关一次。
+	//
+	// 两条入口的分工不同,但写端都要有人管:
+	//   - SetStdinBytes:Session 自己起 goroutine 消费它,goroutine 内部会关;
+	//   - StdinPipe:把写端交给调用方(daemon)去喂,它有义务关。
+	// 兜底这一下是幂等的(os.File.Close 二次调用只返回 ErrClosed),为的是
+	// 调用方异常路径漏关时不会 fd/goroutine 泄漏。
+	stdinW *os.File
 }
 
 // switchWriter 是一个输出目标可替换的 io.Writer。
@@ -130,12 +142,13 @@ func NewSession() *Session {
 	runner, err := interp.New(
 		interp.Dir(cwd),
 		interp.Env(expand.ListEnviron(kept...)),
-		// stdin:daemon 目前没有把 client 的 stdin 转发过来,所以这里给一个**真正的空输入**,
+		// stdin:没有调用 SetStdinBytes 时的默认输入 —— 一个**真正的空输入**,
 		// 而不是 nil。nil 的 io.Reader 读起来是 panic —— 实测 `winbash -c 'grep xyz'`
 		// (无文件、无管道)就是这样把 daemon 打崩的,client 只看到一句
 		// "connection was forcibly closed",完全指不到根因。
 		// 空输入则立即 EOF:读 stdin 的命令(`cat`、`grep`)立刻结束,不挂住、不报错。
-		// 将来若要支持 `echo x | winbash -c 'cat'`,把这里换成从 client 转发的内容即可。
+		// 真要转发 client 的 stdin 请用 SetStdinBytes —— 这里传 bytes.Reader 是不行的,
+		// mvdan/sh 会在**构造期**把非 *os.File 的 reader 抽干(详见 SetStdinBytes 的注释)。
 		interp.StdIO(bytes.NewReader(nil), s.stdout, s.stderr),
 		interp.ExecHandler(s.execHandler),
 		interp.CallHandler(s.callGuard),
@@ -672,6 +685,122 @@ func (s *Session) EngineStatus() string {
 // Dir 返回会话当前的工作目录。cd 之后它会跟着变。
 func (s *Session) Dir() string { return s.runner.Dir }
 
+// SetStdinBytes 让紧随其后的那次 Run 从 b 读取 stdin(b 为空即立即 EOF)。
+//
+// **为什么必须交出管道读端,而不是把 b 包成 bytes.Reader 塞回去**:
+// mvdan/sh 的 interp.StdIO 对非 *os.File 的 reader,会在**构造期**就 os.Pipe()
+// 并起一支 goroutine 一次性抽干(interp/stdin_os.go 的 newStdinFile)。而 Session
+// 是常驻的、StdIO 是构造期 RunnerOption —— 那支 goroutine 早就读到 EOF 并关掉写端了,
+// 之后再往 reader 里填什么内容都进不去。后果是**静默失效**:命令拿到空输入、退出码 0,
+// 调用方无从分辨"输入是空的"和"输入被丢了" —— 正是这个功能本来要修的 bug。
+//
+// *os.File 走 newStdinFile 的 `case *os.File` 直通,跳过那次抽干,所以这里用管道。
+// (全仓没有任何 runner.Reset() 调用,它会把 stdin 还原成构造期那份 —— 已确认不受影响。)
+//
+// 写端放进 goroutine 与 Run 并发:os.Pipe 的内核 buffer 默认 64KB,同步写会让
+// 大输入把自己卡死(TestStdinPipeLargeInput 钉着这条)。
+//
+// 读端由 Run 结束时关闭(见 Run 里的 defer),调用方不必管 —— 每请求关一次,
+// 句柄才不会在 daemon 长驻期间累积(实测 N=300 每次关 delta=-26,不关 +18)。
+func (s *Session) SetStdinBytes(b []byte) {
+	pw, err := s.newStdinPipe()
+	if err != nil {
+		// 建管道失败是系统级故障。退化成空输入:命令立刻 EOF,而不是把调用方
+		// 挂在一条命令上等 300s 超时 —— 空输入至少是确定的、可诊断的。
+		return
+	}
+	go func() {
+		_, _ = pw.Write(b)
+		_ = pw.Close()
+	}()
+}
+
+// StdinPipe 让紧随其后的那次 Run 从一条管道读取 stdin,并把**写端**交给调用方
+// 自己喂(写完必须 Close)。这是**流式**入口 —— daemon 用它把连接上的字节转给脚本。
+//
+// 与 SetStdinBytes 的分工:
+//
+//	一次性(SetStdinBytes):Session 内部起 goroutine 写完并 Close,调用方不用管。
+//	流式  (StdinPipe)     :数据由调用方从连接读出后写入,Session 根本不知道数据从哪来。
+//
+// 为什么让调用方持有写端而不是把 reader 塞进 Session:Session 是 shell 层,
+// 不该知道 TCP/连接的存在;写端的生命周期与连接的生命周期本来就在 daemon 一侧,
+// 归它管分层才干净(见 daemon.handle 的停止时序)。
+//
+// 两者互斥 —— 一次 Run 只能设其一。两者都在 Run 之前、由同一线程调用,
+// 串行的 daemon.handle 保证了这一点。
+//
+// 读端仍由 Run 结束时的 closeStdin 关闭并换回 /dev/null,调用方不必管读端。
+func (s *Session) StdinPipe() (io.WriteCloser, error) {
+	return s.newStdinPipe()
+}
+
+// newStdinPipe 关掉上一根管道,新建一根,把读端装进 runner、写端托管给 s.stdinW,
+// 并把写端返回给调用方。两条 stdin 入口的**唯一**实现,不要各写一份 ——
+// 各写一份必然出现「一条路径换了 /dev/null、另一条没换」的分叉,而那正是
+// `file already closed` 的来源。
+//
+// 读端必须是 *os.File:interp.StdIO 对非 *os.File 的 reader 会在**构造期**就
+// os.Pipe 并起 goroutine 一次性抽干(理由见 SetStdinBytes 的注释)。
+func (s *Session) newStdinPipe() (*os.File, error) {
+	// 旧 fd(上一根管道,或 closeStdin 换上的 /dev/null)必须关掉,否则每设一次漏一个。
+	s.releaseStdin()
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := interp.StdIO(pr, s.stdout, s.stderr)(s.runner); err != nil {
+		// StdIO 重应用只在 option 非法时报错;pr 是 *os.File 属合法值,所以真走到
+		// 这里只能是 mvdan/sh 的行为变了。两端都关掉,别留下半接的管道。
+		_ = pr.Close()
+		_ = pw.Close()
+		return nil, err
+	}
+	s.stdin = pr
+	s.stdinW = pw
+	return pw, nil
+}
+
+// releaseStdin 关掉当前 stdin 管道的两端并清空字段。幂等。
+func (s *Session) releaseStdin() {
+	if s.stdin != nil {
+		_ = s.stdin.Close()
+		s.stdin = nil
+	}
+	if s.stdinW != nil {
+		_ = s.stdinW.Close()
+		s.stdinW = nil
+	}
+}
+
+// closeStdin 关掉当前 stdin 的 fd,并把 runner 的 stdin 换成 /dev/null。
+//
+// **换成 /dev/null 这一步不能省**:mvdan/sh 的 runner 内部**持有**上一次 StdIO
+// 设进去的那个 fd,只关不换的话,下一条不带 stdin 的命令会读到「file already
+// closed」—— 实测正是如此:第 1 条命令带 stdin、第 4 条不带,第 4 条就炸了,
+// 而且是静默攒到那一刻才炸,与「不静默做错事」完全相反。
+//
+// /dev/null 是 *os.File,读它立即 EOF,且走 newStdinFile 的 `case *os.File` 直通、
+// 不会被抽干 —— 与构造期那个空 reader 的语义一致,但 fd 是干净可控的。
+//
+// 由 Run 的 defer 调用,所以「这次 Run 有没有用 stdin」都以回到 /dev/null 收尾。
+// 读端与写端(releaseStdin)在此一并关掉,两条入口共用这一份收尾逻辑。
+func (s *Session) closeStdin() {
+	s.releaseStdin()
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		// 开不出 NUL 极罕见(被占用/权限)。此时保持上一个 fd:它多半已关闭,
+		// 命令会**响亮**报错,好过静默返回空输入让人以为脚本没读 stdin。
+		return
+	}
+	if err := interp.StdIO(f, s.stdout, s.stderr)(s.runner); err != nil {
+		_ = f.Close()
+		return
+	}
+	s.stdin = f
+}
+
 // Run 执行一段脚本,返回 stdout、退出码和错误行。
 //
 // 退出码沿用 shell 惯例:0 成功,非零失败;语法解析失败返回 2。
@@ -686,6 +815,8 @@ func (s *Session) Run(ctx context.Context, script string, jsonOut bool) (stdout 
 	defer func() {
 		s.stdout.Set(nil)
 		s.stderr.Set(nil)
+		// stdin 只属于这一次 Run:关掉读端,句柄才不会在 daemon 长驻期间累积。
+		s.closeStdin()
 	}()
 
 	prog, perr := syntax.NewParser().Parse(strings.NewReader(script), "")

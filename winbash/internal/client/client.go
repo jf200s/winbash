@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -56,7 +57,45 @@ func RunTimeout(endpoint, script, cwd string, jsonOut bool, timeout, idle time.D
 	if inSession() {
 		return runLocal(script, jsonOut, timeout)
 	}
-	return oneShot(endpoint, ipc.Request{Script: script, Cwd: cwd, JSON: jsonOut}, false, timeout, idle)
+	req := ipc.Request{
+		Proto:     ipc.ProtoVersion,
+		Script:    script,
+		Cwd:       cwd,
+		JSON:      jsonOut,
+		StdinMode: ipc.StdinNone,
+	}
+	if stdinIsStream() {
+		req.StdinMode = ipc.StdinStream
+		req.StdinLen = ipc.StdinUntilEOF // 管道输入没有确定长度,读到半侧关闭为止
+	}
+	resp, err := oneShot(endpoint, req, false, timeout, idle)
+	if err != nil {
+		return resp, err
+	}
+	// 只在 run 这条路上查版本,与 daemon 侧的检查对称。--stop 走的是 Stop,
+	// 刻意不查 —— 否则「版本不匹配时先 --stop」这个推荐处置自己会被挡掉。
+	if perr := ipc.CheckProto("daemon", resp.Proto); perr != nil {
+		return ipc.Response{}, fmt.Errorf("client: %s", perr.Error())
+	}
+	return resp, nil
+}
+
+// stdinIsStream 判断调用方的 stdin 该不该走流式转发。
+//
+// **只在 stdin 不是字符设备时转发** —— 理由:无法从脚本文本判断它会不会读 stdin
+// (脚本是任意的),交互终端下无条件读会让 `winbash -c 'ls'` 这类**不读** stdin 的
+// 命令永远挂住。代价:终端下 `winbash -c 'cat'` 拿到空输入,而真 bash 会读 tty ——
+// 这条差异记在 README 的已知差异表里,不是静默。
+//
+// 流式相对一次性(2026-10-16 之前的实现)的变化:不再 `io.ReadAll` 整个 stdin,
+// 所以**没有字节上限**、也不再要求上游先给 EOF —— `yes | winbash -c 'head -1'`
+// 这类场景由边读边转 + daemon 侧的 stop 时序解决,而不是靠缓存。
+func stdinIsStream() bool {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return false // 查不到就当没有 stdin,不拦路
+	}
+	return info.Mode()&os.ModeCharDevice == 0
 }
 
 // Stop 让 daemon 退出。
@@ -243,6 +282,26 @@ func exchange(conn net.Conn, req ipc.Request, timeout time.Duration) (ipc.Respon
 		return ipc.Response{}, fmt.Errorf("client: 发送请求失败: %w", err)
 	}
 
+	// 流式 stdin:请求头之后把 os.Stdin 的字节接着灌给 daemon,灌完关**写半侧** ——
+	// daemon 靠那个 FIN 认出「stdin 到此为止」(协议里 StdinLen=-1 的语义)。
+	//
+	// 起 goroutine 是必须的:上游不给 EOF 时 io.Copy 会一直读,而主流程必须马上去
+	// ReadMessage 等响应。读与写发生在同一连接的**两个方向**,TCP 全双工下安全。
+	//
+	// 这支不 join:client 是短命进程,主流程拿到响应就返回、进程随之退出,
+	// 上游永不 EOF 把它卡住也不阻塞主流程。真正必须精确回收的是 daemon 侧那支
+	// (见 daemon.startStdinStream 的 stop)—— 它若不回收,串行的 handle 会被占死。
+	if req.StdinMode == ipc.StdinStream {
+		go func() {
+			_, _ = io.Copy(conn, os.Stdin)
+			// 写完关写半侧:仍能读响应。Windows 上由 ws2_32.shutdown 实现,
+			// 项目 daemon.Serve 收尾处已在用同一调用。
+			if tc, ok := conn.(*net.TCPConn); ok {
+				_ = tc.CloseWrite()
+			}
+		}()
+	}
+
 	raw, err := ipc.ReadMessage(conn)
 	if err != nil {
 		return ipc.Response{}, fmt.Errorf("client: 读取响应失败: %w", err)
@@ -363,6 +422,28 @@ func inSession() bool {
 func runLocal(script string, jsonOut bool, timeout time.Duration) (ipc.Response, error) {
 	sess := shell.NewSession()
 	defer sess.Close()
+
+	// stdin 在嵌套里同样要接上。漏了它的话 `echo x | winbash -c "… | winbash -c cat'"`
+	// 会是「外层通、内层空」—— 半能用比完全不能用更费人。
+	//
+	// 这里读的是内层进程自己的 os.Stdin,而它正是外层 ③/② 层派生子进程时接上的
+	// 那个 reader(shell.go 的 cmd.Stdin = hc.Stdin),所以与真 bash 的嵌套一致:
+	// 同一个源,顺序消费,外层已读掉的部分内层拿不到。
+	//
+	// 用 StdinPipe + io.Copy 而不是「先读进内存再 SetStdinBytes」:那样会让嵌套
+	// 路径也要求上游先给 EOF(上游不给就挂住),与主路径同样的毛病分叉两处。
+	// 这支 goroutine 不 join —— 嵌套是一次性会话,Run 返回后 closeStdin 关掉读端,
+	// 写端下次 Write 就失败(Windows 上是 Errno 232),它自己退出;进程也要退了。
+	if stdinIsStream() {
+		if pw, perr := sess.StdinPipe(); perr == nil {
+			go func() {
+				_, _ = io.Copy(pw, os.Stdin)
+				_ = pw.Close()
+			}()
+		}
+		// 接不通管道时静默退回空输入,与 SetStdinBytes 的退化行为一致:
+		// 建管道失败是系统级故障,让命令立刻 EOF 好过把嵌套调用挂死。
+	}
 
 	// timeout 在嵌套里也生效。原先这里写死 context.Background(),于是
 	// `winbash --timeout 1s -c 'sleep 5'` 在嵌套下会真的睡满 5 秒 ——
