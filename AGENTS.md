@@ -39,10 +39,11 @@ git worktree add .worktrees/<slug> -b <类型>/<slug>
 ## 4. 主代理的集成流程
 
 1. **review**：逐个 `git diff main..<分支>`，对着上面第 3、4 条核。
-2. **全量门禁**：主工作树跑 `go test ./... -count=1`（带 `GOPROXY=https://goproxy.cn,direct`），全绿才合。
-3. **合并**：`git merge --no-ff <分支>`，一提交 = 一任务。冲突**退回子代理在它的 worktree 里重解**，不在主代理手里硬解。
-4. 删 worktree 与分支（§2 收尾命令）。
-5. 有失败 → 按 `systematic-debugging` 先复现、再修，别猜。
+2. **全量门禁**：主工作树跑 `go test ./... -count=1`（带 `GOPROXY=https://goproxy.cn,direct`）**和** `smoke-gitbash.sh`（真 Git Bash），都绿才合。
+3. **动了跨进程 / 协议 / 状态生命周期的，端到端必须亲手跑** —— 这次有硬反例：stdin 那条线 `go test ./...` **11 包全绿**，端到端第 4 条却炸出 `read |0: file already closed`。原因是前 3 条命令带 stdin、第 4 条不带，而单元测试里没有那个调用序列。**单元测试只证明"被测的函数对"，证不到"两次调用之间 Session 是干净的"。** 端到端要专门构造「同一 daemon 上先 A 后 B」的序列，不是跑通一条就完。
+4. **合并**：`git merge --no-ff <分支>`，一提交 = 一任务。冲突**退回子代理在它的 worktree 里重解**，不在主代理手里硬解。
+5. 删 worktree 与分支（§2 收尾命令），确认 `git status` 空、`git worktree list` 只剩主工作树。
+6. 有失败 → 按 `systematic-debugging` 先复现、再修，别猜。
 
 ## 5. 并发的物理约束（本项目的硬边界，违反会产假失败）
 
@@ -52,7 +53,24 @@ git worktree add .worktrees/<slug> -b <类型>/<slug>
 - **写子代理并发上限 2–3**（同一仓库、同一套测试二进制，CPU 会顶满）；**只读子代理 4–6** 无压力。
 - 本机无 `make`、无 `rg`；Go 项目用 `go test` / `go build`；**唯一直接依赖** `mvdan.cc/sh/v3`，`GOPROXY` 必须是 `https://goproxy.cn,direct`。
 
-## 6. 沿用不改的项目底线（新任务同样受约束）
+## 6. 派子代理的环境约束（本机踩实的 8 条，绕法都验证过）
+
+子代理链路与 shell 链路是两套东西，这 8 条每条都当场卡过一次，**别再试第二遍**：
+
+| # | 约束 | 绕法（已验证） |
+|---|---|---|
+| 1 | `task`/`fleet` 的**默认**子代理模型走 Anthropic 协议会 400（`当前模型不支持该协议`） | 显式传 `model: tokenrhythm/deepseek-flash`（父模型，已知可用）。**用户已把 `subagent_model` 改到「基元」provider**，改后不传 model 也能起 |
+| 2 | **带 `profile` 的**子代理（如 `explore`）会绑到另一个坏模型 → 400 | 不传 `profile`；只读改用 `fleet` 的 `read_only: true` |
+| 3 | `tool_profile` 是**非法字段**（schema 里没有）→ 400 | 别编字段。合法字段只有 `profile` / `model` / `effort` / `tools` / `write_paths` / `read_only` / `max_steps` |
+| 4 | `effort` 只接受 `[disabled low high max]`，`medium` → 400 | 用 `high` 或 `low` |
+| 5 | `neohorse-1-9b` **未声明 reasoning levels** → 传任何 `effort` 都 400 | **省略 `effort`**（这是现在 `subagent_model` 指向它时的必填姿势） |
+| 6 | **同一时刻只有一个 background `task`**：不带 `write_paths` 就认领整个 workspace，`tools` 只读白名单**不能**解除这个写槽 | 要么显式传 `write_paths` 抢这个槽，要么用 `fleet`（≥2 任务）走 `read_only` |
+| 7 | 写锁是**会话级**的，且会匹配**命令文本里出现的路径**（`git -C .worktrees/x …` 被挡）；`job_output` / `read_subagent_result` / 连 `Start-Sleep` 同样被挡 | **没有自解手段**，只能等子代理自己跑完；新轮次通常会重新评估锁 |
+| 8 | `fleet` 要求 `tasks` **≥2** | 拆两个只读任务，或改用 `task` |
+
+结论：**派发前先想清楚三件事** —— 传不传 `profile`、传不传 `effort`、写任务有没有 `write_paths`。这三件凑齐，400 与 blocked 基本都能避开。
+
+## 7. 沿用不改的项目底线（新任务同样受约束）
 
 - **不静默做错事**：不认识的 flag/参数/子命令一律非零退出，不得静默忽略；mvdan/sh 那类"看起来成功"的静默缺口必须在 ④ 层拦住。
 - **值保证**：`0xa`→`10`、`STATE: 1`→`Running`、内存给裸字节、输出无 ANSI 色码。
