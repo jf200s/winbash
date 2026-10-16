@@ -40,6 +40,9 @@ git worktree add .worktrees/<slug> -b <类型>/<slug>
 
 1. **review**：逐个 `git diff main..<分支>`，对着上面第 3、4 条核。
 2. **全量门禁**：主工作树跑 `go test ./... -count=1`（带 `GOPROXY=https://goproxy.cn,direct`）**和** `smoke-gitbash.sh`（真 Git Bash），都绿才合。
+   **别拿 `-run` 单跑一个包就宣布完成** —— 单包绿不等于全量绿：那条 flaky 的
+   `TestStdinLateFillIsSilentlyDropped` 单跑 3 次全绿、宣布完成后的复核全量却红
+   （前面的测试留下调度负载）。**宣布完成前的最后一次门禁必须是全量，且连跑 ≥2 次**以排除间歇性。
 3. **动了跨进程 / 协议 / 状态生命周期的，端到端必须亲手跑** —— 这次有硬反例：stdin 那条线 `go test ./...` **11 包全绿**，端到端第 4 条却炸出 `read |0: file already closed`。原因是前 3 条命令带 stdin、第 4 条不带，而单元测试里没有那个调用序列。**单元测试只证明"被测的函数对"，证不到"两次调用之间 Session 是干净的"。** 端到端要专门构造「同一 daemon 上先 A 后 B」的序列，不是跑通一条就完。
 4. **合并**：`git merge --no-ff <分支>`，一提交 = 一任务。冲突**退回子代理在它的 worktree 里重解**，不在主代理手里硬解。
 5. 删 worktree 与分支（§2 收尾命令），确认 `git status` 空、`git worktree list` 只剩主工作树。
