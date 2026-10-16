@@ -215,15 +215,17 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 
 **当前限制**:
 
-- **stdin 转发的三条边界**:`echo x | winbash -c 'cat'` → `x` **已经支持**(2026-10-16 起,
-  管道数据不再被丢弃),但有边界:
+- **stdin 转发的形态与边界**:`echo x | winbash -c 'cat'` → `x` **已支持**,而且是**流式**的
+  (2026-10-16 起:请求头之后跟裸字节流,边读边转、**不缓存到内存**)。因此
+  `yes | winbash -c 'head -1'` 这类**上游永不给 EOF** 的管道也能跑,同样不受大小限制。
+  剩两条边界:
   1. **交互终端下不读 stdin** —— 判据是它不是字符设备。否则 `winbash -c 'ls'` 这类
      **不读** stdin 的命令会永远挂住(无法从脚本文本判断它读不读)。代价:终端下
      `winbash -c 'cat'` 拿到空输入,而真 bash 会读 tty。
-  2. **上限 16 MiB**(`ipc.MaxStdinBytes`),超限**响亮报错、不静默截断**。大文件别用管道塞,
-     在脚本里自己重定向:`winbash -c 'cmd < bigfile'` —— 那条路由 daemon 直接读文件,不走这道通道。
-  3. **上游永不给 EOF 时会挂**(`yes | winbash -c 'head -1'`):当前是**一次性**读到 EOF 才发。
-     流式转发在计划中,落地前遇到这类场景请直接给文件。
+  2. **界靠时间而不靠字节**:流式不缓存,所以没有「stdin 太大」这回事;要防的是
+     「一直流个不停」,用 `--timeout`(默认 300 s,同时约束执行与读 stdin)。
+     命令**不读** stdin 而上游仍在灌数据时,daemon 在命令返回后立刻回收转发协程 ——
+     这一条有回归钉着(见 `smoke-gitbash.sh` 的「流式 stdin」节)。
 - **② 层没有命令级 `--json`**:`sys mem --json` 会报"不认识的参数"。JSON 开关在整次调用上:`winbash --json -c 'sys mem'`。
 - 不做交互式 REPL,不追求 100% bash 兼容,不做 pwsh 对象管道。
 
