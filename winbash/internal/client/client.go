@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -56,7 +57,59 @@ func RunTimeout(endpoint, script, cwd string, jsonOut bool, timeout, idle time.D
 	if inSession() {
 		return runLocal(script, jsonOut, timeout)
 	}
-	return oneShot(endpoint, ipc.Request{Script: script, Cwd: cwd, JSON: jsonOut}, false, timeout, idle)
+	stdin, err := readStdin()
+	if err != nil {
+		return ipc.Response{}, err
+	}
+	resp, err := oneShot(endpoint, ipc.Request{
+		Proto:  ipc.ProtoVersion,
+		Script: script,
+		Cwd:    cwd,
+		JSON:   jsonOut,
+		Stdin:  stdin,
+	}, false, timeout, idle)
+	if err != nil {
+		return resp, err
+	}
+	// 只在 run 这条路上查版本,与 daemon 侧的检查对称。--stop 走的是 Stop,
+	// 刻意不查 —— 否则「版本不匹配时先 --stop」这个推荐处置自己会被挡掉。
+	if perr := ipc.CheckProto("daemon", resp.Proto); perr != nil {
+		return ipc.Response{}, fmt.Errorf("client: %s", perr.Error())
+	}
+	return resp, nil
+}
+
+// readStdin 读调用方的 stdin,作为这次脚本的标准输入。
+//
+// **只在 stdin 被重定向或来自管道时读** —— 判据是它不是字符设备。我们无法从
+// 脚本文本判断它会不会读 stdin(脚本是任意的),所以在交互终端下无条件读会让
+// `winbash -c 'ls'` 这类命令永远挂住。代价是终端下 `winbash -c 'cat'` 拿到空输入
+// (真 bash 会读 tty) —— 这条差异记在 README 的已知差异表里,不是静默。
+//
+// 读满上限仍没等到 EOF 时**响亮报错**,不静默截断:截断后的输出看着是成功的,
+// 正是本项目反复强调要消灭的那种失败形态。
+func readStdin() ([]byte, error) {
+	info, err := os.Stdin.Stat()
+	if err != nil {
+		return nil, nil // 查不到就当没有 stdin,不拦路
+	}
+	if info.Mode()&os.ModeCharDevice != 0 {
+		return nil, nil // 交互终端:给空输入,理由见上
+	}
+	// 多读 1 字节,用来区分「正好等于上限」与「超了上限」——
+	// 于是内存占用封顶在 MaxStdinBytes+1,不会先读完再发现超限。
+	b, err := io.ReadAll(io.LimitReader(os.Stdin, ipc.MaxStdinBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("client: 读 stdin 失败: %w", err)
+	}
+	if len(b) > ipc.MaxStdinBytes {
+		return nil, fmt.Errorf(
+			"client: stdin 超过上限 %d 字节(%.0f MiB)\n"+
+				"怎么办: 别用管道把它塞进来,让脚本自己重定向 —— "+
+				"`winbash -c 'cmd < bigfile'` 由 daemon 侧直接读文件,不经过这条通道",
+			ipc.MaxStdinBytes, float64(ipc.MaxStdinBytes)/(1<<20))
+	}
+	return b, nil
 }
 
 // Stop 让 daemon 退出。
@@ -363,6 +416,22 @@ func inSession() bool {
 func runLocal(script string, jsonOut bool, timeout time.Duration) (ipc.Response, error) {
 	sess := shell.NewSession()
 	defer sess.Close()
+
+	// stdin 在嵌套里同样要接上。漏了它的话 `echo x | winbash -c "… | winbash -c cat'"`
+	// 会是「外层通、内层空」—— 半能用比完全不能用更费人。
+	//
+	// 这里读到的是内层进程自己的 os.Stdin,而它正是外层 ③/② 层派生子进程时
+	// 接上的那个 reader(shell.go 的 cmd.Stdin = hc.Stdin),所以语义与真 bash 的
+	// 嵌套一致:同一个源,顺序消费,外层已经读掉的部分内层拿不到。
+	//
+	// 读失败(超上限等)同样响亮报错,不悄悄退回空输入 —— 与 daemon 路径一致。
+	stdin, err := readStdin()
+	if err != nil {
+		return ipc.Response{}, err
+	}
+	if stdin != nil {
+		sess.SetStdinBytes(stdin)
+	}
 
 	// timeout 在嵌套里也生效。原先这里写死 context.Background(),于是
 	// `winbash --timeout 1s -c 'sleep 5'` 在嵌套下会真的睡满 5 秒 ——

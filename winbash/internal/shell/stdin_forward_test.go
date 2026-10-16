@@ -142,9 +142,51 @@ func TestStdinPipeLargeInput(t *testing.T) {
 	}
 }
 
-// TestStdinPipeDoesNotLeakHandles 钉住资源面：每请求关掉读端就不会累积句柄。
-// 阈值给得宽（300 次允许 20 个），因为 GetProcessHandleCount 会被无关线程扰动；
-// 真回归（改成每请求新建 pipe 却不关）会是几十到几百的量级，一定穿阈值。
+// TestStdinClearedAfterUse 钉住一条刚踩过的回归:用过 stdin 之后,下一条**不带**
+// stdin 的命令必须仍然正常(立即 EOF),而不是读到上一次那个已关闭的 fd。
+//
+// mvdan/sh 的 runner 会**持有**上次 StdIO 设进去的 fd,所以 closeStdin 关掉之后
+// 必须换成 /dev/null —— 只关不换的话,下一条命令会报「file already closed」。
+// 实测端到端栽过:第 1 条命令带 stdin、第 4 条不带,第 4 条才炸,中间还隔着
+// 几条好命令,查起来非常费人。
+func TestStdinClearedAfterUse(t *testing.T) {
+	s := NewSession()
+	defer s.Close()
+
+	if got := runWithStdin(t, s, "first\n"); got != "first\n" {
+		t.Fatalf("第 1 条 stdin 未到达:out=%q", got)
+	}
+
+	// 第 2 条不设 stdin —— 必须是空输入、立即 EOF、exit 0。
+	out, exit, errs := s.Run(context.Background(), "cat", false)
+	if exit != 0 {
+		t.Fatalf("上一条用过 stdin 后,不带 stdin 的命令失败:exit=%d errs=%v", exit, errs)
+	}
+	if out != "" {
+		t.Fatalf("不带 stdin 的命令读到了上一次的内容:out=%q", out)
+	}
+}
+
+// TestStdinClearedAcrossManyRuns 是上面那条的放大版:交替「带/不带」跑 100 次,
+// 钉住「每次都回到干净的空输入」这件事,而不只是第一条之后那一次。
+func TestStdinClearedAcrossManyRuns(t *testing.T) {
+	s := NewSession()
+	defer s.Close()
+	ctx := context.Background()
+
+	for i := 0; i < 100; i++ {
+		if got := runWithStdin(t, s, "x\n"); got != "x\n" {
+			t.Fatalf("第 %d 轮:stdin 未到达 out=%q", i, got)
+		}
+		if out, exit, errs := s.Run(ctx, "cat", false); exit != 0 || out != "" {
+			t.Fatalf("第 %d 轮:不带 stdin 的命令未回到空输入 out=%q exit=%d errs=%v", i, out, exit, errs)
+		}
+	}
+}
+
+// TestStdinPipeDoesNotLeakHandles 钉住资源面:每请求关掉读端就不会累积句柄。
+// 阈值给得宽(300 次允许 20 个),因为 GetProcessHandleCount 会被无关线程扰动;
+// 真回归(改成每请求新建 pipe 却不关)会是几十到几百的量级,一定穿阈值。
 func TestStdinPipeDoesNotLeakHandles(t *testing.T) {
 	s := NewSession()
 	defer s.Close()

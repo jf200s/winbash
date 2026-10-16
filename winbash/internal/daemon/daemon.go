@@ -158,6 +158,21 @@ func handle(conn net.Conn, sess *shell.Session, token string, readTimeout time.D
 		return false, writeResponse(conn, ipc.Response{OK: true, Out: []byte(out)})
 	}
 
+	// 协议版本只对**执行脚本**这条路检查,并且刻意放在 op 分派之后。
+	//
+	// 两个理由,缺一个都会咬人:
+	//  1. 必须放行 stop —— 否则新版 client 无法停掉旧 daemon,而停掉它正是版本不匹配
+	//     时的推荐处置,于是陷入「要停它得先连上它」的死锁。
+	//  2. 只有执行脚本这条路的语义会随版本漂移(比如 stdin 的有无),stop/status 的
+	//     语义是稳定的。
+	if err := ipc.CheckProto("daemon", req.Proto); err != nil {
+		return false, writeResponse(conn, ipc.Response{
+			OK:     false,
+			Errors: []string{"daemon: " + err.Error()},
+			Exit:   1,
+		})
+	}
+
 	// 请求自带超时。client 放弃**不代表** daemon 该继续跑:一条无限循环会一直占着
 	// 这条串行的 handle,把后续所有命令饿死(实测第二条命令要等满自己的超时)。
 	// 有了这个 ctx,解释器会随取消停下来,handle 才能回到 Accept。
@@ -180,6 +195,13 @@ func handle(conn net.Conn, sess *shell.Session, token string, readTimeout time.D
 		}
 	}
 
+	// stdin 只在 client 真的给了才设(nil = 旧 client / 本次无输入)。不设的话
+	// session 保持构造期的空输入,立即 EOF —— 与真 bash 的 `bash -c 'cat'` 一致。
+	// 传给 SetStdinBytes 的是值拷贝,读端的生命周期由 session 在 Run 结束时关。
+	if req.Stdin != nil {
+		sess.SetStdinBytes(req.Stdin)
+	}
+
 	out, exit, errs := sess.Run(ctx, req.Script, req.JSON)
 	return false, writeResponse(conn, ipc.Response{
 		OK:     exit == 0,
@@ -197,6 +219,9 @@ func handle(conn net.Conn, sess *shell.Session, token string, readTimeout time.D
 const writeBudget = 10 * time.Second
 
 func writeResponse(conn net.Conn, resp ipc.Response) error {
+	// 无差别盖章:client 识别「连上的是旧 daemon」靠的就是这个字段为 0。
+	// 放在唯一出口而不是各个调用点,免得将来新增一条 return 忘了盖。
+	resp.Proto = ipc.ProtoVersion
 	_ = conn.SetWriteDeadline(time.Now().Add(writeBudget))
 	b, err := ipc.EncodeResponse(resp)
 	if err != nil {

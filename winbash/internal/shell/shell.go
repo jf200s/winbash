@@ -694,8 +694,13 @@ func (s *Session) Dir() string { return s.runner.Dir }
 // 读端由 Run 结束时关闭(见 Run 里的 defer),调用方不必管 —— 每请求关一次,
 // 句柄才不会在 daemon 长驻期间累积(实测 N=300 每次关 delta=-26,不关 +18)。
 func (s *Session) SetStdinBytes(b []byte) {
-	// 若上一次设了却没走到 Run(解析失败等),先补关,免得累积句柄。
-	s.closeStdin()
+	// 旧 fd(可能是上一次的 pipe,也可能是 closeStdin 换上的 /dev/null)必须关掉,
+	// 否则每设一次就漏一个。这里刻意不调 closeStdin —— 它还会开一个 NUL 换上,
+	// 而下一步马上又要把它换成 pipe,白开一次。
+	if s.stdin != nil {
+		_ = s.stdin.Close()
+		s.stdin = nil
+	}
 
 	pr, pw, err := os.Pipe()
 	if err != nil {
@@ -717,12 +722,33 @@ func (s *Session) SetStdinBytes(b []byte) {
 	s.stdin = pr
 }
 
-// closeStdin 关掉当前 stdin 的读端。由 SetStdinBytes 与 Run 的 defer 调用。
+// closeStdin 关掉当前 stdin 的 fd,并把 runner 的 stdin 换成 /dev/null。
+//
+// **换成 /dev/null 这一步不能省**:mvdan/sh 的 runner 内部**持有**上一次 StdIO
+// 设进去的那个 fd,只关不换的话,下一条不带 stdin 的命令会读到「file already
+// closed」—— 实测正是如此:第 1 条命令带 stdin、第 4 条不带,第 4 条就炸了,
+// 而且是静默攒到那一刻才炸,与「不静默做错事」完全相反。
+//
+// /dev/null 是 *os.File,读它立即 EOF,且走 newStdinFile 的 `case *os.File` 直通、
+// 不会被抽干 —— 与构造期那个空 reader 的语义一致,但 fd 是干净可控的。
+//
+// 由 Run 的 defer 调用,所以「这次 Run 有没有用 stdin」都以回到 /dev/null 收尾。
 func (s *Session) closeStdin() {
 	if s.stdin != nil {
 		_ = s.stdin.Close()
 		s.stdin = nil
 	}
+	f, err := os.Open(os.DevNull)
+	if err != nil {
+		// 开不出 NUL 极罕见(被占用/权限)。此时保持上一个 fd:它多半已关闭,
+		// 命令会**响亮**报错,好过静默返回空输入让人以为脚本没读 stdin。
+		return
+	}
+	if err := interp.StdIO(f, s.stdout, s.stderr)(s.runner); err != nil {
+		_ = f.Close()
+		return
+	}
+	s.stdin = f
 }
 
 // Run 执行一段脚本,返回 stdout、退出码和错误行。
