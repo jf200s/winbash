@@ -195,20 +195,91 @@ func handle(conn net.Conn, sess *shell.Session, token string, readTimeout time.D
 		}
 	}
 
-	// stdin 只在 client 真的给了才设(nil = 旧 client / 本次无输入)。不设的话
-	// session 保持构造期的空输入,立即 EOF —— 与真 bash 的 `bash -c 'cat'` 一致。
-	// 传给 SetStdinBytes 的是值拷贝,读端的生命周期由 session 在 Run 结束时关。
-	if req.Stdin != nil {
-		sess.SetStdinBytes(req.Stdin)
+	// stdin 现在是**流式**的:请求头帧之后紧跟裸字节流。
+	//
+	// 必须在 Run **之前**就接好管道 —— 否则命令先跑起来读不到数据,脚本可能立刻
+	// 退出,把后面的字节全丢掉(而且看着是成功的)。
+	var stopStdin func()
+	switch req.StdinMode {
+	case "", ipc.StdinNone:
+		// 本次没有 stdin:session 保持空输入(立即 EOF),与真 `bash -c 'cat'` 一致。
+	case ipc.StdinStream:
+		s, err := startStdinStream(sess, conn, req.StdinLen)
+		if err != nil {
+			return false, writeResponse(conn, ipc.Response{
+				OK:     false,
+				Errors: []string{"daemon: 接不通 stdin: " + err.Error()},
+				Exit:   1,
+			})
+		}
+		stopStdin = s
+	default:
+		// 不认识的 mode 报错,不当成「没有 stdin」—— 那会静默丢掉输入。
+		return false, writeResponse(conn, ipc.Response{
+			OK: false,
+			Errors: []string{fmt.Sprintf("daemon: 不认识的 stdin_mode %q\n"+
+				"怎么办: 两端的 winbash.exe 版本可能不一致;运行 `winbash --stop` 后重试", req.StdinMode)},
+			Exit: 2,
+		})
 	}
 
 	out, exit, errs := sess.Run(ctx, req.Script, req.JSON)
+
+	// Run 一返回就回收喂入 goroutine。**顺序不能改**:Run 内部的 defer 已经关掉
+	// 读端并换回 /dev/null,但那支 goroutine 可能还卡在 conn.Read 上 ——
+	// 关读端/关写端都叫不醒一个正阻塞在网络读上的 goroutine。
+	if stopStdin != nil {
+		stopStdin()
+	}
+
 	return false, writeResponse(conn, ipc.Response{
 		OK:     exit == 0,
 		Out:    []byte(out),
 		Errors: append(note, errs...),
 		Exit:   exit,
 	})
+}
+
+// startStdinStream 把连接上的 stdin 字节流接到 session 的管道上,返回 stop。
+//
+// 并发结构(串行 handle 内):建管道 → 起 goroutine 边读连接边写管道 → **立刻返回**,
+// 让调用方去跑 Run。必须并发,不能「先读完 stdin 再 Run」—— 那会结构性死锁:
+// client 在等响应、不会关连接,而 io.Copy 读不到 EOF 就永远不往下走;且一旦数据
+// 超过 os.Pipe 的内核 buffer(64KB),写端会阻塞在一个没有读者的管道上。
+//
+// stop 在 Run 返回之后被调用,做三件事:设 deadline 唤醒可能卡在 conn.Read 的
+// goroutine → 等它真的退出 → 清掉 deadline(免得影响随后的写响应与下一个请求)。
+func startStdinStream(sess *shell.Session, conn net.Conn, n int64) (stop func(), err error) {
+	pw, err := sess.StdinPipe()
+	if err != nil {
+		return nil, err
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if n >= 0 {
+			_, _ = io.CopyN(pw, conn, n)
+		} else {
+			_, _ = io.Copy(pw, conn)
+		}
+		// 必须关写端:脚本在等 EOF,不关它 Read 就永不返回。
+		//
+		// 拿到的错误**不上报**。这里最常见的两种都不是故障:
+		//   - io.Copy 读到 conn 的 EOF:正常收尾。
+		//   - 读端已被 closeStdin 关掉 → Windows 下写返回 Errno(232)
+		//     (ERROR_NO_DATA, "The pipe is being closed"),这是「读端已关」的
+		//     正常信号,Go 标准库自己也把它当可忽略(os/pipe_test.go 硬断言;
+		//     exec_windows.go 同样豁免 232)。报上去就是给每条不读 stdin 的命令
+		//     喷一行假错。
+		_ = pw.Close()
+	}()
+	return func() {
+		// 唤醒可能阻塞在 conn.Read 上的 io.Copy。关读端/写端都叫不醒网络读,
+		// 只有 deadline 或关连接能 —— 这里选 deadline,因为连接随后还要写响应。
+		_ = conn.SetReadDeadline(time.Now())
+		<-done
+		_ = conn.SetReadDeadline(time.Time{})
+	}, nil
 }
 
 // writeBudget 是单次响应写的上限。

@@ -98,6 +98,16 @@ check "cat 串在管链中间"      "3"   "$($EXE -c 'printf "a\nb\nc\n" | cat |
 check "grep 无文件不崩 daemon" "1"  "$($EXE -c 'grep zzz' >/dev/null 2>&1; echo $?)"
 check "崩过之后 daemon 还在"  "0"   "$($EXE --status >/dev/null 2>&1; echo $?)"
 
+# 流式 stdin(请求头之后跟裸字节流)有两处能悄悄把**串行** handle 占死,
+# 而那表现为「后面的命令全都慢/卡」,极难归因 —— 所以都用 timeout 兜着:
+# 挂住就返回 124,check 当场 FAIL,而不是让整个 smoke 卡死。
+echo "-- 流式 stdin(上游永不 EOF / 命令不读 stdin;这两处会占死串行 handle)"
+check "管道内容经 cat 往返"   "hello-from-stdin" "$(printf 'hello-from-stdin\n' | timeout 10 $EXE -c 'cat')"
+check "head -1 配 yes 不挂"   "y"                 "$(yes | timeout 10 $EXE -c 'head -1')"
+check "命令不读 stdin 不反压" "never-reads"       "$(yes | timeout 10 $EXE -c 'echo never-reads')"
+check "大输入经 wc -l"        "30000"             "$(seq 1 30000 | timeout 10 $EXE -c 'wc -l' | tr -d ' ')"
+check "流式跑完 daemon 仍活"  "0"                 "$($EXE --status >/dev/null 2>&1; echo $?)"
+
 echo "-- Review Focus 第 1 条:含空格与中文的路径"
 check "中文路径可列"         "1"     "$($EXE -c 'ls "D:/work/中文 目录"' | grep -c '^winbash$')"
 check "含空格路径可列"       "0"     "$($EXE -c 'ls "C:/Users/Test User"' >/dev/null 2>&1; echo $?)"

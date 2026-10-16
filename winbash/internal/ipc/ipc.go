@@ -24,19 +24,35 @@ const maxMessageBytes = 64 << 20
 // 不静默按旧语义跑。两端都响亮,是因为「静默吞掉 stdin」正是本次要修的 bug 形态,
 // 修完却在另一个入口复现,等于没修。
 //
+// 版本历史:
+//
+//	1 一次性 stdin:Request.Stdin []byte 走 JSON base64,受 64MiB 帧上限约束。
+//	2 流式 stdin:请求头之后跟**裸字节流**,不再缓存到内存(理由见 StdinMode)。
+//
+// 1 → 2 必须**两端同时**升级:如果 client 切到流式、daemon 还是 1,那么 daemon
+// 只解请求头就去执行,根本不读后面那串字节 —— 于是 stdin 静默丢失,而脚本照样
+// exit 0。这正是本次要消灭的 bug 形态,所以在 CheckProto 处直接响亮拒绝。
+//
 // 改动协议时把它 +1,并在两端的检查处同步更新说明。
-const ProtoVersion = 1
+const ProtoVersion = 2
 
-// MaxStdinBytes 是单次请求可携带的 stdin 上限。
-//
-// 为什么不是 maxMessageBytes:stdin 走 JSON 的 []byte,序列化成 base64 会膨胀约
-// 1/3,再算上脚本与 token 等字段,贴着 64MiB 走会先撞上帧上限、报的是「帧损坏」
-// 这种答非所问的错。单独给 stdin 一道更小的界,才能在**读 stdin 的当下**就报
-// 「stdin 过大」,而不是读完、编码完、发出去之后才失败。
-//
-// 超限**必须响亮报错,不得静默截断** —— 截断后的输出看起来是成功的,正是本项目
-// 反复强调要消灭的那种失败形态。
-const MaxStdinBytes = 16 << 20
+// StdinMode 的取值:一次请求的 stdin 走什么形态。
+const (
+	// StdinNone 表示本次没有 stdin —— daemon **不从连接读** stdin 字节,
+	// session 保持空输入(立即 EOF)。交互终端下的调用走这条。
+	StdinNone = "none"
+
+	// StdinStream 表示 stdin 是请求头帧之后的**裸字节流**:没有帧头、没有 base64、
+	// 不受 maxMessageBytes 约束。管道输入的主路径走这条。
+	StdinStream = "stream"
+)
+
+// StdinLen 是 stdin 流的长度语义(StdinMode==StdinStream 时有意义)。
+const (
+	// StdinUntilEOF 表示读到半侧关闭(FIN)为止。管道输入本质没有确定长度,
+	// 所以这是主路径 —— client 转发完上游就 CloseWrite()。
+	StdinUntilEOF = -1
+)
 
 // Request 是客户端发给 daemon 的一条请求。
 type Request struct {
@@ -57,19 +73,24 @@ type Request struct {
 	Cwd    string `json:"cwd"`
 	JSON   bool   `json:"json"`
 
-	// Stdin 是这条脚本的标准输入。为**空的非 nil** 与**未设置**是两回事:前者
-	// (旧 client、或本次调用确实没有 stdin)是「立即 EOF」,后者是未接通 stdin 通道。
-	//
-	// 用 []byte 而不是 string:json.Marshal 会把 string 里的非法 UTF-8 静默替换
-	// 成 U+FFFD,而 []byte 走 base64 原样往返 —— 与 Response.Out 同一条理由,
-	// 二进制管道不能被静默损坏。上限见 MaxStdinBytes。
-	Stdin []byte `json:"stdin,omitempty"`
+	// StdinMode 标明这次请求的 stdin 走什么形态(取值见 StdinNone/StdinStream)。
+	// 空值等同 StdinNone —— 但既然要升版本,两端都应显式写上。
+	StdinMode string `json:"stdin_mode,omitempty"`
+
+	// StdinLen 是 stdin 流的长度(StdinMode==StdinStream 时有意义):
+	// StdinUntilEOF(-1)=读到半侧关闭,管道输入的主路径;>=0=读恰好 N 字节。
+	StdinLen int64 `json:"stdin_len,omitempty"`
 
 	// TimeoutMS 是这次请求在 daemon 侧的执行上限(0 = 不设限)。
 	//
 	// daemon 必须自己看这个值:client 断开并不会让解释器停下来,而 handle 是
 	// 串行调用的 —— 一条无限循环会一直占着它,把后续所有命令饿死(实测第二条
 	// 命令要等满自己的超时)。
+	//
+	// 流式 stdin 落地后它的含义扩大了:它**同时**是「这次调用读 stdin 的上限」。
+	// 理由是 DefaultReadTimeout 只护「读请求头」那一步(读完就清掉,见 daemon.handle),
+	// 执行阶段没有读预算;而 stdin 现在是持续读连接的 —— 没有这一条,一条
+	// 「只连、不发、不关」的流式请求能把串行的 handle 永久占住,后续命令全部饿死。
 	TimeoutMS int `json:"timeout_ms,omitempty"`
 }
 
