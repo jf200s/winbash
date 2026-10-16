@@ -173,7 +173,7 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 
 | 现象 | 说明 |
 |---|---|
-| `pwd` 给 `D:\...` | 刻意:这一层的返回值要能直接喂给 Windows 工具(bash 给 `/d/...`) |
+| `pwd` 给 `D:\...` | 刻意:这一层的返回值要能直接喂给 Windows 工具(bash 给 `/d/...`)。**例外**:`cd /` 后 `pwd` 给 Git 安装根(真 bash 的 `/` 就是它) |
 | glob 给 `.\x` | 同理,Windows 原生形式;①/②/③ 层两种写法都吃 |
 | `${v/#前缀/替换}`、`${v/%后缀/替换}` | **不支持,报错 `2`**。mvdan/sh 没实现,而且会静默原样输出——我们宁可报错 |
 | `printf %q`、`printf -v` | 同上:不支持但显式报错,并给替代写法 |
@@ -187,6 +187,7 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 | `grep -E 'a*?'` | **接受**,按 ERE 语义(`*` 后跟字面 `?`)。它是**已知差异**:真 bash 也接受,但两边对同一输入的匹配数不同(winbash 2 / 真 bash 0)—— Perl 的"懒惰量词"在这里没意义。早先 README 把它写成"拒收",与实际实现不符,已改正 |
 | `grep -E '[\d]'` | **支持**,按 ERE 原意匹配「反斜杠或字母 d」。Go 的 `regexp.CompilePOSIX` 不认字符类里的 `\`,内部归一化成 `\\` 再编译,而不是退化成 Perl 语义。两个边界同样按 ERE 处理:**已转义**的 `\\` 不会再转一次(`[\\d]`、`[\\]` 仍合法),`[` / `[^` 后**紧跟**的 `]` 是字面量(`[\]]` 不被截断)。这 11 个形状有 golden 表钉住,期望值由真 Git Bash 生成(`go test ./internal/builtins/ -update-grep-golden`),不手写 |
 | `more` | Git Bash 里没有,我们用了 Windows 的——多一个工具,不是缺陷 |
+| **MSYS 挂载点** | `/`、`/tmp`、`/usr/bin`、`/bin`、`/c`…**支持**,与真 Git Bash 的挂载表对齐(`/` = Git 安装根,`/tmp` = 用户 `%TEMP%`)。所以 `mktemp`、`echo x > /tmp/f`、`cd /c/Windows`、`[ -d /tmp ]` 都能用。**一条限制**:`[ -e /etc ]` 这类"根挂载点下的子路径"走 `test`/`[` 时**不支持** —— mvdan/sh 会先把路径拼成 `<cwd>\etc`,而相对路径 `etc` 拼出**同一个字符串**,无法区分,所以不猜(猜错会把大量相对路径误判成"存在")。同样的判断用 `ls /etc` 就行(那条能拿到原始路径) |
 | `ls` 默认不列点文件 | **与 bash 一致**(POSIX 语义)。要列用 `-a`;`-a` 时 `.` / `..` **参与同一个排序**(与 bash 一致),不是恒在最前 |
 | `ls -l` 只有四列 | 权限 大小 修改时间 名字;没有属主/组/链接数(Windows 上没有 POSIX 属主),时间格式也不同 |
 | `grep -r` 的输出路径 | 基于**你写的那个路径**算(`grep -r b .` → `./d.txt:b`),与 bash 一致 |

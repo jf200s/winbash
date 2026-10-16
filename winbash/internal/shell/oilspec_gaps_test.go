@@ -154,8 +154,17 @@ func TestCdAcceptsPosixPaths(t *testing.T) {
 		t.Errorf("got %q want %q", strings.TrimSpace(out), `C:\Windows`)
 	}
 
-	// `/` = 当前盘根。这条以前是**静默失效**的。
-	// 先显式回到测试所在的目录,期望才明确(盘根取决于上一次 cd 落在哪个盘)。
+	// `/` = **Git 安装根**,不是当前盘根。
+	//
+	// 这条早先断言的是"当前盘根(`D:\`)",那是没有挂载表时的权宜之计(注释原话:
+	// "在 Windows 上最接近的语义就是它")。后来补上 MSYS 挂载表(见 builtins/msyspath.go),
+	// 真 bash 的证据也拿到了:
+	//
+	//	$ bash -c 'cd / && pwd -W'
+	//	C:/Program Files/Git
+	//	$ bash -c 'cd / && ls'      → usr/ etc/ bin/ …(盘根下没有这些)
+	//
+	// 所以改成与真 bash 一致。这里断言"指向 Git 根"而不硬编码路径,换安装位置仍成立。
 	if code := s.runForSetup(t, `cd "`+cwd+`"`); code != 0 {
 		t.Fatalf("回到测试目录失败:%d", code)
 	}
@@ -163,9 +172,11 @@ func TestCdAcceptsPosixPaths(t *testing.T) {
 	if exit != 0 {
 		t.Fatalf("cd / 失败:exit=%d errs=%v", exit, errsOut)
 	}
-	if got := strings.TrimSpace(out); got != strings.TrimSuffix(root, `\`) && got != root {
-		t.Errorf("cd / 之后 pwd=%q,want %q(当前盘根)", got, root)
+	if got := strings.TrimSpace(out); got != gitInstallRootForTest() {
+		t.Errorf("cd / 之后 pwd=%q, want %q(Git 安装根;真 bash 给 C:/Program Files/Git)",
+			got, gitInstallRootForTest())
 	}
+	_ = root
 
 	// Windows 形式不能被改坏。
 	out, exit, errsOut = s.Run(context.Background(), `cd C:/Windows && pwd`, false)

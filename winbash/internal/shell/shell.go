@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,6 +25,19 @@ import (
 	"winbash/internal/errs"
 	"winbash/internal/pwsh"
 	"winbash/internal/winmgmt"
+)
+
+// dirOf 从 interp 的 handler context 里取当前目录(mvdan/sh 自己也是这么做的)。
+func dirOf(ctx context.Context) string {
+	return interp.HandlerCtx(ctx).Dir
+}
+
+// 三个 base handler 在包初始化时装一次 —— 它们是 mvdan/sh 的默认真实实现,
+// 上面那三个包装器只做路径改写,其余全部委派回去。
+var (
+	baseOpenHandler    = interp.DefaultOpenHandler()
+	baseStatHandler    = interp.DefaultStatHandler()
+	baseReadDirHandler = interp.DefaultReadDirHandler2()
 )
 
 // Session 是一次命令行"会话":它跨多次 Run 保持变量、cwd 与函数。
@@ -125,6 +139,29 @@ func NewSession() *Session {
 		interp.StdIO(bytes.NewReader(nil), s.stdout, s.stderr),
 		interp.ExecHandler(s.execHandler),
 		interp.CallHandler(s.callGuard),
+		// 下面三个 handler 都是**同一个原因**:mvdan/sh 判断绝对路径用 filepath.IsAbs,
+		// 而它在 Windows 上不认 POSIX 形式,于是 `/tmp`、`/c/Users/x` 会被当成相对路径
+		// 拼到 cwd 后面(实测 `echo hi > /tmp/t` → open <cwd>\tmp\t 找不到)。
+		// 详见 builtins.ResolveShellPath 的注释。
+		//
+		// 默认 handler 装在包装器里而不是重写:相对路径的拼接、`/dev/null` 的 NUL 特例
+		// 都保持 mvdan/sh 的原行为 —— 那两件事它做得对,不该被我们覆盖掉。
+		interp.OpenHandler(func(ctx context.Context, path string, flag int, perm os.FileMode) (io.ReadWriteCloser, error) {
+			return baseOpenHandler(ctx, builtins.ResolveShellPath(dirOf(ctx), path), flag, perm)
+		}),
+		interp.StatHandler(func(ctx context.Context, path string, follow bool) (fs.FileInfo, error) {
+			dir := dirOf(ctx)
+			fixed := builtins.ResolveShellPath(dir, path)
+			if fixed == path {
+				// mvdan/sh 的 `r.stat` 会先把路径拼成 `<dir>\tmp` 才交给 handler,
+				// 原始写法在那一步就丢了 —— 拿不回来只能还原(见 RestoreSyntheticMount)。
+				fixed = builtins.RestoreSyntheticMount(dir, path)
+			}
+			return baseStatHandler(ctx, fixed, follow)
+		}),
+		interp.ReadDirHandler2(func(ctx context.Context, path string) ([]fs.DirEntry, error) {
+			return baseReadDirHandler(ctx, builtins.ResolveShellPath(dirOf(ctx), path))
+		}),
 	)
 	if err != nil {
 		// interp.New 只在 RunnerOption 非法时报错;上面的选项都是常量,出错即编程错误。
@@ -275,18 +312,19 @@ func normalizeCdPath(cwd, arg string) (string, bool) {
 	if !strings.HasPrefix(arg, "/") {
 		return "", false
 	}
-	if arg == "/" {
-		// 单个 / 视作当前盘根:`cd /` 在 Windows 上最接近的语义就是它。
-		if vol := filepath.VolumeName(cwd); vol != "" {
-			return vol + `\`, true
-		}
-		return "", false
-	}
-	// `/c/Users/…` 这类 POSIX 盘符写法交给 ResolvePath —— 它已经被 ①/② 层共用,
-	// 不必在这里再写一份路径规则。
+	// `/c/...`(盘符)与 `/tmp`、`/usr/bin`、`/bin`、`/`(MSYS 挂载点)都交给
+	// ResolvePath —— 它已经被 ①/② 层共用,路径规则只该有一份。
+	//
+	// 注意 `cd /` 现在解析到 **Git 安装根**(真 bash 里 `/` 就是那里),
+	// 而不是"当前盘根"。早先这里单独把 `/` 特判成盘根(`D:\`),那与真 bash 不一致:
+	// 实测真 bash 的 `cd / && ls` 能看到 `usr/ etc/ bin/`,而盘根看不到。
+	// 挂载表在 msyspath.go,这一条是它的自然结果,所以特判删掉。
 	abs, err := builtins.ResolvePath(cwd, arg)
 	if err != nil {
 		return "", false
+	}
+	if abs == arg {
+		return "", false // 没改写就别动它(交回 mvdan/sh 原语义)
 	}
 	return abs, true
 }
