@@ -120,16 +120,26 @@ func TestCheckProto(t *testing.T) {
 	}
 }
 
-// TestFrameLimitStillGuardsStdinStream 钉住一个容易被想当然推翻的点:裸字节流
-// **不**经过 WriteMessage,所以 64MiB 的帧上限管不到它 —— 这正是流式的价值
-// (不缓存、不受帧上限)。这条断言的是 ReadMessage 对请求头的约束仍然在,
-// 否则有人可能顺手把上限放宽,连头帧一起放开。
-func TestFrameLimitStillGuardsStdinStream(t *testing.T) {
+// TestUnsupportedStdinLenIsRejected 钉住:按长度读的形态(StdinLen >= 0)是**协议
+// 预留、未实现**,不该有实现侧分支去跑它。
+//
+// 这条记录了「补正向测试」与「删死分支」之间的一次选择:原先 daemon 里有
+// `if n >= 0 { io.CopyN(...) }`,但 client 永远只发 StdinUntilEOF(os.Stdin 是流,
+// 读之前不知道长度),那个分支**零调用方、零测试**。与其给死分支补一条正向测试
+// (测一个永远不会被生产的形态),不如让它变成明确的未支持 —— handle 收到非
+// StdinUntilEOF 的 stdin_len 就退出码 2 报错,协议能力与实现因此一致,
+// 「协议里写了」也不会退化成「假装支持」。
+//
+// 做长度模式那天,应当同时:client 侧真的发送、daemon 侧恢复 CopyN、两边各补
+// 用例、并把 ipc.ProtoVersion 升一位(理由见 StdinLen 的字段注释)。
+func TestUnsupportedStdinLenIsRejected(t *testing.T) {
+	// StdinUntilEOF 必须是负数且是唯一被支持的取值 —— daemon 只认它。
+	if StdinUntilEOF >= 0 {
+		t.Fatalf("StdinUntilEOF 必须为负（它是「读到 EOF」的唯一标识），得到 %d", StdinUntilEOF)
+	}
+	// 帧上限这条容易被想当然推翻:裸字节流**不**经过 WriteMessage,64MiB 的
+	// 上限管不到它(那正是流式的价值);但请求头帧的约束仍在,不能被顺手放宽。
 	if maxMessageBytes == 0 {
 		t.Fatal("请求头帧的上限不该为 0")
-	}
-	// StdinUntilEOF 必须是负数:daemon 靠 n<0 判断「读到 EOF」而不是 CopyN。
-	if StdinUntilEOF >= 0 {
-		t.Fatalf("StdinUntilEOF 必须为负（daemon 用 n<0 分流），得到 %d", StdinUntilEOF)
 	}
 }

@@ -204,7 +204,22 @@ func handle(conn net.Conn, sess *shell.Session, token string, readTimeout time.D
 	case "", ipc.StdinNone:
 		// 本次没有 stdin:session 保持空输入(立即 EOF),与真 `bash -c 'cat'` 一致。
 	case ipc.StdinStream:
-		s, err := startStdinStream(sess, conn, req.StdinLen)
+		// 长度模式(StdinLen >= 0)**协议预留、当前未实现**:client 拿不到 os.Stdin
+		// 的长度(要读到 EOF 才知道),所以没有任何合法来源会发 >=0 —— 那条 CopyN
+		// 分支因此**没有调用方、没有测试**。收到就报错,而不是走一条没人验过的路:
+		// 「协议里写了」不能变成「假装支持」,那正是本项目的底线要防的形态。
+		// 真要做长度模式(例:文件重定向可直接 f.Stat())时,连同 client 侧发送与
+		// 测试一起加,并把 ipc.ProtoVersion 升一位。
+		if req.StdinLen != ipc.StdinUntilEOF {
+			return false, writeResponse(conn, ipc.Response{
+				OK: false,
+				Errors: []string{fmt.Sprintf("daemon: 不支持的 stdin_len %d(当前只支持 %d = 读到 EOF)\n"+
+					"怎么办: 两端的 winbash.exe 版本可能不一致;运行 `winbash --stop` 后重试",
+					req.StdinLen, ipc.StdinUntilEOF)},
+				Exit: 2,
+			})
+		}
+		s, err := startStdinStream(sess, conn)
 		if err != nil {
 			return false, writeResponse(conn, ipc.Response{
 				OK:     false,
@@ -249,7 +264,10 @@ func handle(conn net.Conn, sess *shell.Session, token string, readTimeout time.D
 //
 // stop 在 Run 返回之后被调用,做三件事:设 deadline 唤醒可能卡在 conn.Read 的
 // goroutine → 等它真的退出 → 清掉 deadline(免得影响随后的写响应与下一个请求)。
-func startStdinStream(sess *shell.Session, conn net.Conn, n int64) (stop func(), err error) {
+//
+// 只读到对端 FIN 为止(StdinLen=StdinUntilEOF):按长度读的形态**没有实现**,
+// 校验在 handle 里,理由见那里。
+func startStdinStream(sess *shell.Session, conn net.Conn) (stop func(), err error) {
 	pw, err := sess.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -257,11 +275,7 @@ func startStdinStream(sess *shell.Session, conn net.Conn, n int64) (stop func(),
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		if n >= 0 {
-			_, _ = io.CopyN(pw, conn, n)
-		} else {
-			_, _ = io.Copy(pw, conn)
-		}
+		_, _ = io.Copy(pw, conn)
 		// 必须关写端:脚本在等 EOF,不关它 Read 就永不返回。
 		//
 		// 拿到的错误**不上报**。这里最常见的两种都不是故障:

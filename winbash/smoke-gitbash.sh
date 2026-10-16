@@ -108,6 +108,14 @@ check "命令不读 stdin 不反压" "never-reads"       "$(yes | timeout 10 $EX
 check "大输入经 wc -l"        "30000"             "$(seq 1 30000 | timeout 10 $EXE -c 'wc -l' | tr -d ' ')"
 check "流式跑完 daemon 仍活"  "0"                 "$($EXE --status >/dev/null 2>&1; echo $?)"
 
+# 嵌套(内层带 WINBASH_SESSION,走 runLocal 本地会话、**不连 daemon**)的 stdin 链路:
+# 内层读的是它自己的 os.Stdin,而那是外层 ③ 层派生子进程时接上的 reader。漏了这条
+# 就是「外层通、内层空」—— 半能用比完全不能用更费人,所以钉在这里。
+echo "-- 嵌套 winbash 的 stdin(内层本地会话,不连 daemon)"
+check "嵌套也拿到管道内容"     "nested" "$(printf 'nested\n' | timeout 15 $EXE -c "$EXE -c cat" 2>&1)"
+check "嵌套无 stdin 立即结束"   "0"      "$(timeout 15 $EXE -c "$EXE -c cat" </dev/null >/dev/null 2>&1; echo $?)"
+check "嵌套之后 daemon 仍活"   "0"      "$($EXE --status >/dev/null 2>&1; echo $?)"
+
 echo "-- Review Focus 第 1 条:含空格与中文的路径"
 check "中文路径可列"         "1"     "$($EXE -c 'ls "D:/work/中文 目录"' | grep -c '^winbash$')"
 check "含空格路径可列"       "0"     "$($EXE -c 'ls "C:/Users/Test User"' >/dev/null 2>&1; echo $?)"

@@ -77,8 +77,15 @@ type Request struct {
 	// 空值等同 StdinNone —— 但既然要升版本,两端都应显式写上。
 	StdinMode string `json:"stdin_mode,omitempty"`
 
-	// StdinLen 是 stdin 流的长度(StdinMode==StdinStream 时有意义):
-	// StdinUntilEOF(-1)=读到半侧关闭,管道输入的主路径;>=0=读恰好 N 字节。
+	// StdinLen 是 stdin 流的长度语义(StdinMode==StdinStream 时有意义)。
+	//
+	// 当前**只支持** StdinUntilEOF(-1):读到对端半侧关闭(FIN)为止,管道输入的
+	// 主路径走这条。
+	//
+	// >=0(读恰好 N 字节)**是协议预留、未实现** —— client 拿不到 os.Stdin 的长度
+	// (要读到 EOF 才知道),没有合法来源会发它。daemon 收到即报错(退出码 2),
+	// 而不是走一条**没有调用方、没有测试**的分支;真要做长度模式时(例:文件重定向
+	// 可直接 f.Stat()),连同 client 侧的发送与测试一起加,并把 ProtoVersion 升一位。
 	StdinLen int64 `json:"stdin_len,omitempty"`
 
 	// TimeoutMS 是这次请求在 daemon 侧的执行上限(0 = 不设限)。

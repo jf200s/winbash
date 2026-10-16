@@ -100,6 +100,46 @@ func TestRequestWithoutTokenIsRejected(t *testing.T) {
 	}
 }
 
+// ★ 长度模式(StdinLen >= 0)是协议预留、未实现:daemon 必须**响亮拒绝**,
+// 而不是跑一条零调用方、零测试的分支。
+//
+// 这条测试替代了「给死分支补正向测试」那个选项。原先 daemon 里有
+// `if n >= 0 { io.CopyN(pw, conn, n) }`,但 client 永远只发 StdinUntilEOF ——
+// os.Stdin 是流,**读之前根本不知道长度**,所以没有任何合法来源会发 >=0。
+// 给它补一条正向用例,等于测一个永远不会被生产的形态;改成「明确不支持 + 拒绝
+// 路径的回归」,协议能力就与实现一致了,而且这条是**真打 daemon** 的
+// (rawRequest 绕过 client 直接发帧,同攻击者视角)。
+func TestUnsupportedStdinLenIsRejectedByDaemon(t *testing.T) {
+	ep := startDaemon(t, DefaultReadTimeout)
+	_, token := readEndpointFile(t, ep)
+
+	for _, n := range []int64{0, 1, 1 << 20} {
+		resp, err := rawRequest(t, ep, ipc.Request{
+			Proto:     ipc.ProtoVersion, // 版本要对,否则会被 CheckProto 先挡住(那是另一条路径)
+			Token:     token,            // 鉴权要过,否则走不到 stdin 检查
+			Op:        "run",
+			Script:    "cat",
+			StdinMode: ipc.StdinStream,
+			StdinLen:  n,
+		})
+		if err != nil {
+			t.Fatalf("stdin_len=%d 没得到响应(应当明确拒绝): %v", n, err)
+		}
+		if resp.Exit != 2 {
+			t.Fatalf("stdin_len=%d 期望用法错误 2,得到 %d (out=%q errors=%v)",
+				n, resp.Exit, resp.Out, resp.Errors)
+		}
+		msg := strings.Join(resp.Errors, "\n")
+		if !strings.Contains(msg, "stdin_len") {
+			t.Fatalf("stdin_len=%d 错误没点名字段: %v", n, resp.Errors)
+		}
+		// 三行式:必须带「怎么办」——报错要可操作,这是项目错误模型的硬要求。
+		if !strings.Contains(msg, "--stop") {
+			t.Fatalf("stdin_len=%d 错误没有指路: %v", n, resp.Errors)
+		}
+	}
+}
+
 // 端口文件必须带着 token,而 token 不能是空串或可猜的常量。
 func TestEndpointFileCarriesARandomToken(t *testing.T) {
 	ep := startDaemon(t, DefaultReadTimeout)
