@@ -17,7 +17,7 @@ bash 语法 + pwsh 能力的常驻 shell,给在 Windows 上干活的 AI 用。
 & 'D:\work\中文 目录\winbash\winbash.exe' --json -c 'sys mem'
 ```
 
-- 第一次调用会自动拉起常驻 daemon(约 **70 ms** 一次性成本),之后每条命令约 **22 ms**。
+- 第一次调用会自动拉起常驻 daemon(约 **70 ms** 一次性成本),之后每条命令约 **22 ms**（**早期观察**）。
 - daemon 空闲 30 分钟后自行退出,不留僵尸进程;也可以显式管理:
 
 ```powershell
@@ -167,6 +167,10 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 它量的是 interp 的一次 `Run`(本机:纯 `echo` 约 **6.4 µs/op**,`echo hello | grep hell` 约 **119 µs/op**)。
 端到端那 20 ms 量级里,绝大部分是**进程创建与 IPC 往返**,不是 winbash 本身。
 
+**① 层不比真 bash 快**(实测 20 次 `echo x`:winbash 0.783s vs 真 `bash -c` 0.689s,差异在噪声量级内)。
+它的价值是**语义可控** —— `ls` 永远是自己的 `ls`,不被 PATH 上重名的 Windows exe 抢走 —— **不是快**。
+省时间的地方在 **② 层**(吃掉 pwsh 的 ~350 ms 冷启动,实测 3.7 倍)与「不用换语法」,别指望纯 bash 那层提速。
+
 ## 已知差异与限制
 
 与真 bash 相比的差异(全部有测试钉住,见 `internal/shell/corpus_test.go`):
@@ -198,12 +202,30 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 | 超时**不会**重放脚本 | 客户端超时后直接报错。早先它会重拉 daemon 把同一个请求原样重跑,于是 `echo RUN >> f; sleep 6` 配 `--timeout 2s` 会让文件出现**两行** —— 对写文件类脚本是数据损坏 |
 | 坏连接最多挡住 5 秒 | daemon 串行处理连接,一个只连不说话的连接会让后续命令排队;它会在 5 秒后丢掉这条连接。修之前没有这个上限,能一直挡到客户端自己超时 |
 
-**会话级状态**(常驻会话的必然结果,不是 bug):`set -e`、`trap`、`alias`、变量、`cd` 都**跨命令持久**。
+**会话级状态**(常驻会话的必然结果,不是 bug):`set -e`、`trap`、**变量**、**函数**都**跨命令持久**。
 `bash -c` 每条都是新进程,所以这一点与它不同——一条命令里的 `set -e` 会影响**后续所有命令**。
+
+**不持久的两样**,写出来免得拿它们当配置用(实测,两样都与真 `bash -c` 一致,**不是缺陷**):
+
+- **`cd`** —— client 每次把自己的 cwd 随请求带上,daemon 先切过去,于是覆盖掉上一条留下的目录。
+  一条命令的 `cd` 不会污染下一条,这正是 `bash -c` 的语义。副作用是**跨调用的 `cd` 不累积**:
+  一次调用里 `cd D:\work` 后 `pwd` 是对的,但**下一次**调用的 `pwd` 回到调用方目录。
+- **`alias`** —— 非交互式下 `expand_aliases` 本来就没开。真 bash 同样如此:
+  `bash -c 'alias gg="echo hit"; gg'` → `gg: command not found`。所以它在这里当不了配置。
 
 **当前限制**:
 
-- **不转发 stdin**:`echo x | winbash -c 'cat'` 拿到的是空输入(不是 `x`)。管道进 winbash 的数据会被丢弃。
+- **stdin 转发的形态与边界**:`echo x | winbash -c 'cat'` → `x` **已支持**,而且是**流式**的
+  (2026-10-16 起:请求头之后跟裸字节流,边读边转、**不缓存到内存**)。因此
+  `yes | winbash -c 'head -1'` 这类**上游永不给 EOF** 的管道也能跑,同样不受大小限制。
+  剩两条边界:
+  1. **交互终端下不读 stdin** —— 判据是它不是字符设备。否则 `winbash -c 'ls'` 这类
+     **不读** stdin 的命令会永远挂住(无法从脚本文本判断它读不读)。代价:终端下
+     `winbash -c 'cat'` 拿到空输入,而真 bash 会读 tty。
+  2. **界靠时间而不靠字节**:流式不缓存,所以没有「stdin 太大」这回事;要防的是
+     「一直流个不停」,用 `--timeout`(默认 300 s,同时约束执行与读 stdin)。
+     命令**不读** stdin 而上游仍在灌数据时,daemon 在命令返回后立刻回收转发协程 ——
+     这一条有回归钉着(见 `smoke-gitbash.sh` 的「流式 stdin」节)。
 - **② 层没有命令级 `--json`**:`sys mem --json` 会报"不认识的参数"。JSON 开关在整次调用上:`winbash --json -c 'sys mem'`。
 - 不做交互式 REPL,不追求 100% bash 兼容,不做 pwsh 对象管道。
 
