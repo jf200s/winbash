@@ -47,6 +47,13 @@ git worktree add .worktrees/<slug> -b <类型>/<slug>
 4. **合并**：`git merge --no-ff <分支>`，一提交 = 一任务。冲突**退回子代理在它的 worktree 里重解**，不在主代理手里硬解。
 5. 删 worktree 与分支（§2 收尾命令），确认 `git status` 空、`git worktree list` 只剩主工作树。
 6. 有失败 → 按 `systematic-debugging` 先复现、再修，别猜。
+7. **量耗时别用 bash 的管道** —— 本轮在这上面栽了两次，两次都得出"产品有 bug"的假结论：
+   `$( cmd1 | cmd2 )` 会等**整条管道**（含上游子 shell），`a | b & wait $!` 也一样
+   （`$!` 没只指向 b）。实测 `( sleep 10; echo late ) | winbash --timeout 1s -c 'cat'`
+   在 bash 里量出 **10101ms**，而 Python 直接 `Popen` + `wait()` 量到 **1065ms** ——
+   winbash 的 timeout 是准的，**错的是尺子**。
+   量单条命令的耗时：直接起进程（Python `subprocess` + `wait()`），或用 `timeout N`
+   看是否返回 124；上游有长命令时，`$!`/`$(...)` 一律不可信。
 
 ## 5. 并发的物理约束（本项目的硬边界，违反会产假失败）
 

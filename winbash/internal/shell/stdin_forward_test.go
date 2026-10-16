@@ -109,6 +109,24 @@ func (r *drainingReader) Read(p []byte) (int, error) {
 //
 // 用内建 read 而不是外部 cat：interp.New 默认没有 ExecHandler，cat 会走外部进程
 // 而 127（探针第一版就栽在这，测成了「找不到 cat」）。
+//
+// ---- 为什么不改上游去根除这个根因（2026-10-16 调研，别再重开） ----
+//
+// 抽干看着反直觉，但 `*os.File` 是上游的**硬约束**，理由写在它自己的源码里：
+//
+//	stdin_os.go:18  type stdinFile = *os.File    ← 配合 SetReadDeadline 提供可取消读
+//	stdin_os.go:28 / api.go:606  「an [*os.File] is the only way to share a
+//	                              reader with subprocesses」
+//
+// 而子进程继承那条链我们**正在用**：上游 handler.go:154 与 winbash 的
+// shell.go:513 是同一句 `cmd.Stdin = hc.Stdin`。所以真把 stdinFile 改成能后填的
+// bytes.Reader，代价是**③ 层外部命令（head/cat/grep/wc）全部读不到 stdin**，
+// 还会失去「timeout 打断卡在 stdin 上的读」这一能力（那靠 SetReadDeadline）。
+// smoke 里 `printf … | winbash -c 'head -1'` → `y` 钉的就是第一条。
+//
+// 顺带：我们用的 v3.14.1 已是上游最新（40 个版本里的最后一个），没有「等新版」
+// 这条路。**结论：不 fork、不 replace**，`go mod verify` 干净零维护成本；我们
+// 自持 pipe 对是**满足**这个约束（交出一个 *os.File 给 runner），不是绕开它。
 func TestStdinLateFillIsSilentlyDropped(t *testing.T) {
 	dr := newDrainingReader()
 	var out bytes.Buffer
@@ -118,13 +136,14 @@ func TestStdinLateFillIsSilentlyDropped(t *testing.T) {
 	}
 
 	// 等抽干 goroutine 真的读到 EOF —— 这一步把竞态变成确定事实。
-	// 超时同样是有意义的信号：说明 mvdan/sh 不再在构造期抽干，
-	// 那时本文件的承载方案可以简化，测试应当显式喊出来而不是静默 PASS。
+	// 等不到同样是有意义的信号：说明上游不再在构造期抽干，而那时该重新查的是
+	// **它是否仍把 *os.File 当 stdin 载体**（见上方「为什么不改上游」），
+	// 而不是「可以简化成 bytes.Reader」—— 那条路会砸掉 ③ 层的 stdin 继承。
 	select {
 	case <-dr.EOFSeen:
 	case <-time.After(5 * time.Second):
-		t.Fatal("5s 内没等到构造期抽干的 EOF —— mvdan/sh 的构造期行为可能已变，" +
-			"本文件的 pipe 承载方案需重新评估（SetStdinBytes 的注释一起看）")
+		t.Fatal("5s 内没等到构造期抽干的 EOF —— mvdan/sh 的构造期行为变了，先查它是否仍以 " +
+			"*os.File 承载 stdin（子进程继承 + 可取消读），再重审 pipe 方案；理由见上方调研注释")
 	}
 
 	dr.buf.WriteString("late-data\n") // 确定太迟：抽干已经结束，EOFSeen 已关闭
