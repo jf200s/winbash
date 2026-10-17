@@ -292,13 +292,46 @@ func (s *Session) callGuard(ctx context.Context, args []string) ([]string, error
 
 	// `cd /c/Users` 与 `cd /`:cd 是 mvdan/sh 的内建,走不到我们的 OpenHandler,
 	// 于是 POSIX 路径在这里一直失效(细则见 normalizeCdPath)。
-	if len(args) == 2 && args[0] == "cd" {
-		if fixed, ok := normalizeCdPath(interp.HandlerCtx(ctx).Dir, args[1]); ok {
-			return []string{"cd", fixed}, nil
-		}
+	//
+	// 判据必须覆盖**别名前缀**:实测 `command cd /` 与 `builtin cd /c/Users` 都绕过了
+	// 这里(原先只认 args[0]=="cd"),后果比"不起效"更糟 —— 实测二者都返回 **0**,
+	// 而 cwd 要么没动、要么被拼成 `<cwd>\c\Users`(一个不存在的相对路径)。
+	// 也就是说脚本以为切过去了、后面全在错的目录里跑,全程没有任何报错。
+	if fixed, prefix, ok := normalizeCdInvocation(interp.HandlerCtx(ctx).Dir, args); ok {
+		return append(append([]string{}, prefix...), "cd", fixed), nil
 	}
 
 	return args, nil
+}
+
+// normalizeCdInvocation 认出 `cd X` / `command cd X` / `builtin cd X` 三种形态,
+// 返回规范化后的路径与需要保留的前缀。
+//
+// 为什么把这三种收在一处:它们走的是**同一个** mvdan/sh 内建,也就会踩同一个
+// 「POSIX 路径没被规范化」的坑。原先只处理 `cd X`,于是 `command cd /` 与
+// `builtin cd /c/Users` 静默给出错结果 —— 实测两者都返回 0:
+//
+//	command cd /        → cwd 没动(仍是原目录)
+//	builtin cd /c/Users → cwd 变成 <原 cwd>\c\Users(一个不存在的相对路径)
+//
+// 返回值 prefix 是要保留的前缀(command / builtin),保留它是为了不改语义:
+// 那两种写法本来就是在**刻意绕过**函数或别名,替换成裸 `cd` 会把这一层去掉。
+func normalizeCdInvocation(dir string, args []string) (fixed string, prefix []string, ok bool) {
+	var target string
+	switch {
+	case len(args) == 2 && args[0] == "cd":
+		target = args[1]
+	case len(args) == 3 && (args[0] == "command" || args[0] == "builtin") && args[1] == "cd":
+		prefix = []string{args[0]}
+		target = args[2]
+	default:
+		return "", nil, false
+	}
+	fixed, ok = normalizeCdPath(dir, target)
+	if !ok {
+		return "", nil, false
+	}
+	return fixed, prefix, true
 }
 
 // needsOurWhich 报告这个名字是不是「只有 winbash 认识」—— 即 mvdan/sh 的

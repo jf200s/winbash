@@ -94,6 +94,49 @@ func TestMsysMountsInTestBuiltin(t *testing.T) {
 	}
 }
 
+// ★ `command cd` 与 `builtin cd` 也必须走同一条路径规范化。
+//
+// 它们与裸 `cd` 是**同一个** mvdan/sh 内建,所以踩同一个坑,但修之前 callGuard 只认
+// args[0]=="cd",于是这两条整条绕过规范化。实测后果比"不起效"更糟 —— 都返回 **0**:
+//
+//	command cd /        → cwd 没动(仍是原目录)
+//	builtin cd /c/Users → cwd 变成 <原 cwd>\c\Users(一个不存在的相对路径)
+//
+// 也就是说脚本以为切过去了、后面所有相对路径全跑在错的目录里,全程没有任何报错。
+// 这两条恰恰是"刻意绕过函数/别名"的写法,使用者往往正是在调试这类问题,
+// 结果拿到一个假的成功。
+func TestCdThroughCommandAndBuiltinTakesEffect(t *testing.T) {
+	// `command cd /`:cwd 必须变成 Git 安装根(与裸 cd / 一致)。
+	out, exit := runScript(t, `command cd / && pwd`)
+	if exit != 0 {
+		t.Fatalf("command cd / 失败: exit=%d out=%q", exit, out)
+	}
+	got := strings.TrimSpace(out)
+	if got == "" || strings.HasSuffix(got, "c\\Users") || strings.HasSuffix(got, "c/Users") {
+		t.Fatalf("command cd / 之后 pwd 给 %q —— 路径没被规范化", got)
+	}
+	// 与裸 `cd /` 的结果**逐字相等**才叫一致(两者本就是同一个内建)。
+	out2, exit2 := runScript(t, `cd / && pwd`)
+	if exit2 != 0 || strings.TrimSpace(out2) != got {
+		t.Fatalf("command cd / 给 %q,而 cd / 给 %q —— 两者不一致", got, strings.TrimSpace(out2))
+	}
+
+	// `builtin cd /c/Users`:必须真到 Users 目录,而不是 <cwd>\c\Users。
+	out, exit = runScript(t, `builtin cd /c/Users && pwd`)
+	if exit != 0 {
+		t.Fatalf("builtin cd /c/Users 失败: exit=%d out=%q", exit, out)
+	}
+	got = filepath.ToSlash(strings.TrimSpace(out))
+	if !strings.HasSuffix(strings.ToLower(got), "users") || strings.Contains(strings.ToLower(got), "/c/users") {
+		t.Fatalf("builtin cd /c/Users 之后 pwd 给 %q —— 被拼成了相对路径", got)
+	}
+
+	// 相对路径的 cd 不能被误伤:真的不存在时仍要非零。
+	if _, exit := runScript(t, `cd definitely-no-such-dir-xyz`); exit == 0 {
+		t.Fatal("cd 到不存在的目录仍返回 0 —— 规范化把失败也一起吞了")
+	}
+}
+
 // cd 到挂载点必须真的生效。这一条尤其重要:`cd` 失败时 mvdan/sh 报错但我们**不**改
 // 退出码语义,一旦静默失效,后面所有相对路径都跑在错的目录里。
 func TestMsysMountCdTakesEffect(t *testing.T) {

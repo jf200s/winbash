@@ -120,6 +120,60 @@ func TestWhichCmdResolvesPathAgainstSessionCwd(t *testing.T) {
 	}
 }
 
+// ★ `which -a` 列**所有**匹配位置,而不是把 -a 当成一个名字。
+//
+// 修之前:WhichCmd 把 argv 当名字逐个搜,于是 `which -a ls` 会
+//  1. 打出 ls 的位置(正确),
+//  2. 再对名字 "-a" 报一句「找不到: -a」并返回 exit 1。
+//
+// 那份「既有输出又报错」的组合最容易被误读成"某个名字没找到",而 AI 常用
+// `which -a python` 判断装了几个版本 —— 拿到输出却被退出码告知失败。
+func TestWhichCmdAllListsEveryMatch(t *testing.T) {
+	// 两个目录各放一个同名可执行文件,按 order 拼进搜索路径。
+	first, second := t.TempDir(), t.TempDir()
+	for _, d := range []string{first, second} {
+		if err := os.WriteFile(filepath.Join(d, "probe-all.exe"), []byte("MZ"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx := WithSearchPath(context.Background(), first+string(filepath.ListSeparator)+second)
+
+	var out, errw bytes.Buffer
+	code := WhichCmd(ctx, "", []string{"-a", "probe-all"}, &out, &errw)
+	if code != errs.ExitOK {
+		t.Fatalf("which -a 应当 exit 0,got %d stderr=%q", code, errw.String())
+	}
+	lines := strings.Fields(strings.TrimSpace(out.String()))
+	if len(lines) != 2 {
+		t.Fatalf("两个目录各有一个,应当输出 2 行,got %d: %q", len(lines), out.String())
+	}
+	// 顺序必须按 PATH 顺序(先 first,后 second)。
+	if !strings.Contains(strings.ToLower(lines[0]), strings.ToLower(filepath.Base(first))) {
+		t.Errorf("第一行应当来自 %s,got %q", first, lines[0])
+	}
+	// stderr 必须干净 —— 这正是修之前坏掉的地方。
+	if strings.Contains(errw.String(), "-a") {
+		t.Fatalf("stderr 不该提到 -a(它是个开关,不是名字): %q", errw.String())
+	}
+
+	// 不带 -a 时只给第一处(原有行为不能变)。
+	out.Reset()
+	errw.Reset()
+	if code := WhichCmd(ctx, "", []string{"probe-all"}, &out, &errw); code != errs.ExitOK {
+		t.Fatalf("which probe-all: exit=%d", code)
+	}
+	if n := len(strings.Fields(strings.TrimSpace(out.String()))); n != 1 {
+		t.Fatalf("不带 -a 时只该给一行,got %d: %q", n, out.String())
+	}
+
+	// 不认识的开关照旧响亮拒绝(不静默当名字 —— 项目底线)。
+	out.Reset()
+	errw.Reset()
+	if code := WhichCmd(ctx, "", []string{"-Z", "probe-all"}, &out, &errw); code != errs.ExitUsage {
+		t.Fatalf("未知开关应当 exit %d,got %d", errs.ExitUsage, code)
+	}
+}
+
 func TestWhichCmdWithoutArgsIsUsageError(t *testing.T) {
 	var out, errw bytes.Buffer
 	if code := WhichCmd(context.Background(), "", nil, &out, &errw); code != errs.ExitUsage {

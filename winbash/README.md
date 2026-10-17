@@ -99,7 +99,7 @@ winbash: client: daemon 没有协议版本(它是旧版),与本客户端(4)不�
 | `ls` | `[-l -a -h -1] [路径...]`;默认按 POSIX **不列点文件**(要列用 `-a`) |
 | `cat` | `[-n] [文件...]`;无参数 = 读 stdin,`-` 也是 stdin |
 | `grep` | `[-i -n -v -c -l -r -E -F -q] PATTERN [文件...]`;无文件 = 读 stdin |
-| `which` | `名字 [名字...]`;认识下面**四层**,①/② 层报名字,③ 层报绝对路径 |
+| `which` | `[-a\|--all] 名字 [名字...]`;认识下面**四层**,①/② 层报名字,③ 层报绝对路径。`-a` 列出**所有**匹配位置(按 PATH 顺序);不认识的开关**响亮拒绝**(`exit 2`)而不是当名字搜 |
 
 GNU grep 的两个高频选项 `--include` / `--exclude` **不支持**(① 层只有上表那些开关)。它们常被
 写在 PATTERN **之后**(`grep -rn x --include='*.go' .`),而真 grep 靠 getopt 的 **permutation**
@@ -321,7 +321,7 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 | `grep -E '[\d]'` | **支持**,按 ERE 原意匹配「反斜杠或字母 d」。Go 的 `regexp.CompilePOSIX` 不认字符类里的 `\`,内部归一化成 `\\` 再编译,而不是退化成 Perl 语义。两个边界同样按 ERE 处理:**已转义**的 `\\` 不会再转一次(`[\\d]`、`[\\]` 仍合法),`[` / `[^` 后**紧跟**的 `]` 是字面量(`[\]]` 不被截断)。这 11 个形状有 golden 表钉住,期望值由真 Git Bash 生成(`go test ./internal/builtins/ -update-grep-golden`),不手写 |
 | `more` | Git Bash 里没有,我们用了 Windows 的——多一个工具,不是缺陷 |
 | `mktemp` 的默认目录 | **不是 msyspath 的映射错误,是 MSYS 自己解析 `/tmp` 的结果**:winbash 的 `/tmp` 恒等于 `%TEMP%`;而 `mktemp.exe` 启动时若把 `/tmp` 解析成 `%TEMP%` 的**父目录**,它就会把 `TMPDIR` 投影成 `/tmp/<TEMP 的 basename>/tmp.XXX` —— 那个路径在两侧不是一个目录,`f=$(mktemp); cat "$f"` 于是读不回来(真 Git Bash 在同一个进程里也读不回来)。实测:直接派生 `mktemp.exe` 时稳定复现,经 `bash -c` 或 winbash ③ 层派生时约 1% 触发,**且触发一次后成片触发**(直到另一次干净的启动)。所以要跨工具链传临时路径,就在同一侧创建并消费;`internal/shell/msyspath_e2e_test.go` 对这种形态按「TEMP 的 basename 在路径里连续出现两次」跳过,而不是红 —— 判据精确到不会掩盖真的映射故障 |
-| **MSYS 挂载点** | `/`、`/tmp`、`/usr/bin`、`/bin`、`/c`…**支持**,与真 Git Bash 的挂载表对齐(`/` = Git 安装根,`/tmp` = 用户 `%TEMP%`)。所以 `mktemp`、`echo x > /tmp/f`、`cd /c/Windows`、`[ -d /tmp ]` 都能用。**一条限制**:`[ -e /etc ]` 这类"根挂载点下的子路径"走 `test`/`[` 时**不支持** —— mvdan/sh 会先把路径拼成 `<cwd>\etc`,而相对路径 `etc` 拼出**同一个字符串**,无法区分,所以不猜(猜错会把大量相对路径误判成"存在")。同样的判断用 `ls /etc` 就行(那条能拿到原始路径) |
+| **MSYS 挂载点** | `/`、`/tmp`、`/usr/bin`、`/bin`、`/c`…**支持**,与真 Git Bash 的挂载表对齐(`/` = Git 安装根,`/tmp` = 用户 `%TEMP%`)。所以 `mktemp`、`echo x > /tmp/f`、`cd /c/Windows`、`[ -d /tmp ]` 都能用。**`cd` 的三种写法都规范化了**:`cd /x`、`command cd /x`、`builtin cd /x`(`TestCdThroughCommandAndBuiltinTakesEffect`)。**一条限制**:`[ -e /etc ]` 这类"根挂载点下的子路径"走 `test`/`[` 时**不支持** —— mvdan/sh 会先把路径拼成 `<cwd>\etc`,而相对路径 `etc` 拼出**同一个字符串**,无法区分,所以不猜(猜错会把大量相对路径误判成"存在")。同样的判断用 `ls /etc` 就行(那条能拿到原始路径) |
 | `ls` 默认不列点文件 | **与 bash 一致**(POSIX 语义)。要列用 `-a`;`-a` 时 `.` / `..` **参与同一个排序**(与 bash 一致),不是恒在最前 |
 | `ls -l` 只有四列 | 权限 大小 修改时间 名字;没有属主/组/链接数(Windows 上没有 POSIX 属主),时间格式也不同 |
 | `grep -r` 的输出路径 | 基于**你写的那个路径**算(`grep -r b .` → `./d.txt:b`),与 bash 一致 |

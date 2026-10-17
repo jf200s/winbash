@@ -72,6 +72,33 @@ func findExecutable(base string, exts []string) (string, bool) {
 	return "", false
 }
 
+// WhichAll 在搜索路径里找出**所有**匹配位置(按 PATH 顺序),给 `which -a` 用。
+//
+// 与 Which 的差别只有一处:不提前返回。自带路径的写法(含 / 或 \)仍只有一处 ——
+// 它不是"在 PATH 里搜",GNU which 对那种写法也只给一行。
+func WhichAll(cmd, searchPath string) []string {
+	if cmd == "" {
+		return nil
+	}
+	exts := pathExts()
+	if strings.ContainsAny(cmd, `/\`) {
+		if p, ok := findExecutable(cmd, exts); ok {
+			return []string{p}
+		}
+		return nil
+	}
+	var hits []string
+	for _, dir := range filepath.SplitList(searchPath) {
+		if dir == "" {
+			continue
+		}
+		if p, ok := findExecutable(filepath.Join(dir, cmd), exts); ok {
+			hits = append(hits, p)
+		}
+	}
+	return hits
+}
+
 // isScript 报告 p 是不是一个以 shebang 开头的文件。
 //
 // 只读头两个字节,所以再大的文件也不会被拖进来;文件不存在、读不出来、
@@ -143,8 +170,37 @@ func SearchPathFrom(ctx context.Context) string {
 // 而 mvdan/sh 的 `command -v` 只认进程 PATH 与它自己的内建表 ——
 // 于是它对 `ls`(我们的内建)和 `sed`(只在 Git Bash 的 usr\bin 里)都会说"没有"。
 func WhichCmd(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int {
+	// -a / --all:列出**所有**匹配位置,而不只是第一个。
+	//
+	// 为什么必须单独处理(而不是当未知参数拒掉):AI 判断「装了哪个版本」时常用
+	// `which -a python`,而原先这里会把它当**名字**去搜,报一句"找不到: -a"、
+	// 退出码 1 —— 但 stdout 里已经把首个位置打出来了。那份「既有输出又报错」的
+	// 组合最容易被误读成"某个名字没找到"。
+	//
+	// 语义照 GNU which:
+	//   - 每个名字的每一处匹配各打一行(内置/②层只有一处);
+	//   - 一个都没找到时非零,否则 0(-a 与否都一样)。
+	all := false
+	filtered := make([]string, 0, len(argv))
+	for _, a := range argv {
+		switch a {
+		case "-a", "--all":
+			all = true
+		case "--":
+			// `--` 之后全是名字(照 POSIX 惯例)。
+		default:
+			// 其它以 - 开头的参数照旧响亮拒绝 —— 不静默当名字(项目底线)。
+			if strings.HasPrefix(a, "-") && a != "-" {
+				fmt.Fprintln(errw, errs.Errorf("which", "不认识的参数: "+a,
+					"① 层的 which 只支持 -a / --all;要看 GNU which 的完整行为请用 usr\\bin 里的 which"))
+				return errs.ExitUsage
+			}
+			filtered = append(filtered, a)
+		}
+	}
+	argv = filtered
 	if len(argv) == 0 {
-		fmt.Fprintln(errw, errs.Errorf("which", "需要至少一个名字", "用法: which 名字 [名字...]"))
+		fmt.Fprintln(errw, errs.Errorf("which", "需要至少一个名字", "用法: which [-a] 名字 [名字...]"))
 		return errs.ExitUsage
 	}
 
@@ -173,8 +229,18 @@ func WhichCmd(ctx context.Context, cwd string, argv []string, out, errw io.Write
 			if !filepath.IsAbs(target) {
 				target = filepath.Join(cwd, target)
 			}
-		}
-		if p, ok := Which(target, searchPath); ok {
+			if p, ok := Which(target, searchPath); ok {
+				fmt.Fprintln(out, p)
+				continue
+			}
+		} else if all {
+			if hits := WhichAll(target, searchPath); len(hits) > 0 {
+				for _, p := range hits {
+					fmt.Fprintln(out, p)
+				}
+				continue
+			}
+		} else if p, ok := Which(target, searchPath); ok {
 			fmt.Fprintln(out, p)
 			continue
 		}
