@@ -212,15 +212,31 @@ BRE 这一条是修过的:**早先默认按整串字面匹配**,于是这几个�
 MSYS 的 `/v` 参数改写、把 POSIX 路径喂给 Windows 工具)会在原错误之后补一条翻译,原错误不改写。
 
 **路径错误用 POSIX 措辞,不泄漏 Win32 细节**(2026-10-18)。`ls` / `cat` / `grep` 遇到路径失败时,
-"问题"那行与真 Git Bash 逐字对齐:
+"问题"那行与真 Git Bash 的**对应命令**逐字对齐 —— 注意**各命令格式并不相同**,
+这是 GNU coreutils 本身的做法,不是我们随意统一:
 
 ```
-winbash: ls
-         问题: cannot access 'nope.txt': No such file or directory
-         怎么办: 先确认路径存在,或用 winbash -c 'ls 上级目录' 看有哪些名字
+ls nope.txt      winbash: ls        问题: cannot access 'nope.txt': No such file or directory
+                 真 bash           ls: cannot access 'nope.txt': No such file or directory
+
+cat nope.txt     winbash: cat       问题: nope.txt: No such file or directory
+                 真 bash           cat: nope.txt: No such file or directory
+
+grep x nope.txt  winbash: grep      问题: nope.txt: No such file or directory
+                 真 bash           grep: nope.txt: No such file or directory
 ```
 
-真 bash:`ls: cannot access 'nope.txt': No such file or directory`(只差三行式外壳)。
+只差三行式外壳(`winbash: <命令>` / `问题:` / `怎么办:`)。**`cannot access` 是 ls 独有的措辞**;
+实测 GNU 内部就不统一 —— `cat` / `grep` / `wc` 给裸的 `<路径>: <原因>`,`head` / `tail` 用
+`cannot open 'x' for reading`,`sed` 用 `can't read`,`awk` 用 `fatal: cannot open file`。
+所以**不要**把三者统一成一种:统一必然与其中两个对不上。`TestCatPathProblemUsesBareCoreutilsFormat` /
+`TestGrepPathProblemUsesBareCoreutilsFormat` / `TestLsPathProblemKeepsCannotAccess` 逐命令钉着这件事
+(含 `ls -d` 分支,那是另一处独立调用点)。
+
+**两条有意不照搬 GNU**:`cat 大文件 | head` 在真 bash 里是被 SIGPIPE 直接杀掉(rc=0、stderr 空),
+`cat f > /bad/x` 由 **shell 层**拦截、cat 根本没启动 —— 所以那两种情况 GNU 并没有"cat 的措辞"可对齐。
+winbash 不会因 SIGPIPE 被杀(它自己管着输出端),因此仍显式报 `cannot write output: …` /
+`cannot read standard input: …`。报出来比照抄一句"什么都没有"有用(`TestCatWriteAndStdinProblemsStayExplicit`)。
 
 修之前是 `GetFileAttributesEx C:\Users\...\nope.txt: The system cannot find the file
 specified.` —— 三个问题都直接影响「AI 能不能自己修」:**泄漏 Win32 API 名**(`GetFileAttributesEx`
@@ -344,7 +360,8 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 | `${v/#前缀/替换}`、`${v/%后缀/替换}` | **不支持,报错 `2`**。mvdan/sh 没实现,而且会静默原样输出——我们宁可报错 |
 | `printf %q`、`printf -v` | 同上:不支持但显式报错,并给替代写法 |
 | `command -v find` / `type find` | 这两个是 mvdan/sh 的内建,按进程 PATH 回答(给 System32 那个)。准确答案用 `which find`。**`command -v` 已被 guard 接管**:①/② 层内建与只在 Git Bash `usr\bin` 里的工具都答得对,**多名字也行**(`command -v ls cat`;`TestCommandVHandlesMultipleNames`)。一条残余缺口:**混合写法**会放行给 mvdan/sh —— 例如 `command -v ls git` 里 `ls` 仍被漏报(`git` 在进程 PATH 里、mvdan 自己答得对,而 `CallHandler` 只能返回一条命令,没法逐名字替换)。要逐个判存在就分开写:`command -v ls && command -v git`。`type -p` / `type -t` 与 `type find` 同待遇:**未接管**,按进程 PATH 回答 |
-| 显式写 `Git\bin\bash.exe` 时参数里的双引号 | 那个 47 KB 的 exe **不是 MSYS 程序**,是 Git for Windows 的原生 launcher(导入表只有 `KERNEL32`/`msvcrt`/`SHELL32`,没有 `msys-2.0.dll`)。它把命令行**转发**给 `usr\bin\bash.exe`,这一跳用 MSVC 规则重拼,参数里的 `"` 到真 bash 手里已经变成 `\` —— **不是我们的转义问题**:对原生目标用标准 MSVC 规则是对的,坏在第二跳不受我们控制。按 PATH 找 `bash`(`which bash` 给的就是 `usr\bin\bash.exe`)完全正常,只有显式写全路径到 `bin\` 才会撞上 || `set -u` / `${v:?}` | 退出码 `1`(bash 的 `-c` 给 `127`),错误文本不带 `bash: line N:` 前缀——都非零、都点名变量 |
+| 显式写 `Git\bin\bash.exe` 时参数里的双引号 | 那个 47 KB 的 exe **不是 MSYS 程序**,是 Git for Windows 的原生 launcher(导入表只有 `KERNEL32`/`msvcrt`/`SHELL32`,没有 `msys-2.0.dll`)。它把命令行**转发**给 `usr\bin\bash.exe`,这一跳用 MSVC 规则重拼,参数里的 `"` 到真 bash 手里已经变成 `\` —— **不是我们的转义问题**:对原生目标用标准 MSVC 规则是对的,坏在第二跳不受我们控制。按 PATH 找 `bash`(`which bash` 给的就是 `usr\bin\bash.exe`)完全正常,只有显式写全路径到 `bin\` 才会撞上 |
+| `set -u` / `${v:?}` | 退出码 `1`(bash 的 `-c` 给 `127`),错误文本不带 `bash: line N:` 前缀——都非零、都点名变量 |
 | `${#关联数组[@]}` | mvdan/sh 的缺口:恒返回 `1`(键列表 `${!m[@]}` 与取值都是对的) |
 | `IFS` 给**多字符** | mvdan/sh 把整个串当分隔符,真 bash 只取**第一个字符**(`IFS=BC` 等价 `IFS=B`)。**静默**差异,光看输出看不出对错 —— 要按多字符分,请用 `IFS=,` 这类单字符,或先 `tr` 转换 |
 | **管道段不是真子 shell** | **静默差异**(两边都 `exit 0`、都不报错,只有输出不同):`cmd \| <右侧>` 右侧对变量的赋值会**泄漏到外层**,而真 bash 里右侧是独立进程、赋值随进程消失。实测三种形态都泄漏:`printf "a\nb" \| while read -r _; do n=$((n+1)); done` 之后 `n=2`(真 bash 得 `n=0`);`echo x \| f` 里函数内的赋值;`echo x \| { export PX=1; }` 的 `export`。**根因是上游架构限制,不是本项目的 bug** —— mvdan/sh 的 README 明说 `Go does not support forking its own process, so subshells use a goroutine instead`,管道每段是一个 goroutine 而非进程,变量绑定因此共享作用域。**这一条的方向对 AI 干活有利**(`n=2` 才是直觉预期),要防的是它无声变掉;`oilspec_gaps_test.go` 的 `TestPipelineSegmentsAreNotRealSubshells` 同时钉住三件事:泄漏的三种形态、显式 `( )` / `$( )` / `{ }` 与 bash 一致的隔离(防止有人"修"泄漏时把对的也改坏)、以及推荐替代写法 `while ... done < file`(`TestRedirectWhileDoesNotLeak`) |
@@ -357,7 +374,7 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 | `more` | Git Bash 里没有,我们用了 Windows 的——多一个工具,不是缺陷 |
 | `mktemp` 的默认目录 | **不是 msyspath 的映射错误,是 MSYS 自己解析 `/tmp` 的结果**:winbash 的 `/tmp` 恒等于 `%TEMP%`;而 `mktemp.exe` 启动时若把 `/tmp` 解析成 `%TEMP%` 的**父目录**,它就会把 `TMPDIR` 投影成 `/tmp/<TEMP 的 basename>/tmp.XXX` —— 那个路径在两侧不是一个目录,`f=$(mktemp); cat "$f"` 于是读不回来(真 Git Bash 在同一个进程里也读不回来)。实测:直接派生 `mktemp.exe` 时稳定复现,经 `bash -c` 或 winbash ③ 层派生时约 1% 触发,**且触发一次后成片触发**(直到另一次干净的启动)。所以要跨工具链传临时路径,就在同一侧创建并消费;`internal/shell/msyspath_e2e_test.go` 对这种形态按「TEMP 的 basename 在路径里连续出现两次」跳过,而不是红 —— 判据精确到不会掩盖真的映射故障 |
 | **MSYS 挂载点** | `/`、`/tmp`、`/usr/bin`、`/bin`、`/c`…**支持**,与真 Git Bash 的挂载表对齐(`/` = Git 安装根,`/tmp` = 用户 `%TEMP%`)。所以 `mktemp`、`echo x > /tmp/f`、`cd /c/Windows`、`[ -d /tmp ]` 都能用。**`cd` 的三种写法都规范化了**:`cd /x`、`command cd /x`、`builtin cd /x`(`TestCdThroughCommandAndBuiltinTakesEffect`)。**一条限制**:`[ -e /etc ]` 这类"根挂载点下的子路径"走 `test`/`[` 时**不支持** —— mvdan/sh 会先把路径拼成 `<cwd>\etc`,而相对路径 `etc` 拼出**同一个字符串**,无法区分,所以不猜(猜错会把大量相对路径误判成"存在")。同样的判断用 `ls /etc` 就行(那条能拿到原始路径) |
-| `ls` 默认不列点文件 | **与 bash 一致**(POSIX 语义)。要列用 `-a`;`-a` 时 `.` / `..` **参与同一个排序**(与 bash 一致)
+| `ls` 默认不列点文件 | **与 bash 一致**(POSIX 语义)。要列用 `-a`;`-a` 时 `.` / `..` **参与同一个排序**(与 bash 一致) |
 | `ls` 的**开关支持面** | 支持 `-l -a -h -1 -d`。其余(如 `-R`、`-t`、`-p`、`--color`)一律**响亮拒绝**:`exit 2` + 列出支持的参数,不静默忽略。`-R` 另给指路(递归用 `find`)。**`ls -d` 的已知边界**:参数里含**反斜杠**时输出也带反斜杠 —— 因为 winbash 的 glob 用反斜杠分隔(`echo */` 给 `dirA\`),`-d` 又按"参数原文输出"实现(与 bash 行为一致),所以 `ls -d */` 给 `dirA\` 而真 bash 给 `dirA/`。两者都不是错的,只是各自的 glob 命名法;要干净的裸名字用 `for d in */; do basename "$d"; done`。**注意别用 `ls -a \| grep /`** —— `ls` 的名字不带斜杠,那条**没有任何输出**(实测 rc=1) |
 | `ls -l` 与真 bash 一样是 7 列 | 权限 链接数 属主 属组 大小 时间 名字,单空格分隔,连同 `total` 行、数值列右对齐、时间两形态,都与真 Git Bash 对齐(`TestLsLongFormatHasSevenColumns`)。**属主/属组是进程级常量**:MSYS 不读文件的属主 SID,一律显示当前登录用户 —— 实测 `C:\Windows\notepad.exe`(属主是 TrustedInstaller)真 Git Bash 也显示 `Test User`,我们照此实现(`ownerName()` / `ownerIDs()`,`sync.Once` 缓存)。**属主名可能含空格**(Windows 账户名如 `Test User`),所以**不要**用 `awk '{print $3}'` 按位置取字段,那会**静默**错位(输出照样像对的);拿名字用 `awk '{print $NF}'`,要大小用 `awk '{for(i=5;i<NF;i++)if($i ~ /^[0-9]+$/){print $i; break}}'` 这类稳健写法,或直接用 `stat`。**`total` 行是近似值**:真 bash 的 total 是文件系统块分配数(实测 1B→1、1000B→4、5000B→8、200000B→196),依赖 NTFS 簇大小与 MFT 小文件驻留,不可跨盘复现;我们按 1024 字节块求和 —— **行在、位置对**(`tail -n +2` 能正确跳过),但数值可能与真 bash 不同。**一处已知偏差(2026-10-18 查明)**:展开目录时条目走 `DirEntry.Info()`,而 Windows 上它对**子目录**给的 size 是 0(`GetFileAttributesEx` 才给 4096),所以含子目录的 `ls -l` 的 total 会偏小 —— 实测含 40 个文件的子目录:真 bash `total 5`、winbash `total 1`。`-a` 的 `.` / `..` 走 `os.Stat` 能拿到真实 size,那条路径又反过来比真 bash 偏大(真 bash 让它们贡献 0 块)。**脚本不该依赖 total 的数值**,只该依赖"这行存在"。**权限位已对齐(2026-10-18)** 复刻了 MSYS 的算法(`lsmode.go`),19 个代表性条目与真 Git Bash 逐条一致 —— 目录 `drwxr-xr-x`、普通文件 `-rw-r--r--`、只读文件 `-r--r--r--`、可执行 `-rwxr-xr-x`、只读可执行 `-r-xr-xr-x`。**「可执行」的判据是 MSYS 那套**:`.exe` 扩展名(大小写不敏感)或文件头 `MZ` 或文件头 `#!`,三者之一;`.bat`/`.cmd`/`.ps1` **不可执行**,`.sh`/`.py` 光有扩展名也不可执行(要有 `#!`),ELF/PNG/ZIP 头都不可执行。所以这一列现在**可以**用来判可执行。**两条残留限制**:① winbash **没有 `umask` 内建**,权限按 Git Bash 的默认 `022` 固定算,`umask 077` 不会生效;② 符号链接显示目标类型(实测真 Git Bash 在这台机器上也一样,不给 `l` 前缀)。**`-h` 时大小列的文本形态也不同**(只有带 `-h` 才不同,默认的纯字节数完全对齐):GNU 在小于 1K 时打 `5` 而**不带单位**,我们的 `FormatBytes` 打 `5B`;GNU 在数值 ≥10 时取整(`196K`),我们恒保留一位小数(`195.3K`)。同一条规则也影响 `-lh` 的 `total` 行。读大小的脚本本来就不该用 `-h`,所以这条的优先级低,但它确实是差异 |
 | `grep -r` 的输出路径 | 基于**你写的那个路径**算(`grep -r b .` → `./d.txt:b`),与 bash 一致 |
