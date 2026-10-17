@@ -304,7 +304,8 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 与真 bash 相比的差异。**这些差异的回归测试不在一个文件里** —— 原先这句话写的是「全部有测试钉住,见 `internal/shell/corpus_test.go`」,那是不准确的(那张表有 31 条,而 `corpus_test.go` 里只有一个 Test 函数)。实际分布是这样:
 
 - **`corpus_test.go` / `pbb_corpus_test.go` 是差分测试**(拿真 bash 的实际输出当参照)。它们的 `known:` 语料是**豁免说明** —— 「这几条差异存在,比对时跳过」。所以一条差异被列进 `known:`,只说明它被**承认**,不说明它被**钉住**。这两件事别混。
-- 真正把行为写死的是各层专项测试:`classify_test.go`(printf/trap 类缺口)、`commandv_test.go`、`grep_test.go` + `grep_binary_test.go` + `grep_classes_test.go` + `grep_class_scanner_test.go`、`ls_test.go`、`cat_test.go`、`msyspath_e2e_test.go`、`msysargv_test.go`、`trapguard_test.go`、`oilspec_gaps_test.go`、`internal/winmgmt/pwshcmd_test.go`、`internal/daemon/guard_test.go`、`cmd/winbash/e2e_test.go`。
+- 真正把行为写死的是各层专项测试:`classify_test.go`(printf/trap 类缺口)、`commandv_test.go`、`grep_test.go` + `grep_binary_test.go` + `grep_classes_test.go` + `grep_class_scanner_test.go`、`ls_test.go`、`cat_test.go`、`msyspath_e2e_test.go`、`msysargv_test.go`、`trapguard_test.go`、`oilspec_gaps_test.go`、`internal/winmgmt/pwshcmd_test.go`、`internal/daemon/guard_test.go` + `internal/daemon/stdin_cwd_test.go`、`cmd/winbash/e2e_test.go`。
+  (`stdin_cwd_test.go` 是 2026-10-18 补的:`daemon` 包里 **stdin 流式转发**与 **cwd 切换**原先覆盖率是 **0%** —— 两条主路径只有 e2e 间接带着。补完 `startStdinStream` 0→91.7%、`shellQuote` 0→100%、`rejectJob` 0→100%,该包总覆盖 71.6%→80.5%。)
 - 有 5 条只是**弱覆盖**(测试覆盖了相邻行为,但没有逐字钉住这条差异):显式 `Git\bin\bash.exe` 的第二跳吃引号、`grep -E 'a*?'` 的匹配数差异、`ls` 默认不列点文件、`grep -r` 的 `./` 前缀、`pwsh -c "$env:X"` 的空展开。改这些地方时不能指望测试变红。**这份清单是照测试注释与断言盘的,不是机器判定** —— 某个用例后来被加强了,这里就会偏保守(写"弱"而其实够强),不会反过来。
   (原先这里还有一条 `ls -l` 的四列;那一列已经补成 7 列,不再算"弱覆盖",见表格里对应的行。)
 
@@ -343,6 +344,7 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 | 超时**不会**重放脚本 | 客户端超时后直接报错。早先它会重拉 daemon 把同一个请求原样重跑,于是 `echo RUN >> f; sleep 6` 配 `--timeout 2s` 会让文件出现**两行** —— 对写文件类脚本是数据损坏 |
 | 一条坏连接最多宽限 5 秒 | daemon 读完请求头就撤读预算,所以「只连、不说话」的连接会在 5 秒(`DefaultReadTimeout`)后被单独丢掉 —— 并发化之后它只占自己那支 goroutine 与一个 fd,不再让别人排队。修之前既没有这个上限(能一直挡到客户端自己超时),又因为是串行处理而拦住**所有**人 |
 | 并发**首次**启动只起一个 daemon | **已修(2026-10-17)**。原先 `ensureDaemon` 只看端口文件能不能读出来,不验证对端存活,也没有跨进程启动锁 —— 多个 client **同时**发现"没有 daemon"时各 spawn 一个。而 daemon 用 `127.0.0.1:0` 取随机端口,并发起的每一个**都能绑定成功**,不存在"后来者失败退出"这种天然去重,于是后写端口文件者赢,先起的全成孤儿(`--status` 看不到、`--stop` 停不掉,各自还抱着一个 Session,只能等 30 分钟空闲自己退)。实测 8 个 client 同时首次调用:**修前 8 个 `--serve` 进程、`--stop` 只停掉 1 个;修后恒为 1 个**。做法是 spawn 之前抢一把跨进程锁(`<endpoint>.lock`,`O_CREATE\|O_EXCL` 原子创建),持锁只覆盖"拉起 daemon + 等就绪"、**不覆盖命令执行**(否则并发就没了);抢不到的一方改为轮询端口文件,赢家一起来就直接用。陈旧锁(持锁者被强杀)按 mtime 超过 30s 接管 —— 否则一次强杀会让该端点永久起不来,而表现只是"daemon 在 20s 内没有起来",极难归因。回归:`TestConcurrentFirstStartSpawnsOneDaemon` / `TestStaleStartLockIsTakenOver` |
+| client 的 cwd 切换失败时,**错误可见但退出码不反映** | daemon 收到 `cwd` 后先 `cd` 过去,**失败不致命**:记一条错误行(`client: 无法切换到 <路径>,已在原目录 <实际目录> 下执行`)、脚本继续在原目录跑、退出码仍取**脚本**的退出码。所以 `cd` 失败时你可能看到 `exit 0` —— 但 stderr 里有那两行。这是有意的取舍(cd 失败不该掩盖脚本本身的结果),`TestCwdFailureIsReportedNotSilent` 钉住"错误必须可见且点出路径与原目录"。**若你要靠退出码判断"到底在哪个目录执行的",请显式写 `cd <dir> && <命令>`** —— 脚本里的 `cd` 失败会正常让整条命令非零 |
 
 **会话级状态**(常驻会话的必然结果,不是 bug):`set -e`、`trap`、**变量**、**函数**都**跨命令持久**。
 `bash -c` 每条都是新进程,所以这一点与它不同——一条命令里的 `set -e` 会影响**后续所有命令**。
