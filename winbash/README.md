@@ -47,23 +47,26 @@ winbash.exe --stop      # 停掉 daemon(不会为了停掉它而先把它拉起�
 | `--endpoint` | 端口文件路径,默认 `%TEMP%\winbash-<用户名>.port`(按用户名区分,同机多用户不互踩)。文件里是**两行**:地址 + 随机 token |
 | `--idle` | 空闲多久后 daemon 退出,默认 `30m`(`0` = 永不) |
 | `--timeout` | 单次请求超时,默认 `300s`(`0` = 不设限)。这个上限**同时**告诉 daemon:客户端放弃后它也要停手,否则一条无限循环会把后续命令全部饿死。**嵌套里也生效**(内层走的是本进程执行,同样受这个上限约束) |
+| `--fresh` / `--no-state` | 这条命令跑在**一次性会话**里:前面的变量 / `set -e` / `trap` / 函数影响不到它,它设的也不留给后面的命令。默认**不用**,会话照旧持久(见下文「会话级状态」) |
 
 ## 升级与协议版本
 
-client 与 daemon 之间有协议版本(当前 **2**,见 `internal/ipc/ipc.go` 的 `ProtoVersion`)。
+client 与 daemon 之间有协议版本(当前 **3**,见 `internal/ipc/ipc.go` 的 `ProtoVersion`)。
 daemon 是**常驻**的(默认 30 分钟才退),且它由 client 用**同一个 exe 路径**拉起 —— 所以
 「你替换了 `winbash.exe`、而旧 daemon 还活着」是**正常状态**,不是意外。
 
 这种情况下新 client 连旧 daemon **会明确报错,不静默执行**:
 
 ```text
-winbash: client: daemon 没有协议版本(它是旧版),与本客户端(2)不兼容
+winbash: client: daemon 没有协议版本(它是旧版),与本客户端(3)不兼容
 怎么办: 运行 `winbash --stop` 停掉旧 daemon,下次调用会自动用新 exe 重建
 ```
 
 为什么宁可报错也不静默降级:协议一旦变化(例如 2026-10-16 把 stdin 从「一次性缓存」
 改成「流式转发」),旧 daemon 会**忽略**新 client 发来的 stdin —— 脚本照样 `exit 0`,
 而输入其实丢了。那正是本项目「不静默做错事」要消灭的失败形态,不能在新入口复现。
+同一理由适用于 **3**:旧 daemon 不认识 `fresh` 字段,会当成没写 —— 于是 `--fresh`
+静默退化成「复用会话」,而调用方以为已经隔离了。
 
 处置只有一步:**`winbash --stop`**。`--stop` 与 `--status` **刻意不参与版本检查** ——
 否则「版本不匹配时先 `--stop`」这个推荐处置会被版本检查自己挡掉,陷入「要停它得先连上它」的死锁。
@@ -260,6 +263,21 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 
 **会话级状态**(常驻会话的必然结果,不是 bug):`set -e`、`trap`、**变量**、**函数**都**跨命令持久**。
 `bash -c` 每条都是新进程,所以这一点与它不同——一条命令里的 `set -e` 会影响**后续所有命令**。
+
+**需要「每条命令彼此独立」时用 `--fresh`**(别名 `--no-state`):这条命令跑在一个**一次性会话**里,
+跑完就丢。隔离是**双向**的 —— 前面的变量 / `set -e` / `trap` / 函数影响不到它,它设的也不会留给后面:
+
+```bash
+winbash -c 'set -e; PERSIST=1'          # 默认:会话持久
+winbash -c 'echo $PERSIST'              # → 1
+winbash --fresh -c 'echo ${PERSIST:-无}' # → 无
+winbash --fresh -c 'LEAK=1'
+winbash -c 'echo ${LEAK:-无}'            # → 无
+```
+
+默认仍然是持久(不破坏既有行为),代价说清楚:`fresh` 会话用到 ② 层时,常驻 pwsh 引擎挂在
+Session 上,所以要重新拉起一次(约 350 ms);只用 ①/③ 层没有额外开销。`--fresh` 与
+`--serve`/`--stop`/`--status` 组合是用法错误(`exit 2`),不会静默忽略。
 
 **不持久的两样**,写出来免得拿它们当配置用(实测,两样都与真 `bash -c` 一致,**不是缺陷**):
 

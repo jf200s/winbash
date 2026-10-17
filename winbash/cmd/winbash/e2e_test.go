@@ -244,6 +244,65 @@ func findPwsh(t *testing.T) string {
 	return ""
 }
 
+// TestFreshSessionIsIsolated 钉住 --fresh / --no-state 的语义:**双向隔离**。
+//
+// 这条测试的形态是刻意的 —— 同一个 daemon 上「先 A 后 B」的序列。单元测试只能证明
+// 「一次 Run 的行为对」,证不到「两次调用之间会话是干净的」;而这里的 bug 恰恰长在
+// 「两次调用之间」,所以必须走真进程、真 daemon。
+func TestFreshSessionIsIsolated(t *testing.T) {
+	exe := buildWinbash(t)
+	endpoint := benchEndpoint(t)
+	t.Cleanup(func() { runWinbash(t, exe, endpoint, "--stop") })
+
+	runOrFail := func(args ...string) string {
+		t.Helper()
+		out, code := runWinbash(t, exe, endpoint, args...)
+		if code != 0 {
+			t.Fatalf("%v 失败 exit=%d out=%q", args, code, out)
+		}
+		return strings.TrimRight(out, "\r\n")
+	}
+
+	// 0. 先确认默认行为没变:会话**持久**(这是 winbash 相对 bash -c 的特性)。
+	runOrFail("-c", "PERSIST=kept")
+	if got := runOrFail("-c", "echo $PERSIST"); got != "kept" {
+		t.Fatalf("默认会话应当持久,got %q", got)
+	}
+
+	// 1. 方向一:之前的命令影响不到 fresh 请求。
+	if got := runOrFail("--fresh", "-c", "echo ${PERSIST:-<empty>}"); got != "<empty>" {
+		t.Errorf("--fresh 应当看不到之前设的变量,got %q", got)
+	}
+
+	// 2. 方向二:fresh 请求设的东西也不留给后面的命令。
+	runOrFail("--fresh", "-c", "LEAKED=yes")
+	if got := runOrFail("-c", "echo ${LEAKED:-<empty>}"); got != "<empty>" {
+		t.Errorf("--fresh 设的变量泄漏到了下一个命令,got %q", got)
+	}
+
+	// 3. set -e 也隔离:它在 fresh 里该生效(后面的 echo 不执行),但影响不到下一个命令。
+	out, code := runWinbash(t, exe, endpoint, "--fresh", "-c", "set -e; false; echo unreachable")
+	if code == 0 {
+		t.Errorf("fresh 里的 set -e 没生效:exit=0 out=%q", out)
+	}
+	if got := runOrFail("-c", "false; echo still-running"); got != "still-running" {
+		t.Errorf("set -e 泄漏到了下一个命令,got %q(它应当照常往下跑)", got)
+	}
+
+	// 4. --no-state 是同一个开关的别名。
+	if got := runOrFail("--no-state", "-c", "echo ${PERSIST:-<empty>}"); got != "<empty>" {
+		t.Errorf("--no-state 应当与 --fresh 同效,got %q", got)
+	}
+
+	// 5. fresh 请求之后长驻会话仍然可用 —— 别把 daemon 弄成一次性。
+	if got := runOrFail("-c", "echo alive"); got != "alive" {
+		t.Errorf("fresh 之后长驻会话不可用了,got %q", got)
+	}
+	if got := runOrFail("-c", "echo $PERSIST"); got != "kept" {
+		t.Errorf("fresh 之后长驻会话的状态丢了,got %q", got)
+	}
+}
+
 func p50(ds []time.Duration) time.Duration {
 	s := append([]time.Duration{}, ds...)
 	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })

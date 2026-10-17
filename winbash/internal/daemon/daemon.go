@@ -185,13 +185,24 @@ func handle(conn net.Conn, sess *shell.Session, token string, readTimeout time.D
 
 	// note 收集"不影响主流程、但使用者必须知道"的错误行。
 	var note []string
+
+	// fresh 请求跑在**一次性会话**里:新建一个,handle 返回时 Close 掉。长驻的 sess
+	// 一格都不动 —— 所以它既不受先前命令影响,也不把影响留给后面的命令
+	// (语义与代价见 ipc.Request.Fresh)。Close 是必须的:② 层的常驻 pwsh 引擎挂在
+	// Session 上,漏掉 Close 就漏一个进程。
+	execSess := sess
+	if req.Fresh {
+		execSess = shell.NewSession()
+		defer func() { _ = execSess.Close() }()
+	}
+
 	if req.Cwd != "" {
 		// client 传来 cwd 时先切过去。失败**不致命**(继续在旧目录执行),但绝不能
 		// 静默 —— 原先这里丢掉了退出码,于是"cd 没成功"与"根本没请求切目录"在输出上
 		// 完全一样,而使用者以为自己在目标目录里。把它作为一条错误行带回去。
-		if _, exit, errs := sess.Run(ctx, "cd "+shellQuote(req.Cwd), false); exit != 0 {
+		if _, exit, errs := execSess.Run(ctx, "cd "+shellQuote(req.Cwd), false); exit != 0 {
 			note = append(note, errs...)
-			note = append(note, fmt.Sprintf("client: 无法切换到 %s,已在原目录 %s 下执行", req.Cwd, sess.Dir()))
+			note = append(note, fmt.Sprintf("client: 无法切换到 %s,已在原目录 %s 下执行", req.Cwd, execSess.Dir()))
 		}
 	}
 
@@ -219,7 +230,7 @@ func handle(conn net.Conn, sess *shell.Session, token string, readTimeout time.D
 				Exit: 2,
 			})
 		}
-		s, err := startStdinStream(sess, conn)
+		s, err := startStdinStream(execSess, conn)
 		if err != nil {
 			return false, writeResponse(conn, ipc.Response{
 				OK:     false,
@@ -238,7 +249,7 @@ func handle(conn net.Conn, sess *shell.Session, token string, readTimeout time.D
 		})
 	}
 
-	out, exit, errs := sess.Run(ctx, req.Script, req.JSON)
+	out, exit, errs := execSess.Run(ctx, req.Script, req.JSON)
 
 	// Run 一返回就回收喂入 goroutine。**顺序不能改**:Run 内部的 defer 已经关掉
 	// 读端并换回 /dev/null,但那支 goroutine 可能还卡在 conn.Read 上 ——

@@ -105,9 +105,22 @@ func TestUnknownFlagIsAUsageError(t *testing.T) {
 	}
 }
 
+// --fresh 只对「执行脚本」这条路有意义。和 --serve/--stop/--status 一起给时
+// 报用法错误,而不是默默忽略 —— 静默忽略会让人以为隔离生效了。
+func TestFreshWithControlFlagsIsAUsageError(t *testing.T) {
+	for _, ctl := range []string{"--serve", "--stop", "--status"} {
+		code, _, errOut := runCLI(t, "--fresh", ctl)
+		if code != 2 {
+			t.Errorf("--fresh %s: code=%d want 2 (组合不合法不能静默放过)", ctl, code)
+		}
+		if !strings.Contains(errOut, "--fresh") {
+			t.Errorf("--fresh %s: stderr 应当说明冲突,got %q", ctl, errOut)
+		}
+	}
+}
+
 // run 的主路径:真拉起一个 daemon(端点指向临时目录),跑一条命令。
-func TestEchoRunsThroughARealDaemon(t *testing.T) {
-	ep := tmpEndpoint(t)
+func TestEchoRunsThroughARealDaemon(t *testing.T) {	ep := tmpEndpoint(t)
 	t.Cleanup(func() { _, _, _ = runCLI(t, "--stop", "--endpoint", ep) })
 	startDaemon(t, ep)
 

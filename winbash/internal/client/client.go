@@ -44,6 +44,15 @@ func Run(endpoint, script, cwd string, jsonOut bool) (ipc.Response, error) {
 	return RunTimeout(endpoint, script, cwd, jsonOut, 0, 0)
 }
 
+// Option 是 RunTimeout 的可选开关。
+//
+// 用可变参数而不是再加形参:现有调用点(嵌套、测试、库调用方)一行都不用改。
+type Option func(*ipc.Request)
+
+// Fresh 让这条命令跑在**一次性会话**里:之前的命令影响不到它,它设的变量 /
+// set -e / trap 也不留给后面的命令。语义与代价见 ipc.Request.Fresh。
+func Fresh() Option { return func(r *ipc.Request) { r.Fresh = true } }
+
 // RunTimeout 同 Run,但给整个往返设一个上限(timeout<=0 表示不设限)。
 //
 // 这个上限会同时传给 daemon(见 ipc.Request.TimeoutMS):client 放弃不代表
@@ -53,8 +62,10 @@ func Run(endpoint, script, cwd string, jsonOut bool) (ipc.Response, error) {
 // 是两件事:前者是"这一条命令跑多久算超时",后者是"daemon 空着多久就自己走"。
 //
 // 嵌套里(见 inSession)不走 daemon,直接在本进程执行 —— 理由见 runLocal。
-func RunTimeout(endpoint, script, cwd string, jsonOut bool, timeout, idle time.Duration) (ipc.Response, error) {
+func RunTimeout(endpoint, script, cwd string, jsonOut bool, timeout, idle time.Duration, opts ...Option) (ipc.Response, error) {
 	if inSession() {
+		// 嵌套时 runLocal 本来就每次新建 Session,天然是 fresh 的,所以 opts 在这里
+		// 无事可做 —— 写出来是为了别让人以为漏了。
 		return runLocal(script, jsonOut, timeout)
 	}
 	req := ipc.Request{
@@ -63,6 +74,9 @@ func RunTimeout(endpoint, script, cwd string, jsonOut bool, timeout, idle time.D
 		Cwd:       cwd,
 		JSON:      jsonOut,
 		StdinMode: ipc.StdinNone,
+	}
+	for _, o := range opts {
+		o(&req)
 	}
 	if stdinIsStream() {
 		req.StdinMode = ipc.StdinStream
