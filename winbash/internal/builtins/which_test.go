@@ -120,7 +120,8 @@ func TestWhichCmdResolvesPathAgainstSessionCwd(t *testing.T) {
 	}
 }
 
-func TestWhichCmdWithoutArgsIsUsageError(t *testing.T) {	var out, errw bytes.Buffer
+func TestWhichCmdWithoutArgsIsUsageError(t *testing.T) {
+	var out, errw bytes.Buffer
 	if code := WhichCmd(context.Background(), "", nil, &out, &errw); code != errs.ExitUsage {
 		t.Fatalf("exit=%d want %d", code, errs.ExitUsage)
 	}
