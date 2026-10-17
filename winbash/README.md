@@ -9,15 +9,26 @@ bash 语法 + pwsh 能力的常驻 shell,给在 Windows 上干活的 AI 用。
 
 ## 快速开始
 
-它**目前不在 PATH 里**(还没做安装步骤,不是刻意设计成这样的),所以要用全路径调用 —— 路径含中文,记得引号:
+**已加入用户 PATH**(本机 2026-10-17 配置:把 `winbash\` 目录追加进 `HKCU\Environment` 的 `Path`,
+没有安装器、没有服务、没有注册表项),所以直接写命令名:
+
+```powershell
+winbash -c 'ls | grep go'
+winbash -c 'svc list --running'
+winbash --json -c 'sys mem'
+```
+
+**未配置的机器**(或想卸掉)用全路径 —— 路径含中文,记得引号;卸载就是从**用户 PATH** 里删掉 `D:\work\中文 目录\winbash` 这一条:
 
 ```powershell
 & 'D:\work\中文 目录\winbash\winbash.exe' -c 'ls | grep go'
-& 'D:\work\中文 目录\winbash\winbash.exe' -c 'svc list --running'
-& 'D:\work\中文 目录\winbash\winbash.exe' --json -c 'sys mem'
 ```
 
-- 第一次调用会自动拉起常驻 daemon(约 **70 ms** 一次性成本),之后每条命令约 **22 ms**（**早期观察**）。
+- 第一次调用会自动拉起常驻 daemon,之后每条命令:**冷启动 63 ms / 已热 15 ms**
+  (2026-10-17 实测,见下一行的口径)。
+  原先这里写的是「约 70 ms / 约 22 ms」并标注**早期观察、本机无法证实** ——
+  用 PowerShell 的 `Stopwatch` **直调进程**复测后,数字与那个量级**对得上了**,
+  所以去掉「无法证实」的措辞;详见「性能怎么量」里的口径说明。
 - daemon 空闲 30 分钟后自行退出,不留僵尸进程;也可以显式管理:
 
 ```powershell
@@ -176,9 +187,17 @@ token 仍在、daemon 仍可用,只是这层加固没生效,而使用者有权�
 - **退出码**:`0` 成功 · `1` 一般错误 · `2` 用法错误 · `126` 不可执行 · `127` 命令未找到。
 - **不认识的 flag 一律报错退出**,不会静默忽略。
 
-**性能怎么量**:端到端计时在本机**测不出信号** —— 启动一个进程约 700 ms(`cmd.exe` 空转基线),
-它把 winbash 真正的开销整个淹掉。上面"首次 70 ms / 之后 22 ms"属于**早期观察**,既难证实也难证伪。
-能复现的是进程内 benchmark:
+**性能怎么量**:**先说口径 —— 口径决定能不能测出信号**。两种,别混:
+
+| 口径 | 结果 | 什么时候用 |
+|---|---|---|
+| **PowerShell 直调进程**(`& $exe -c '…'` + `Stopwatch`) | 信号干净。2026-10-17 实测:冷启动(拉起 daemon + 执行)**63 ms**、已热**15 ms**、批量 12 条 **595 ms**(50 ms/条) | 报绝对值用这个 |
+| **端到端**(Git Bash 里手测) | 本机**测不出信号** —— 启动一个进程约 700 ms(`cmd.exe` 空转基线),把 winbash 的开销整个淹掉 | 只做相对比较,别报绝对值 |
+
+正因为在 PowerShell 直调口径下测出了信号,开头那对数字(冷 **63 ms** / 热 **15 ms**)已
+不再标「早期观察」;**Git Bash 口径仍测不出**,所以别在那个口径下引用绝对值。
+
+能复现到微秒的是进程内 benchmark:
 
 ```powershell
 go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
@@ -189,7 +208,10 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 
 **① 层不比真 bash 快**(实测 20 次 `echo x`:winbash 0.783s vs 真 `bash -c` 0.689s,差异在噪声量级内)。
 它的价值是**语义可控** —— `ls` 永远是自己的 `ls`,不被 PATH 上重名的 Windows exe 抢走 —— **不是快**。
-省时间的地方在 **② 层**(吃掉 pwsh 的 ~350 ms 冷启动,实测 3.7 倍)与「不用换语法」,别指望纯 bash 那层提速。
+省时间的地方在 **② 层**(吃掉 pwsh 的 ~350 ms 冷启动):**3.7 倍**是评估报告的口径
+(daemon 冷、逐次摊),而 2026-10-17 在「引擎已热、连跑 5 次」下量到 **20.6×**
+(2038 ms → 99 ms)。两个都真,口径不同 —— **别混着引用**,对外说法用「重复调用 ② 层比每次
+冷启 pwsh 快一个数量级」。再加上「不用换语法」,别指望纯 bash 那层提速。
 
 ## 已知差异与限制
 
