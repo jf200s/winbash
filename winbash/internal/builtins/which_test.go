@@ -98,8 +98,29 @@ func TestWhichCmdReportsMissWithNonZero(t *testing.T) {
 	}
 }
 
-func TestWhichCmdWithoutArgsIsUsageError(t *testing.T) {
+// 自带路径的写法要按**会话 cwd** 解析 —— Which 里 os.Stat 的基准是**进程** cwd,
+// 而 `which` 的 cwd 参数是会话目录,两者通常不同。
+//
+// 修之前 `cd /tmp && which ./x.sh` 会说"找不到",而同一会话里 `./x.sh` 却能跑:
+// 我们的错误信息恰好还让人拿 `which` 自查,那条指路就会是坏的。
+func TestWhichCmdResolvesPathAgainstSessionCwd(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "x.sh")
+	if err := os.WriteFile(script, []byte("#!/bin/sh\necho hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	var out, errw bytes.Buffer
+	code := WhichCmd(context.Background(), dir, []string{"./x.sh"}, &out, &errw)
+	if code != errs.ExitOK {
+		t.Fatalf("exit=%d stderr=%q", code, errw.String())
+	}
+	if !strings.Contains(out.String(), "x.sh") {
+		t.Fatalf("应在 stdout 给出解析后的路径,got %q", out.String())
+	}
+}
+
+func TestWhichCmdWithoutArgsIsUsageError(t *testing.T) {	var out, errw bytes.Buffer
 	if code := WhichCmd(context.Background(), "", nil, &out, &errw); code != errs.ExitUsage {
 		t.Fatalf("exit=%d want %d", code, errs.ExitUsage)
 	}

@@ -205,6 +205,13 @@ var bashCorpus = []corpusCase{
 
 	// ---- 重定向与文件 ----
 	{script: `echo hi > "WBTMP/wb-corpus-1.txt"; cat "WBTMP/wb-corpus-1.txt"; rm -f "WBTMP/wb-corpus-1.txt"`},
+	// 自带路径的程序:绝对与相对两种写法。这两条曾经都跑不了 ——
+	//   · `./x.sh` 是按**进程** cwd 找的(不是会话 cwd),于是报"找不到这个命令"
+	//   · 路径对了之后还有第二道:`.sh` 有扩展名所以不走 env.exe,CreateProcess
+	//     报 126 "%1 is not a valid Win32 application"
+	// 语料走 WBTMP(本次测试的临时目录),真 bash 侧同样能执行,所以对照是真实的。
+	{script: `printf '#!/bin/sh\necho abs-ok\n' > "WBTMP/wb-abs.sh"; chmod +x "WBTMP/wb-abs.sh"; "WBTMP/wb-abs.sh"`},
+	{script: `printf '#!/bin/sh\necho rel-ok\n' > "WBTMP/wb-rel.sh"; chmod +x "WBTMP/wb-rel.sh"; cd "WBTMP" && ./wb-rel.sh`},
 	{script: `printf 'x\n' | tee "WBTMP/wb-corpus-2.txt" > /dev/null; cat "WBTMP/wb-corpus-2.txt"; rm -f "WBTMP/wb-corpus-2.txt"`},
 	{script: `echo hi 2>&1`},
 	{script: `echo out; echo err 1>&2`},

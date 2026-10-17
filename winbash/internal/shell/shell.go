@@ -468,18 +468,41 @@ func (t *tailBuffer) String() string {
 
 // runExternal 是 ③ 层(命中真实 PATH)与 ④ 层(哪个都没有)的实现。
 func (s *Session) runExternal(ctx context.Context, args []string, hc interp.HandlerContext) error {
-	abs, ok := builtins.Which(args[0], s.searchPath)
+	// args[0] 有三种形态:裸名字(sed)、自带路径的相对写法(./t.sh)、自带路径的
+	// 绝对写法(/c/x/y.sh、C:\x\y.exe)。Which 对"自带路径"直接 os.Stat,而那个 stat
+	// 的基准是**进程** cwd(daemon 启动时那个目录),**不是**会话 cwd(hc.Dir ——
+	// 会话里的 `cd` 只改 interp 的状态,要到最后才通过 cmd.Dir 交给子进程)。
+	//
+	// 两者通常不同,于是 `cd /tmp && ./t.sh` 会去 daemon 的目录里找 ./t.sh,报
+	// 「找不到这个命令」,而文案还把人引向"命令名写错了"(实测 exit 127)。
+	// 所以先按会话 cwd 解析成 Windows 绝对路径,再交给 Which。
+	target := args[0]
+	if strings.ContainsAny(target, `/\`) {
+		// ResolveShellPath 负责 MSYS 挂载表(/c、/tmp、/usr/bin …);剩下的相对路径
+		// 按会话 cwd 拼成绝对路径。
+		target = builtins.ResolveShellPath(hc.Dir, target)
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(hc.Dir, target)
+		}
+	}
+	abs, ok := builtins.Which(target, s.searchPath)
 	if !ok {
 		// ④ 层:明确报错 + 下一步。不是静默失败,也不是让 mvdan/sh 丢一句
 		// "command not found" 了事 —— 那句话没告诉使用者接下来该做什么。
-		fmt.Fprintln(hc.Stderr, errs.Errorf(args[0], "找不到这个命令",
-			"确认命令名有没有写错;③ 层会搜索 Git Bash 的 usr\\bin 与真实 PATH,可用 winbash -c 'which "+args[0]+"' 自查"))
+		hint := "确认命令名有没有写错;③ 层会搜索 Git Bash 的 usr\\bin 与真实 PATH,可用 winbash -c 'which " + args[0] + "' 自查"
+		if target != args[0] {
+			// 自带路径的写法:把它解析成了什么也说出来,否则使用者不知道自己写的
+			// 相对路径被按哪个目录解释了。
+			hint = "按会话目录解析成 " + target + " 之后仍然找不到;确认它存在: ls '" + target + "'"
+		}
+		fmt.Fprintln(hc.Stderr, errs.Errorf(args[0], "找不到这个命令", hint))
 		return interp.ExitStatus(errs.ExitNotFound)
 	}
 
-	// MSYS 的**无扩展名脚本**(usr\bin 里有 44 个)不能直接交给 CreateProcess ——
-	// Windows 只认 PE 文件。它们得由 MSYS 自己的 env.exe 启动:env 会读 shebang 找解释器,
-	// 而这件事**不能**靠扩展名猜 —— `c_rehash` 是 Perl、`bzgrep` 是 sh。
+	// Windows 只能 CreateProcess 一个 **PE 映像**,判据是文件头而不是扩展名 ——
+	// 见 isPEImage 顶上那两条实测(`./t.sh` 报 126、`c_rehash` 是 Perl 无扩展名)。
+	// 不是 PE 的就交给 MSYS 的 env.exe:env 读 shebang 找解释器,而这件事**不能**
+	// 靠扩展名猜(usr\bin 里 bzgrep 是 sh、c_rehash 是 Perl)。
 	//
 	// 试过但**不行**的两条路(都实测过):
 	//
@@ -487,18 +510,26 @@ func (s *Session) runExternal(ctx context.Context, args []string, hc interp.Hand
 	//	                              `line 15: my: command not found`
 	//	`bash -c 'exec "$0" "$@"'` → 那串里的双引号在 Windows 命令行转义下会被搞坏,
 	//	                              bash 报出 `cwd/$0 $@\` 这种怪名字
-	//
-	// 只在"目标没有扩展名"时才走这条,所以 .exe/.bat 的常规路径一点没被碰。
 	argv0 := abs
 	var leading []string
-	if filepath.Ext(abs) == "" {
+	ext := strings.ToLower(filepath.Ext(abs))
+	if !isPEImage(abs) {
+		if ext == ".bat" || ext == ".cmd" {
+			// 批处理既不是 PE、也没有 shebang:CreateProcess 与 env.exe 都跑不了它
+			// (前者给 "%1 is not a valid Win32 application",后者报 exec format)。
+			// 显式说清楚并指路,而不是把一个看不懂的系统错误丢给使用者。
+			fmt.Fprintln(hc.Stderr, errs.Errorf(args[0],
+				"Windows 批处理("+ext+")不能直接执行 —— 它既不是 PE 程序,也没有 shebang",
+				"用 `cmd /c ...` 显式调它,或把里面的命令改写成 sh 脚本(winbash 会按 shebang 执行)"))
+			return interp.ExitStatus(errs.ExitNoExec)
+		}
 		envExe := ""
 		if usrBin := gitBashUsrBin(); usrBin != "" {
 			envExe = filepath.Join(usrBin, "env.exe")
 		}
 		if envExe == "" {
 			fmt.Fprintln(hc.Stderr, errs.Errorf(args[0],
-				"这是一个靠 shebang 运行的脚本(没有 .exe 扩展名),而 Windows 自己执行不了它",
+				"这是一个靠 shebang 运行的脚本,而 Windows 自己执行不了它",
 				"这台机器上找不到 Git Bash;装上它(或让 "+`C:\Program Files\Git\usr\bin\env.exe`+" 存在)再试"))
 			return interp.ExitStatus(errs.ExitNoExec)
 		}

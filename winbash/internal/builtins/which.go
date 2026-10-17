@@ -163,7 +163,18 @@ func WhichCmd(ctx context.Context, cwd string, argv []string, out, errw io.Write
 			fmt.Fprintln(out, name)
 			continue
 		}
-		if p, ok := Which(name, searchPath); ok {
+		// 自带路径的写法(./x、/c/x、C:\x)要按**会话 cwd** 解析:Which 里 os.Stat 的
+		// 基准是**进程** cwd,而 cwd 这个参数是会话目录 —— 两者通常不同。理由与
+		// runExternal 里那段完全相同,两处必须一致:否则 `which ./t.sh` 说"找不到",
+		// 而那条命令其实能跑 —— 我们的错误信息还叫人拿 which 自查,指路就成了坏的。
+		target := name
+		if strings.ContainsAny(target, `/\`) {
+			target = ResolveShellPath(cwd, target)
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(cwd, target)
+			}
+		}
+		if p, ok := Which(target, searchPath); ok {
 			fmt.Fprintln(out, p)
 			continue
 		}
