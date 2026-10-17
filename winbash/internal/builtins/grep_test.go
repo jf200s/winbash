@@ -15,6 +15,48 @@ import (
 // 计划里的 6 个用例(TestGrepMatchesLineAndPrintsIt … TestGrepNoMatchExitsOne)
 // 照抄自 plan Task 6;其后是本轮补的 6 个,补的理由写在各自注释里。
 
+// TestGrepRejectsGNUOptionAfterPattern 钉住一个「静默半错」的修复。
+//
+// 修之前 `grep -rn x --include='*.go' .` 的实际行为是:把 --include 当**文件名**
+// (stderr 报一句"路径不存在")、**照旧搜全部文件**、最后 exit 0 —— 过滤没生效而
+// 退出码说成功,正是本项目要消灭的形态。
+//
+// GNU grep 靠 getopt 的 permutation 认这种写法;我们不做置换(那是另一套语义),
+// 但必须响亮拒绝,并把"改用哪种写法"直接给出来,否则使用者只知道"不支持"。
+func TestGrepRejectsGNUOptionAfterPattern(t *testing.T) {
+	for _, arg := range []string{"--include=*.go", "--exclude=*.md"} {
+		var out, errb bytes.Buffer
+		code := Grep(context.Background(), t.TempDir(), []string{"-rn", "x", arg, "."},
+			strings.NewReader(""), &out, &errb)
+		if code != errs.ExitUsage {
+			t.Errorf("%s: code=%d want %d(必须响亮拒绝,不能当文件名继续搜)", arg, code, errs.ExitUsage)
+		}
+		if out.Len() != 0 {
+			t.Errorf("%s: 竟然还有输出 %q —— 说明它照旧把文件搜了一遍", arg, out.String())
+		}
+		if !strings.Contains(errb.String(), "find") {
+			t.Errorf("%s: 错误信息要指路(find 组合),got %q", arg, errb.String())
+		}
+	}
+}
+
+// `--` 写在 PATTERN **之前**时,后面以 - 开头的名字是文件名,不是选项。
+func TestGrepDashDashBeforePatternAllowsDashNamedFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "-weird.txt"), []byte("x\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	code := Grep(context.Background(), dir, []string{"-n", "--", "x", "-weird.txt"},
+		strings.NewReader(""), &out, &errb)
+	if code != 0 {
+		t.Fatalf("code=%d err=%q", code, errb.String())
+	}
+	if !strings.Contains(out.String(), "x") {
+		t.Fatalf("got %q", out.String())
+	}
+}
+
 func TestGrepMatchesLineAndPrintsIt(t *testing.T) {
 	r := strings.NewReader("alpha\nbeta\ngamma\n")
 	var out bytes.Buffer

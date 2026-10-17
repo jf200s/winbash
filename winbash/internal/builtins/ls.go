@@ -35,7 +35,13 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 		// 长开关整个报出来。拆成单字符会把 "--nope" 报成 "--",
 		// 使用者拿着这个提示没法定位问题。
 		if strings.HasPrefix(a, "--") {
-			fmt.Fprintln(errw, errs.Errorf("ls", "不认识的参数: "+a, "支持的参数: -l -a -h -1"))
+			remedy := "支持的参数: -l -a -h -1"
+			if a == "--recursive" {
+				// ls 不做递归是对的(① 层的 ls 只列一层,语义可控),但"不认识的参数"
+				// 没说下一步 —— 递归列目录在 bash 里的标准解法是 find,直接给出来。
+				remedy = "ls 不递归;要递归列目录用 find: find . -name '*' (只看文件用 find . -type f)"
+			}
+			fmt.Fprintln(errw, errs.Errorf("ls", "不认识的参数: "+a, remedy))
 			return errs.ExitUsage
 		}
 		for _, c := range a[1:] {
@@ -51,7 +57,11 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 				// 不接受反而更坏:`ls -1` 是极常见的写法,而它在这里的预期行为
 				// 恰好就是现状(给了 -l 时被 -l 压过,与 bash 一致)。
 			default:
-				fmt.Fprintln(errw, errs.Errorf("ls", "不认识的参数: -"+string(c), "支持的参数: -l -a -h -1"))
+				remedy := "支持的参数: -l -a -h -1"
+				if c == 'R' {
+					remedy = "ls 不递归;要递归列目录用 find: find . -name '*' (只看文件用 find . -type f)"
+				}
+				fmt.Fprintln(errw, errs.Errorf("ls", "不认识的参数: -"+string(c), remedy))
 				return errs.ExitUsage
 			}
 		}

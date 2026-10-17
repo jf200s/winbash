@@ -29,7 +29,13 @@ import (
 func Grep(ctx context.Context, cwd string, argv []string, in io.Reader, out, errw io.Writer) int {
 	opts, pattern, files, aerr := parseGrepArgs(argv)
 	if aerr != nil {
-		fmt.Fprintln(errw, errs.Errorf("grep", aerr.Error(), "用法: grep [-i -n -v -c -l -r -E -F -q] PATTERN [文件...]"))
+		remedy := "用法: grep [-i -n -v -c -l -r -E -F -q] PATTERN [文件...]"
+		if ue, ok := aerr.(*usageErr); ok {
+			// 带针对性指路的错误(例如 GNU 的 --include):通用那句「用法:」对它
+			// 没有任何帮助,使用者还得再花一轮问"那该怎么写"。
+			remedy = ue.remedy
+		}
+		fmt.Fprintln(errw, errs.Errorf("grep", aerr.Error(), remedy))
 		return errs.ExitUsage
 	}
 
@@ -142,10 +148,12 @@ type grepOpts struct {
 func parseGrepArgs(argv []string) (*grepOpts, string, []string, error) {
 	opts := &grepOpts{}
 	i := 0
+	sawDashDash := false
 	for ; i < len(argv); i++ {
 		a := argv[i]
 		if a == "--" {
 			i++
+			sawDashDash = true
 			break
 		}
 		if len(a) < 2 || a[0] != '-' {
@@ -193,7 +201,54 @@ func parseGrepArgs(argv []string) (*grepOpts, string, []string, error) {
 	if len(rest) == 0 {
 		return nil, "", nil, fmt.Errorf("没有指定 pattern")
 	}
+	// 选项写在 PATTERN **之后**:bash 的 getopt 会做置换(permutation)把它挪到前面,
+	// 我们不做置换 —— 于是 `--include` 会被当成**文件名**。实测的后果比"报错"更坏:
+	//
+	//	grep -rn x --include="*.go" .
+	//	→ stderr 一句"路径不存在",stdout 却把**全部**文件都搜了,而且 exit 0
+	//
+	// 过滤没生效、退出码还是成功 —— 这正是本项目要消灭的"静默做错事"。所以这里
+	// 必须响亮拒绝,并把"该改用哪种写法"直接说清楚(见 afterPatternOptionErr)。
+	// `--` 之后的 `-` 开头参数是**文件名**,不在此列。
+	if !sawDashDash {
+		for _, f := range rest[1:] {
+			// 单独的 `-` 是「读 stdin」的惯用文件名(grep x a.txt -),不是选项。
+			if f != "-" && strings.HasPrefix(f, "-") {
+				return nil, "", nil, afterPatternOptionErr(f)
+			}
+		}
+	}
 	return opts, rest[0], rest[1:], nil
+}
+
+// usageErr 是一个**带针对性指路**的参数错误。
+//
+// 普通参数错误配上通用的「用法: grep [...]」就够了;但 GNU 的 `--include` 这类
+// 选项需要说清"改用哪种写法",否则使用者只知道"不支持",还得再花一轮问怎么替代。
+type usageErr struct {
+	problem string
+	remedy  string
+}
+
+func (e *usageErr) Error() string { return e.problem }
+
+// afterPatternOptionErr 给"选项写在 PATTERN 之后"这一种错误一句能省一轮的指路。
+func afterPatternOptionErr(opt string) error {
+	name, _, _ := strings.Cut(opt, "=")
+	switch name {
+	case "--include", "--exclude", "--include-dir", "--exclude-dir":
+		return &usageErr{
+			problem: name + " 是 GNU grep 的选项,① 层的 grep 不支持;" +
+				"而且它写在 PATTERN 之后 —— 我们不做选项置换,只会把它当文件名",
+			remedy: "按文件名过滤改用: find . -name '*.go' -exec grep -n PATTERN {} + ;" +
+				"需要 GNU 的完整方言就显式调真 grep:(Git 安装根)\\usr\\bin\\grep.exe -rn PATTERN --include='*.go' .",
+		}
+	}
+	return &usageErr{
+		problem: "不认识的参数: " + opt + "(它写在 PATTERN 之后,我们不做选项置换)",
+		remedy: "选项要写在 PATTERN **之前**;真要搜以 - 开头的**文件名**,把 -- 也写在 PATTERN 之前: " +
+			"grep -n -- PATTERN -weird-name",
+	}
 }
 
 // compileGrep 按方言决策编译 pattern,失败时返回「问题 + 怎么办」两行文案。

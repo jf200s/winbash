@@ -70,6 +70,23 @@ func TestLsRejectsUnknownFlag(t *testing.T) {
 	}
 }
 
+// ls 不做递归是对的(① 层只列一层,语义可控),但错误信息要指路。
+//
+// "不认识的参数: -R" 只说了不行、没说下一步 —— AI 与人都得再花一轮去问"那递归
+// 该怎么写"。bash 里的标准解法是 find,直接给出来。
+func TestLsRecursivePointsToFind(t *testing.T) {
+	for _, arg := range []string{"-R", "--recursive"} {
+		var errw bytes.Buffer
+		code := Ls(context.Background(), t.TempDir(), []string{arg}, io.Discard, &errw)
+		if code == 0 {
+			t.Errorf("%s: code=0,应当报用法错误", arg)
+		}
+		if !strings.Contains(errw.String(), "find") {
+			t.Errorf("%s: 该指路到 find,got %q", arg, errw.String())
+		}
+	}
+}
+
 func TestResolvePathAcceptsBothPOSIXAndWindowsForms(t *testing.T) {
 	if p, err := ResolvePath(`C:\work`, "/c/Users/x"); err != nil || p != `C:\Users\x` {
 		t.Fatalf("posix form: %q %v", p, err)
