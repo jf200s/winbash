@@ -169,6 +169,11 @@ BRE 这一条是修过的:**早先默认按整串字面匹配**,于是这几个�
   (Git Bash 版),不会撞上 `C:\Windows\System32` 里同名的 Windows 程序
   —— `find . -name '*.go'` 在 System32 那个 `find.exe`(在文件里找字符串)上会直接报参数错误。
 - `git`、`go`、`node` 这些走系统 PATH,与你在终端里跑的一致。
+- **自带路径的写法**(`./x.sh`、`/c/x/y.sh`、`C:\x\y.exe`)按**会话 cwd** 解析,不是进程 cwd
+  —— 否则 `cd /tmp && ./t.sh` 会去 daemon 启动时那个目录里找。判"能不能直接执行"看的是
+  **文件头是不是 PE**,不是扩展名:`.sh`/`.py` 这类带 shebang 的脚本因此能像在真 bash 里
+  一样跑(`usr\bin` 的 `env.exe` 读 shebang 找解释器);`.bat`/`.cmd` 既不是 PE 也没有 shebang,
+  会显式报错并指路 `cmd /c`,而不是丢一句 `%1 is not a valid Win32 application`。
 - 子进程拿到的是**同一条** PATH,所以 `xargs`、`find -exec`、`make` 这类"子进程再 exec"也能找到工具集。
 - **参数怎么送进去,这两类目标不是同一套规则。** Windows 上"父→子"的参数是拼成一条命令行字符串
   传的,由**子进程自己**按它认的规则拆回 argv,而这个规则不是 ABI 钉死的:
@@ -252,7 +257,15 @@ token 仍在、daemon 仍可用,只是这层加固没生效,而使用者有权�
 go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 ```
 
-它量的是 interp 的一次 `Run`(本机:纯 `echo` 约 **6.4 µs/op**,`echo hello | grep hell` 约 **119 µs/op**)。
+它量的是 interp 的一次 `Run`。**2026-10-17 实测:纯 `echo` 约 13.9 µs/op、
+`echo hello | grep hell` 约 146 µs/op**(AMD Ryzen 9 8945HX,16 核 32 线程,
+`-benchtime=200x`)。
+
+这里原先记的是 6.4 µs / 119 µs —— 但那条**没写测在哪台机器上**,而两次数值差约 2×,
+于是分不清是版本退化还是换了机器(一次独立评审也量到 12.9 µs / 135 µs,同量级)。
+所以从现在起 benchmark 数字必须**连日期与 CPU 一起记**:换机器先重测再比对,
+别拿两台机器的数互相印证。
+
 端到端那 20 ms 量级里,绝大部分是**进程创建与 IPC 往返**,不是 winbash 本身。
 
 **① 层不比真 bash 快**(实测 20 次 `echo x`:winbash 0.783s vs 真 `bash -c` 0.689s,差异在噪声量级内)。
@@ -293,6 +306,7 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 | `pwsh` 的列名按字母序 | 真实 PowerShell 会按对象属性定义顺序排版;我们排序是为了让两次运行的列序一致 |
 | 超时**不会**重放脚本 | 客户端超时后直接报错。早先它会重拉 daemon 把同一个请求原样重跑,于是 `echo RUN >> f; sleep 6` 配 `--timeout 2s` 会让文件出现**两行** —— 对写文件类脚本是数据损坏 |
 | 坏连接最多挡住 5 秒 | daemon 串行处理连接,一个只连不说话的连接会让后续命令排队;它会在 5 秒后丢掉这条连接。修之前没有这个上限,能一直挡到客户端自己超时 |
+| 并发**首次**启动可能拉起多个 daemon | `ensureDaemon` 只看端口文件能不能读出来,不验证对端存活,也没有跨进程启动锁。多个 client **同时**发现"没有 daemon"时会各 spawn 一个,后写端口文件者赢,先起的那只成为孤儿 —— `--status` 看不到、`--stop` 停不掉,只能等 30 分钟空闲超时自己退。日常单线程不会撞上,并行脚本会。**尚未修**:要跨进程锁(命名互斥量或端口文件的独占创建),属设计级改动,不是一行能补的 |
 
 **会话级状态**(常驻会话的必然结果,不是 bug):`set -e`、`trap`、**变量**、**函数**都**跨命令持久**。
 `bash -c` 每条都是新进程,所以这一点与它不同——一条命令里的 `set -e` 会影响**后续所有命令**。
