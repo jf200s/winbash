@@ -129,7 +129,8 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 			}
 			info, serr := os.Stat(abs)
 			if serr != nil {
-				fmt.Fprintln(errw, errs.Errorf("ls", serr.Error(),
+				fmt.Fprintln(errw, errs.Errorf("ls",
+					userPathProblem("cannot access", p, serr, abs),
 					"先确认路径存在,或用 winbash -c 'ls 上级目录' 看有哪些名字"))
 				code = errs.ExitError
 				continue
@@ -167,7 +168,9 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 			// 不是目录 —— 按 bash 惯例把它当单个文件列出,而不是直接失败。
 			info, serr := os.Stat(abs)
 			if serr != nil {
-				fmt.Fprintln(errw, errs.Errorf("ls", serr.Error(), "先确认路径存在,或用 winbash -c 'ls 上级目录' 看有哪些名字"))
+				fmt.Fprintln(errw, errs.Errorf("ls",
+					userPathProblem("cannot access", p, serr, abs),
+					"先确认路径存在,或用 winbash -c 'ls 上级目录' 看有哪些名字"))
 				code = errs.ExitError
 				continue
 			}
@@ -232,7 +235,9 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 			}
 			fi, ierr := e.Info()
 			if ierr != nil {
-				fmt.Fprintln(errw, errs.Errorf("ls", ierr.Error(), "读不到 "+e.Name()+" 的属性,已跳过"))
+				fmt.Fprintln(errw, errs.Errorf("ls",
+					userPathProblem("cannot access", e.Name(), ierr, filepath.Join(abs, e.Name())),
+					"读不到 "+e.Name()+" 的属性,已跳过"))
 				code = errs.ExitError
 				continue
 			}
