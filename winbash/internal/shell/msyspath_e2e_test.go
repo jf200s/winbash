@@ -50,7 +50,15 @@ func TestMsysMountsWorkFromShellSyntax(t *testing.T) {
 	}
 
 	// mktemp 是 AI 写临时文件的标准写法:它返回 `/tmp/tmp.XXXX`,整条链依赖那个路径可写。
-	out, exit, errs := runScriptErr(t, `f=$(mktemp); echo hi > "$f"; cat "$f"; rm -f "$f"`)
+	//
+	// 这里**先把 mktemp 给的路径打出来**(MK= / MD=),用它直接判断"参照物有没有退化"。
+	// 为什么不能继续从**错误文本**反推(我自己踩的回归,记下来):旧判据找的是
+	// 「TEMP 的 basename 在错误里连续出现两次」,而那依赖 Win32 的**绝对路径**被原样
+	// 端出来 —— 措辞层修好之后给的是用户写的 POSIX 路径,basename 只出现一次。
+	// 于是同一个退化环境从 skip 变成**红**:实测 5/5 稳定红,任何人在这台机器上跑全量
+	// 都会看到假失败。判据要盯**事实本身**(mktemp 返回了什么),不是某段文案的形状。
+	out, exit, errs := runScriptErr(t, `f=$(mktemp); echo "MK=$f"; echo hi > "$f"; cat "$f"; rm -f "$f"`)
+	mkPath, out := splitProbeLine(out, "MK=")
 	if exit != 0 || strings.TrimSpace(out) != "hi" {
 		// 已知的**参照物退化**,不是 winbash 的映射错误:宿主把 TEMP 设成 Windows 短名路径
 		// (`...\Temp\reasonix-session-tmp-123`)时,MSYS 有约 1% 的启动会把 `/tmp` 解析成
@@ -59,19 +67,99 @@ func TestMsysMountsWorkFromShellSyntax(t *testing.T) {
 		// 根本不是同一个 —— 真 Git Bash 在那一次里同样读不回来。而且它**成片**出现:
 		// 实测 -count=100 时 93 次退化、7 次正常,所以门禁会"突然连红几次"
 		// (直接派生 mktemp.exe 时更是稳定复现,见 README 的已知差异表)。
-		//
-		// 判据精确到「TEMP 的 basename 在路径里连续出现两次」,所以它不会掩盖真的映射故障:
-		// 真故障的路径不会是这种形状(而且上面那条 /tmp 写读断言会先红)。
-		if base := filepath.Base(os.Getenv("TEMP")); base != "" && base != "." &&
-			strings.Contains(strings.Join(errs, " "), base+`\`+base) {
-			t.Skipf("参照物这一次退化了(Git Bash 把 /tmp 解析成 %%LOCALAPPDATA%%\\Temp):%v", errs)
+		if mktempPathDegraded(mkPath) {
+			t.Skipf("参照物这一次退化了(Git Bash 把 /tmp 解析成 %%LOCALAPPDATA%%\\Temp);"+
+				"mktemp 给的是 %q,不是 /tmp 的直接子项:%v", mkPath, errs)
 		}
-		t.Fatalf("mktemp 链失败: exit=%d out=%q", exit, out)
+		t.Fatalf("mktemp 链失败: exit=%d out=%q mktemp=%q errs=%v", exit, out, mkPath, errs)
 	}
 
-	out, exit = runScript(t, `d=$(mktemp -d); echo x > "$d/a"; cat "$d/a"; rm -rf "$d"`)
+	out, exit, errs = runScriptErr(t, `d=$(mktemp -d); echo "MD=$d"; echo x > "$d/a"; cat "$d/a"; rm -rf "$d"`)
+	mdPath, out := splitProbeLine(out, "MD=")
 	if exit != 0 || strings.TrimSpace(out) != "x" {
-		t.Fatalf("mktemp -d 链失败: exit=%d out=%q", exit, out)
+		if mktempPathDegraded(mdPath) {
+			t.Skipf("参照物这一次退化了(Git Bash 把 /tmp 解析成 %%LOCALAPPDATA%%\\Temp);"+
+				"mktemp -d 给的是 %q:%v", mdPath, errs)
+		}
+		t.Fatalf("mktemp -d 链失败: exit=%d out=%q mktemp=%q errs=%v",
+			exit, out, mdPath, errs)
+	}
+}
+
+// splitProbeLine 从脚本输出里取出我们插进去的那一行探针(<prefix><值>),
+// 返回(探针的值, 去掉探针行之后的其余输出)。
+//
+// 为什么要在脚本里插一行而不是从别处推断:见上面那段注释 —— 从错误文本反推的判据
+// 会随文案改动而失效,而文案是本项目正在持续打磨的东西。让脚本自己报告事实最稳。
+func splitProbeLine(out, prefix string) (value, rest string) {
+	i := strings.Index(out, prefix)
+	if i < 0 {
+		return "", out
+	}
+	after := out[i+len(prefix):]
+	if j := strings.IndexByte(after, '\n'); j >= 0 {
+		return strings.TrimSpace(after[:j]), out[:i] + after[j+1:]
+	}
+	return strings.TrimSpace(after), out[:i]
+}
+
+// mktempPathDegraded 判断 mktemp 给出的路径是不是**参照物退化**的形态。
+//
+// 正常:`/tmp/tmp.XXXXXX` —— 直接挂在挂载点根下。
+// 退化:`/tmp/<TEMP 的 basename>/tmp.XXXXXX` —— 中间多出一层 TEMP 自己的名字,
+// 那是 MSYS 把 `/tmp` 解析成 `%TEMP%` 的父目录造成的(见上面长注释)。
+//
+// 判据只认这种确定形态,所以不会掩盖真的映射故障:真的映射坏了,mktemp 要么失败、
+// 要么给出的路径不在 `/tmp` 下,而上面那条「写/读 /tmp」的断言会先红。
+func mktempPathDegraded(p string) bool {
+	if p == "" {
+		return false
+	}
+	base := filepath.Base(os.Getenv("TEMP"))
+	if base == "" || base == "." {
+		return false
+	}
+	return strings.Contains(filepath.ToSlash(p), "/"+base+"/")
+}
+
+// ★ 判据本身要能双向判定:认得出退化,也**不能**把正常形态当成退化。
+//
+// 为什么值得单独测:这个函数决定的是「真失败要不要被 skip 掉」。
+// 若它恒返回 true,真的映射故障会被静默跳过 —— 门禁永远绿,而 bug 留在那里。
+// 恒 false 只是回到"退化时红"(可察觉),恒 true 才是危险的那一边。
+//
+// 上面的集成测试在当前机器上只能观察到**退化**那一侧(这台机器的 TEMP 是短名),
+// 所以正常侧必须靠这个纯函数测试来钉。
+func TestMktempPathDegradedRecognizesBothShapes(t *testing.T) {
+	base := filepath.Base(os.Getenv("TEMP"))
+	if base == "" || base == "." {
+		t.Skip("本机没有可用的 TEMP basename,无从判断退化形态")
+	}
+
+	cases := []struct {
+		name string
+		in   string
+		want bool
+		why  string
+	}{
+		{"正常形态", "/tmp/tmp.ABC123", false,
+			"直接挂在 /tmp 下 —— 这是正常情况,绝不能 skip"},
+		{"退化形态", "/tmp/" + base + "/tmp.ABC123", true,
+			"中间多了一层 TEMP 的 basename,正是退化"},
+		{"空串", "", false,
+			"拿不到 mktemp 输出时不判退化(交给断言去红,不要静默跳过)"},
+		{"只有那层没后续", "/tmp/" + base, false,
+			"路径不完整,不构成退化形态"},
+		{"别的 tmp 根", "/var/tmp/tmp.ABC", false,
+			"不含 TEMP 的 basename"},
+		{"Windows 形态但无关", `C:\some\where\tmp.ABC`, false,
+			"不含 TEMP 的 basename"},
+	}
+	for _, c := range cases {
+		if got := mktempPathDegraded(c.in); got != c.want {
+			t.Errorf("%s:mktempPathDegraded(%q) = %v,期望 %v —— %s",
+				c.name, c.in, got, c.want, c.why)
+		}
 	}
 }
 
