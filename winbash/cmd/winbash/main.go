@@ -84,16 +84,30 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	// 收集用户**显式**写了哪些 flag。
+	//
+	// 为什么不能只看「值非空」:--session 的默认值来自 WINBASH_SESSION_NAME 环境变量
+	// (见上面 StringVar),而那个变量是给**执行脚本**那条路用的默认值。按值判断的话,
+	// 只要环境里设了它,`--status` / `--stop` / `--serve` 就全部 exit 2 ——
+	// 实测过:连 daemon 都起不来(client 拉起的 `--serve` 子进程继承了同一个环境),
+	// 而 `--stop` 正是版本不匹配时唯一的处置。README 又恰恰推荐并行子代理设这个变量。
+	// 所以互斥校验的判据必须是「用户显式给了」,不是「值非空」。
+	explicit := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { explicit[f.Name] = true })
+	// --fresh 与 --no-state 是同一个变量的两个名字,任一出现都算显式。
+	freshGiven := explicit["fresh"] || explicit["no-state"]
+	sessionGiven := explicit["session"]
+
 	// --fresh 只对「执行脚本」这条路有意义。和 --serve/--stop/--status 一起给时
 	// 报用法错误,而不是默默忽略 —— 静默忽略会让人以为隔离生效了。
-	if fresh && (serve || stop || status) {
+	if freshGiven && (serve || stop || status) {
 		fmt.Fprintln(stderr, "winbash: --fresh / --no-state 只用于执行脚本,不能与 --serve/--stop/--status 同用")
 		return 2
 	}
 
 	// --session 只对「执行脚本」这条路有意义。和 --serve/--stop/--status 一起给时
 	// 报用法错误,而不是默默忽略 —— 静默忽略会让人以为会话隔离生效了。
-	if session != "" && (serve || stop || status) {
+	if sessionGiven && (serve || stop || status) {
 		fmt.Fprintln(stderr, "winbash: --session 只用于执行脚本,不能与 --serve/--stop/--status 同用")
 		return 2
 	}
@@ -101,7 +115,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// --fresh 是「一次性会话」,--session 是「长期存在的具名会话」,两者语义正交
 	// 且组合起来没有说得通的含义(是 build 的一次性副本?还是忽略 build?)。
 	// 与其猜一个,不如按项目底线报用法错误。
-	if fresh && session != "" {
+	//
+	// 注意判的是**显式**的 --session:环境变量给的那个默认会话名与 --fresh 不冲突 ——
+	// `--fresh` 已经把"不要持久会话"说清楚了,这时忽略环境变量的会话名不叫静默
+	// (它本来就是个默认值,不是使用者此刻的意图)。
+	if freshGiven && sessionGiven {
 		fmt.Fprintln(stderr, "winbash: --fresh / --no-state 与 --session 不能同用:前者是一次性会话,后者是具名长期会话")
 		return 2
 	}
@@ -150,8 +168,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if fresh {
 		opts = append(opts, client.Fresh())
 	}
-	// 空会话名也照传:daemon 侧会把它当成默认会话(与引入 --session 之前等价)。
-	opts = append(opts, client.Session(session))
+	// 会话名照传;空串也传(daemon 侧会当成默认会话,与引入 --session 之前等价)。
+	//
+	// 但 --fresh 时不传:它要的是**一次性会话**,而 session 此刻的值只可能来自
+	// 环境变量的默认值(显式组合已被上面拦成用法错误)。把环境变量的会话名带过去
+	// 是没意义的噪音 —— daemon 侧本来也会因为 fresh 而忽略它。
+	if !freshGiven {
+		opts = append(opts, client.Session(session))
+	}
 	resp, err := client.RunTimeout(endpoint, script, cwd, jsonOut, timeout, idle, opts...)
 	if err != nil {
 		fmt.Fprintln(stderr, "winbash:", err)

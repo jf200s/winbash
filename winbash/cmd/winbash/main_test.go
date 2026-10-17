@@ -139,8 +139,51 @@ func TestFreshWithControlFlagsIsAUsageError(t *testing.T) {
 	}
 }
 
+// --session 的默认值来自 WINBASH_SESSION_NAME,而那个变量是给**执行脚本**那条路用的。
+// 所以互斥校验的判据必须是「用户显式给了 flag」,不能是「值非空」——
+// 按值判会让一个环境变量把 --status / --stop / --serve 全部打成 exit 2。
+//
+// 实测过的后果(修之前):设了 WINBASH_SESSION_NAME 之后连 daemon 都起不来
+// (client 拉起的 `--serve` 子进程继承了同一个环境),而 --stop 正是版本不匹配时
+// 唯一的处置 —— 于是使用者会卡在一个既用不了又停不掉的 daemon 上。
+// 而 README 恰恰推荐并行子代理去设这个变量,所以这条不是理论风险。
+//
+// 两个方向都要钉住:环境变量不该触发互斥,显式 flag 仍必须触发。
+func TestSessionEnvVarDoesNotTriggerUsageErrors(t *testing.T) {
+	t.Setenv("WINBASH_SESSION_NAME", "build")
+
+	// 方向一:环境变量在场时,管理开关与 --fresh 都不能被误判成"与 --session 同用"。
+	ep := tmpEndpoint(t)
+	startDaemon(t, ep)
+	defer func() { _, _, _ = runCLI(t, "--stop", "--endpoint", ep) }()
+
+	if code, _, errOut := runCLI(t, "--status", "--endpoint", ep); code != 0 {
+		t.Errorf("环境变量在场时 --status 不该失败: code=%d stderr=%q", code, errOut)
+	}
+	// --fresh 与环境变量给的默认会话名不冲突:--fresh 已经把"不要持久会话"说清楚了。
+	if code, out, errOut := runCLI(t, "--fresh", "-c", "echo fresh-ok", "--endpoint", ep); code != 0 {
+		t.Errorf("环境变量在场时 --fresh 不该失败: code=%d out=%q stderr=%q", code, out, errOut)
+	}
+	// 普通执行当然也要能用。
+	if code, out, _ := runCLI(t, "-c", "echo plain", "--endpoint", ep); code != 0 || !strings.Contains(out, "plain") {
+		t.Errorf("环境变量在场时普通执行失败: code=%d out=%q", code, out)
+	}
+
+	// 方向二:显式写出来的组合**仍然**必须是用法错误 ——
+	// 修 bug 不能把校验一起废掉,否则又回到"静默忽略,以为隔离生效了"。
+	for _, ctl := range []string{"--serve", "--stop", "--status"} {
+		if code, _, _ := runCLI(t, "--session", "x", ctl, "--endpoint", ep); code != 2 {
+			t.Errorf("显式 --session %s: code=%d want 2", ctl, code)
+		}
+	}
+	if code, _, _ := runCLI(t, "--fresh", "--session", "x", "-c", "echo x", "--endpoint", ep); code != 2 {
+		t.Errorf("显式 --fresh --session: code=%d want 2", code)
+	}
+}
+
 // run 的主路径:真拉起一个 daemon(端点指向临时目录),跑一条命令。
-func TestEchoRunsThroughARealDaemon(t *testing.T) {	ep := tmpEndpoint(t)
+func TestEchoRunsThroughARealDaemon(t *testing.T) {
+	ep := tmpEndpoint(t)
 	t.Cleanup(func() { _, _, _ = runCLI(t, "--stop", "--endpoint", ep) })
 	startDaemon(t, ep)
 

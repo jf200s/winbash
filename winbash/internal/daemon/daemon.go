@@ -448,6 +448,21 @@ func (d *daemon) handleConn(conn net.Conn, readTimeout time.Duration) {
 		_ = writeResponse(conn, ipc.Response{OK: true, Out: []byte(d.statusText(conn))})
 		closeConnGracefully(conn)
 		return
+
+	case "":
+		// 空 op = 执行脚本,本次调用的主路径。显式写出来(而不是靠 switch 落空)
+		// 是为了让下面那个 default 能真的把「不认识的 op」拦住 ——
+		// 原先没有 default,op="restart" 这类值会静默落到执行路径上(实测过)。
+
+	default:
+		_ = writeResponse(conn, ipc.Response{
+			OK: false,
+			Errors: []string{fmt.Sprintf("daemon: 不认识的 op %q\n"+
+				"怎么办: 两端的 winbash.exe 版本可能不一致;运行 `winbash --stop` 后重试", req.Op)},
+			Exit: 2,
+		})
+		closeConnGracefully(conn)
+		return
 	}
 
 	// 协议版本只对**执行脚本**这条路检查,并且刻意放在 op 分派之后。

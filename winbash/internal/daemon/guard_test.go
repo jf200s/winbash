@@ -100,6 +100,56 @@ func TestRequestWithoutTokenIsRejected(t *testing.T) {
 	}
 }
 
+// ★ 不认识的 op 必须被拒绝,不能静默落到「执行脚本」路径。
+//
+// 修之前:handleConn 的 `switch req.Op` 只有 stop/status 两个 case、**没有 default**,
+// 于是任何其它 op 值都会继续往下走到执行路径。实测裸 socket 发 op="restart" 时
+// 脚本照跑、ok=true、exit=0 —— 调用方以为发的是个管理命令,实际执行了任意脚本。
+// 这是「不静默做错事」的直接违反。
+//
+// 两个方向都要钉:未知 op 拒绝(exit 2),**空 op 仍照常执行**(那是唯一的主路径,
+// 误伤它等于把整个产品废掉)。
+func TestUnknownOpIsRejectedButEmptyOpRuns(t *testing.T) {
+	ep := startDaemon(t, DefaultReadTimeout)
+	_, token := readEndpointFile(t, ep)
+
+	for _, op := range []string{"restart", "stopX", "run", "Status", "STOP"} {
+		resp, err := rawRequest(t, ep, ipc.Request{
+			Proto:  ipc.ProtoVersion,
+			Token:  token,
+			Op:     op,
+			Script: "echo SHOULD-NOT-RUN",
+		})
+		if err != nil {
+			t.Fatalf("op=%q 没得到响应(应当明确拒绝): %v", op, err)
+		}
+		if resp.OK || resp.Exit != 2 {
+			t.Errorf("op=%q 应当以用法错误 2 被拒绝,得到 ok=%v exit=%d",
+				op, resp.OK, resp.Exit)
+		}
+		// 最关键的一条:脚本**一个字都不能跑**。
+		if strings.Contains(string(resp.Out), "SHOULD-NOT-RUN") {
+			t.Fatalf("op=%q 静默执行了脚本(out=%q)—— 未知 op 必须被拦在执行路径之前",
+				op, resp.Out)
+		}
+	}
+
+	// 空 op 是执行脚本的主路径,不能被上面的 default 误伤。
+	resp, err := rawRequest(t, ep, ipc.Request{
+		Proto:  ipc.ProtoVersion,
+		Token:  token,
+		Op:     "",
+		Script: "echo EMPTY-OP-RAN",
+	})
+	if err != nil {
+		t.Fatalf("空 op 没得到响应: %v", err)
+	}
+	if !resp.OK || !strings.Contains(string(resp.Out), "EMPTY-OP-RAN") {
+		t.Fatalf("空 op 没能执行脚本(ok=%v exit=%d out=%q)—— 主路径被误伤了",
+			resp.OK, resp.Exit, resp.Out)
+	}
+}
+
 // ★ 长度模式(StdinLen >= 0)是协议预留、未实现:daemon 必须**响亮拒绝**,
 // 而不是跑一条零调用方、零测试的分支。
 //
@@ -117,7 +167,7 @@ func TestUnsupportedStdinLenIsRejectedByDaemon(t *testing.T) {
 		resp, err := rawRequest(t, ep, ipc.Request{
 			Proto:     ipc.ProtoVersion, // 版本要对,否则会被 CheckProto 先挡住(那是另一条路径)
 			Token:     token,            // 鉴权要过,否则走不到 stdin 检查
-			Op:        "run",
+			Op:        "",               // 空 op = 执行脚本,唯一会走到 stdin 检查的路径
 			Script:    "cat",
 			StdinMode: ipc.StdinStream,
 			StdinLen:  n,

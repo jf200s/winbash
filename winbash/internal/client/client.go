@@ -500,11 +500,40 @@ func spawnDaemon(endpoint string, idle time.Duration) error {
 		return err
 	}
 	cmd := exec.Command(exe, serveArgs(endpoint, idle)...)
+	// 子进程不能继承这几个环境变量:它们是**client 侧**的默认值来源,而 daemon
+	// 一旦拿到就会撞上 main.go 里那些「只用于执行脚本」的互斥校验。
+	// 实测后果:设了 WINBASH_SESSION_NAME 之后 `--serve` 直接 exit 2,daemon 永远
+	// 起不来,连 `--stop` 这个唯一处置也一起废 —— 而那个变量正是 README 推荐
+	// 并行子代理去设的。
+	cmd.Env = daemonEnv(os.Environ())
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		HideWindow:    true,
 		CreationFlags: createNoWindow,
 	}
 	return cmd.Start()
+}
+
+// daemonEnv 从环境里摘掉那些「只该影响 client」的变量,给拉起的 daemon 用。
+//
+// 理由:这些变量的作用都是给 **CLI 的 flag 默认值**提供来源(见 cmd/winbash/main.go),
+// 而 daemon 是用 `--serve` 起的 —— 它一旦拿到默认值就会撞上「--session/--fresh 只用于
+// 执行脚本」那几条互斥校验,于是直接 exit 2。
+//
+// 注意**不摘** EnvNested:那一条由 shell.NewSession 在 daemon 内部自己滤,与这里无关。
+func daemonEnv(env []string) []string {
+	drop := map[string]bool{
+		"WINBASH_SESSION_NAME": true,
+	}
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		name, _, _ := strings.Cut(kv, "=")
+		// Windows 的环境变量名大小写不敏感,比对时必须折成大写。
+		if drop[strings.ToUpper(name)] {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
 
 // serveArgs 拼出拉起的 daemon 的命令行。抽成纯函数是为了能测 ——

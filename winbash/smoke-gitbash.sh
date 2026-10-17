@@ -132,6 +132,10 @@ check "跨会话隔离"           "none"  "$(wb --session sm-b -c 'echo ${S:-non
 check "默认会话也隔离"       "none"  "$(wb -c 'echo ${S:-none}')"
 check "--fresh 与 --session 互斥" "2" "$(wb --fresh --session sm-a -c 'echo x' >/dev/null 2>&1; echo $?)"
 check "--session 与 --serve 互斥"  "2" "$(wb --session sm-a --serve >/dev/null 2>&1; echo $?)"
+# 环境变量只该给「执行脚本」当默认会话名,不能把管理命令一起打成用法错误。
+# 实测后果(修之前):设了它连 daemon 都起不来,而 --stop 是版本不匹配时唯一的处置。
+check "会话环境变量不影响管理命令" "0" "$(WINBASH_SESSION_NAME=envsess wb --status >/dev/null 2>&1; echo $?)"
+check "会话环境变量不影响 --fresh"  "0" "$(WINBASH_SESSION_NAME=envsess wb --fresh -c 'echo ok' >/dev/null 2>&1; echo $?)"
 check "status 报会话数"      "1"     "$(wb --status | grep -cE '^sessions=[0-9]+')"
 
 echo "-- 生命周期:--stop 之后必须能立刻继续用"
