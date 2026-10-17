@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
@@ -508,7 +509,19 @@ func (s *Session) runExternal(ctx context.Context, args []string, hc interp.Hand
 	// stderr 边转发边留尾:已知坑的识别靠它(见下),但输出不能延迟。
 	tail := tailWriter(hc.Stderr, 4<<10)
 
-	cmd := exec.CommandContext(ctx, argv0, append(append([]string{}, leading...), args[1:]...)...)
+	argv := append(append([]string{}, leading...), args[1:]...)
+	cmd := exec.CommandContext(ctx, argv0, argv...)
+	// MSYS/Cygwin 目标要用**它自己的**引号规则拼命令行,不能交给 Go 默认的
+	// MSVC 规则(理由与实测见 msysargv.go 开头)。原生目标一行不改 —— 反过来给
+	// node / git 套上 MSYS 引号,它们会收到带引号的字面串,比现在更坏。
+	if isMSYSBinary(argv0) {
+		parts := make([]string, 0, len(argv)+1)
+		parts = append(parts, quoteMSYSArg(argv0))
+		for _, a := range argv {
+			parts = append(parts, quoteMSYSArg(a))
+		}
+		cmd.SysProcAttr = &syscall.SysProcAttr{CmdLine: strings.Join(parts, " ")}
+	}
 	cmd.Dir = hc.Dir
 	cmd.Stdin = hc.Stdin
 	cmd.Stdout = hc.Stdout

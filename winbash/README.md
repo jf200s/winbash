@@ -135,6 +135,20 @@ winbash: client: daemon 没有协议版本(它是旧版),与本客户端(2)不�
   —— `find . -name '*.go'` 在 System32 那个 `find.exe`(在文件里找字符串)上会直接报参数错误。
 - `git`、`go`、`node` 这些走系统 PATH,与你在终端里跑的一致。
 - 子进程拿到的是**同一条** PATH,所以 `xargs`、`find -exec`、`make` 这类"子进程再 exec"也能找到工具集。
+- **参数怎么送进去,这两类目标不是同一套规则。** Windows 上"父→子"的参数是拼成一条命令行字符串
+  传的,由**子进程自己**按它认的规则拆回 argv,而这个规则不是 ABI 钉死的:
+  - 原生程序(`git`、`go`、`node`)走 MSVC CRT 规则,Go 默认的 `syscall.EscapeArg` 正是这一套,没问题;
+  - **MSYS/Cygwin 系程序**(`usr\bin` 里的 `awk`、`sed`、`find`、`grep`、`sort`、`xargs`…)走的是
+    bash 式 `build_argv`,里面 `\` **没有任何转义含义**。两套规则不兼容,所以凡是从我们(原生进程)
+    启动它们,MSVC 风格的 `\"` 会被解析成"字面 `\` + 引号结束":
+
+        awk 'NR==1{print "quoted-ok"}' f   →  awk: NR==1{print \quoted-ok\}  (backslash not last character)
+
+    修法是不给它们走 MSVC 规则:按其自身规则改用**混合引号 + 相邻段拼接**(含 `'` 的段用 `"` 包,
+    其余用 `'` 包),这条路不需要任何转义,任意字节串都能完整送达。判定靠"文件里有没有导入
+    `msys-2.0.dll`/`cygwin1.dll`",结果按路径缓存且不进热路径。实现与实测表见
+    `internal/shell/msysargv.go`。
+
 
 ### ④ 层:兜底
 
