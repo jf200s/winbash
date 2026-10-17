@@ -6,9 +6,10 @@ import (
 	"testing"
 )
 
-// daemon 是「一条连接串行处理」的:会话里某条命令正在跑时,若它又去连同一个
-// daemon,两边会互相等到 300s 超时(实测过)。所以 ③ 层派生的子进程必须带一个标记,
-// 让嵌套调用的 winbash 认出自己在哪、不去连 daemon(见 client.Run 的嵌套分支)。
+// 同一个会话内是严格 FIFO、串行执行的:会话里某条命令正在跑时,若它又去连同一个
+// daemon,内层会排在**自己后面** —— 两边互相等到 300s 超时(实测过)。所以 ③ 层派生的
+// 子进程必须带一个标记,让嵌套调用的 winbash 认出自己在哪、不去连 daemon
+// (见 client.Run 的嵌套分支)。
 func TestExternalCommandsCarryTheNestedMarker(t *testing.T) {
 	if gitBashUsrBin() == "" {
 		t.Skip("Git Bash 不在标准位置,跳过")

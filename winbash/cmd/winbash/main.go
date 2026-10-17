@@ -35,6 +35,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		stop     bool
 		status   bool
 		fresh    bool
+		session  string
 		endpoint string
 		idle     time.Duration
 		timeout  time.Duration
@@ -51,6 +52,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&status, "status", false, "打印 daemon 状态")
 	fs.BoolVar(&fresh, "fresh", false, "这条命令跑在一次性会话里:之前的变量/set -e/trap/cwd 影响不到它,它也不影响后面的命令")
 	fs.BoolVar(&fresh, "no-state", false, "同 --fresh")
+	fs.StringVar(&session, "session", os.Getenv("WINBASH_SESSION_NAME"),
+		"落到哪个会话:同名会话内串行且状态持久,不同名会话之间并行。默认从环境变量 WINBASH_SESSION_NAME 取,空 = 默认会话")
 	fs.StringVar(&endpoint, "endpoint", defaultEndpoint(), "daemon 的端口文件路径")
 	fs.DurationVar(&idle, "idle", 30*time.Minute, "空闲多久后 daemon 自行退出(0 = 永不);自动拉起 daemon 时也会转给它")
 	fs.DurationVar(&timeout, "timeout", 300*time.Second, "单次请求的超时(0 = 不设限)")
@@ -85,6 +88,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// 报用法错误,而不是默默忽略 —— 静默忽略会让人以为隔离生效了。
 	if fresh && (serve || stop || status) {
 		fmt.Fprintln(stderr, "winbash: --fresh / --no-state 只用于执行脚本,不能与 --serve/--stop/--status 同用")
+		return 2
+	}
+
+	// --session 只对「执行脚本」这条路有意义。和 --serve/--stop/--status 一起给时
+	// 报用法错误,而不是默默忽略 —— 静默忽略会让人以为会话隔离生效了。
+	if session != "" && (serve || stop || status) {
+		fmt.Fprintln(stderr, "winbash: --session 只用于执行脚本,不能与 --serve/--stop/--status 同用")
+		return 2
+	}
+
+	// --fresh 是「一次性会话」,--session 是「长期存在的具名会话」,两者语义正交
+	// 且组合起来没有说得通的含义(是 build 的一次性副本?还是忽略 build?)。
+	// 与其猜一个,不如按项目底线报用法错误。
+	if fresh && session != "" {
+		fmt.Fprintln(stderr, "winbash: --fresh / --no-state 与 --session 不能同用:前者是一次性会话,后者是具名长期会话")
 		return 2
 	}
 
@@ -132,6 +150,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if fresh {
 		opts = append(opts, client.Fresh())
 	}
+	// 空会话名也照传:daemon 侧会把它当成默认会话(与引入 --session 之前等价)。
+	opts = append(opts, client.Session(session))
 	resp, err := client.RunTimeout(endpoint, script, cwd, jsonOut, timeout, idle, opts...)
 	if err != nil {
 		fmt.Fprintln(stderr, "winbash:", err)
