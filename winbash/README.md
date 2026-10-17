@@ -309,7 +309,7 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 | glob 给 `.\x` | 同理,Windows 原生形式;①/②/③ 层两种写法都吃 |
 | `${v/#前缀/替换}`、`${v/%后缀/替换}` | **不支持,报错 `2`**。mvdan/sh 没实现,而且会静默原样输出——我们宁可报错 |
 | `printf %q`、`printf -v` | 同上:不支持但显式报错,并给替代写法 |
-| `command -v find` / `type find` | 这两个是 mvdan/sh 的内建,按进程 PATH 回答(给 System32 那个)。准确答案用 `which find` |
+| `command -v find` / `type find` | 这两个是 mvdan/sh 的内建,按进程 PATH 回答(给 System32 那个)。准确答案用 `which find`。**`command -v` 已被 guard 接管**:①/② 层内建与只在 Git Bash `usr\bin` 里的工具都答得对,**多名字也行**(`command -v ls cat`;`TestCommandVHandlesMultipleNames`)。一条残余缺口:**混合写法**会放行给 mvdan/sh —— 例如 `command -v ls git` 里 `ls` 仍被漏报(`git` 在进程 PATH 里、mvdan 自己答得对,而 `CallHandler` 只能返回一条命令,没法逐名字替换)。要逐个判存在就分开写:`command -v ls && command -v git`。`type -p` / `type -t` 与 `type find` 同待遇:**未接管**,按进程 PATH 回答 |
 | 显式写 `Git\bin\bash.exe` 时参数里的双引号 | 那个 47 KB 的 exe **不是 MSYS 程序**,是 Git for Windows 的原生 launcher(导入表只有 `KERNEL32`/`msvcrt`/`SHELL32`,没有 `msys-2.0.dll`)。它把命令行**转发**给 `usr\bin\bash.exe`,这一跳用 MSVC 规则重拼,参数里的 `"` 到真 bash 手里已经变成 `\` —— **不是我们的转义问题**:对原生目标用标准 MSVC 规则是对的,坏在第二跳不受我们控制。按 PATH 找 `bash`(`which bash` 给的就是 `usr\bin\bash.exe`)完全正常,只有显式写全路径到 `bin\` 才会撞上 || `set -u` / `${v:?}` | 退出码 `1`(bash 的 `-c` 给 `127`),错误文本不带 `bash: line N:` 前缀——都非零、都点名变量 |
 | `${#关联数组[@]}` | mvdan/sh 的缺口:恒返回 `1`(键列表 `${!m[@]}` 与取值都是对的) |
 | `IFS` 给**多字符** | mvdan/sh 把整个串当分隔符,真 bash 只取**第一个字符**(`IFS=BC` 等价 `IFS=B`)。**静默**差异,光看输出看不出对错 —— 要按多字符分,请用 `IFS=,` 这类单字符,或先 `tr` 转换 |

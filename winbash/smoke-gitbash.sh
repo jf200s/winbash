@@ -107,6 +107,8 @@ check "sort 是 GNU 的(不是 System32 的)" "1" "$(wb -c 'sort --version 2>&1 
 check "printf | sort 不乱码"          "a"  "$(wb -c "printf 'b\na\n' | sort | head -1")"
 check "xargs 能 exec echo"            "2"  "$(wb -c 'echo a b | xargs -n1 echo | wc -l' | tr -d ' ')"
 check "command -v 认得 ① 层内建"      "ls" "$(wb -c 'command -v ls')"
+check "command -v 支持多名字"          "2"  "$(wb -c 'command -v ls cat' | wc -l | tr -d ' ')"
+check "command -v 多名字含缺失→非零"   "1"  "$(wb -c 'command -v ls no-such-xyz >/dev/null 2>&1; echo $?')"
 check "which 认得四层"                "3"  "$(wb -c 'which ls svc git | wc -l' | tr -d ' ')"
 check "锚定替换被拦下"                "2"  "$(wb -c 'v=prefix-x; echo "${v/#prefix/root}"' >/dev/null 2>&1; echo $?)"
 

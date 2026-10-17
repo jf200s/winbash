@@ -255,19 +255,33 @@ func (s *Session) callGuard(ctx context.Context, args []string) ([]string, error
 		return guarded, err
 	}
 
-	if len(args) == 3 && args[0] == "command" && args[1] == "-v" {
-		name := args[2]
-		_, isBuiltin := builtins.Registry[name]
-		_, isWinmgmt := winmgmt.Registry[name]
-		if isBuiltin || isWinmgmt {
-			return []string{"which", name}, nil
-		}
-		if _, err := exec.LookPath(name); err != nil {
-			// 进程 PATH 里没有,但我们的搜索路径(git bash 的 usr\bin)里有:
-			// 原逻辑会说"没有",而 winbash 明明跑得动它。
-			if _, found := builtins.Which(name, s.searchPath); found {
-				return []string{"which", name}, nil
+	// `command -v X [X...]`:mvdan/sh 的原逻辑只查**进程 PATH** 与它自己的内建表 ——
+	// 于是对 winbash 自己的内建(`ls`)和只在 Git Bash usr\bin 里的工具(`sed`)都会说
+	// "没有"。AI 常写 `command -v X >/dev/null && …` 做存在性判断,这一误判是**静默**的。
+	//
+	// 判据必须覆盖**多名字**写法(`command -v a b`)。早先只写 `len(args)==3`,
+	// 于是多名字那条整条漏拦:实测 `command -v sed cat`(PATH 里没有 usr\bin 时)
+	// 无任何输出、exit 1,而 sed 与 cat 都跑得动 —— 调用方的 `&&` 会静默短路。
+	//
+	// 为什么是「全部都要我们插手才换」:CallHandler 只能返回**一条**命令的 argv,
+	// 没法把 `command -v a b` 拆成两条命令依次执行。所以只在这条命令**完全**用得上
+	// 我们的时候整体换成 `which a b`(它本来就吃多名字,输出形态也与 `command -v` 一致:
+	// ①/② 层报名字、③ 层报绝对路径)。
+	//
+	// 混合写法(既有内建又有 mvdan 自己答得对的,如 `command -v ls git`)只能**放行**
+	// —— 那样 ls 仍会被漏报。这是已知残余缺口,已记进 README:真要逐个判存在,
+	// 就分开写 `command -v ls && command -v git`。
+	if len(args) >= 3 && args[0] == "command" && args[1] == "-v" {
+		names := args[2:]
+		allOurs := true
+		for _, name := range names {
+			if !s.needsOurWhich(name) {
+				allOurs = false
+				break
 			}
+		}
+		if allOurs {
+			return append([]string{"which"}, names...), nil
 		}
 	}
 
@@ -285,6 +299,36 @@ func (s *Session) callGuard(ctx context.Context, args []string) ([]string, error
 	}
 
 	return args, nil
+}
+
+// needsOurWhich 报告这个名字是不是「只有 winbash 认识」—— 即 mvdan/sh 的
+// `command -v` 必然答错的那几种。
+//
+// 三种:
+//  1. ① 层内建(`ls`/`cat`/`grep`/`which`):不在进程 PATH 里,mvdan/sh 会说"没有";
+//  2. ② 层内建(`svc`/`reg`/`ps`/`sys`/`pwsh`):同上;
+//  3. 只存在于 Git Bash `usr\bin` 里的工具(`sed`/`awk`/`find`…):宿主 PATH 不一定有它,
+//     而 winbash 的第 ③ 层能跑 —— 这也是「AI 写 `command -v sed && …` 却静默走 else」的根源。
+//
+// 其余一律返回 false,交给 mvdan/sh 自己答。这一条很关键:函数、别名、PATH 里的命令
+// 它答得对,我们把它们也换掉只会引入新语义(比如把函数名换成 which 就答"找不到")。
+func (s *Session) needsOurWhich(name string) bool {
+	if name == "" {
+		return false
+	}
+	if _, ok := builtins.Registry[name]; ok {
+		return true
+	}
+	if _, ok := winmgmt.Registry[name]; ok {
+		return true
+	}
+	// 进程 PATH 里有 → mvdan/sh 自己答得对,不插手。
+	if _, err := exec.LookPath(name); err == nil {
+		return false
+	}
+	// 进程 PATH 里没有,但我们的搜索路径(Git Bash 的 usr\bin + 真 PATH)里有。
+	_, found := builtins.Which(name, s.searchPath)
+	return found
 }
 
 // splitEchoFlags 把 `echo -en` 这类**组合开关**拆成 `-e -n`。
