@@ -162,7 +162,8 @@ func NewSession() *Session {
 		// 默认 handler 装在包装器里而不是重写:相对路径的拼接、`/dev/null` 的 NUL 特例
 		// 都保持 mvdan/sh 的原行为 —— 那两件事它做得对,不该被我们覆盖掉。
 		interp.OpenHandler(func(ctx context.Context, path string, flag int, perm os.FileMode) (io.ReadWriteCloser, error) {
-			f, err := baseOpenHandler(ctx, builtins.ResolveShellPath(dirOf(ctx), path), flag, perm)
+			resolved := builtins.ResolveShellPath(dirOf(ctx), path)
+			f, err := baseOpenHandler(ctx, resolved, flag, perm)
 			if err != nil {
 				// 失败时换成 POSIX 措辞。要点:传的是**原始 path**(用户写的,
 				// 如 `/nonexistent-dir/x`),不是上面转换后的 Windows 绝对路径 ——
@@ -171,9 +172,12 @@ func NewSession() *Session {
 				// 这条路径覆盖:输出/追加重定向、输入重定向、以及 source 找不到文件。
 				// 它原先原样端出 Go 的错误(`open C:\...: The system cannot find the
 				// path specified.`)—— 泄漏 Win32 API 名与绝对路径,且不是 POSIX 措辞。
-				return nil, builtins.ShellPathError(path, err, builtins.ResolveShellPath(dirOf(ctx), path))
+				return nil, builtins.ShellPathError(path, err, resolved)
 			}
-			return f, nil
+			// 打开**成功**但目标是目录:Windows 允许 open 目录,失败要等到第一次 Read。
+			// 在那里报错会走出来不及措辞的路径(见 builtins/dirread.go 的长注释),
+			// 所以在这里就拦掉 —— 得到的措辞与"重定向失败"天然一致。
+			return builtins.OpenErrorOrDir(f, path, resolved)
 		}),
 		interp.StatHandler(func(ctx context.Context, path string, follow bool) (fs.FileInfo, error) {
 			dir := dirOf(ctx)
