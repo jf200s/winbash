@@ -702,18 +702,25 @@ func (d *daemon) runJob(e *sessionEntry, j job) {
 	// 计数里,--stop 的宽限会以为没人在跑而立刻取消它们)。这里只标记 busy。
 	e.busy = true
 	e.lastUsed = time.Now()
+	d.lastUsed = time.Now()
 	d.mu.Unlock()
 	defer func() {
 		// 快照在锁外取(它可能碰到 ② 层连接的内部锁),但必须在这个 goroutine 里取:
 		// 同会话只有一个 worker,此刻没有任何人正用这条 Session —— 这是唯一能安全读
 		// 它字段的时刻。取完再进锁写回 entry,给 --status 用(见 statusText)。
 		dir, pwsh := e.sess.Dir(), e.sess.EngineStatus()
-		// 收工时再刷一次 lastUsed:空闲判据要按"最后一次用完"算,否则一条跑了
-		// 半小时的命令一走完,daemon 会立刻被判成空闲 —— 而 client 可能正要接着用。
 		d.mu.Lock()
 		d.running--
 		e.busy = false
 		e.lastUsed = time.Now()
+		// **d.lastUsed 也要在收工时刷一次**,这一点不能省:
+		// 空闲判据(watchdog)看的是 daemon 级的 d.lastUsed,而它原先只在
+		// pickSession / statusText 里更新 —— 于是一条跑得比 idle 还长的命令,
+		// 一结束就被判成"已经空闲了整整一个 idle",watchdog 下一个 tick 立刻
+		// 把 daemon 关掉。实测:idle=2s + `sleep 5`,命令结束后 1.2s 端口文件就没了;
+		// 而 idle=2s + `echo` 同条件仍存活。真实后果是任何超过 30 分钟的
+		// `go test` / 构建跑完之后,常驻 daemon 立刻消失、白丢一次冷启。
+		d.lastUsed = time.Now()
 		e.snapDir, e.snapPwsh = dir, pwsh
 		d.mu.Unlock()
 	}()

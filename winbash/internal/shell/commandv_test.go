@@ -61,6 +61,55 @@ func TestCommandVStillResolvesShellFunctions(t *testing.T) {
 	}
 }
 
+// ★ `command -v` 支持**多名字**,而且每个都必须答对。
+//
+// 修之前 guard 的判据是 `len(args)==3`(只覆盖一个名字),于是多名字那条整条漏拦:
+// mvdan/sh 原逻辑只查进程 PATH,对 ①/② 层内建与只在 Git Bash usr\bin 里的工具
+// 一律说"没有"。实测(宿主 PATH 不含 usr\bin 时)`command -v sed cat` 无任何输出、
+// exit 1,而 sed 与 cat 都跑得动 —— AI 写的 `command -v a b && …` 会静默短路。
+//
+// 三个方向都要钉:
+//  1. 全是我们的(内建/usr\bin 工具)→ 每个都答出来;
+//  2. 其中有一个不存在 → 非零(与 bash 的"只要有一个没找到就 exit 1"一致);
+//  3. 混有 mvdan 自己答得对的(如函数)→ 不误伤(那条路径仍是原逻辑)。
+func TestCommandVHandlesMultipleNames(t *testing.T) {
+	s := NewSession()
+	defer s.Close()
+
+	// 1. 两个都是 ① 层内建:都必须被答出来。
+	out, exit, errsOut := s.Run(context.Background(), `command -v ls cat`, false)
+	if exit != 0 {
+		t.Fatalf("command -v ls cat: exit=%d out=%q errs=%v", exit, out, errsOut)
+	}
+	lines := strings.Fields(strings.TrimSpace(out))
+	if len(lines) != 2 {
+		t.Fatalf("两个名字都应当有输出,got %q(期望两行)", out)
+	}
+	joined := strings.Join(lines, " ")
+	for _, want := range []string{"ls", "cat"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("输出里缺 %q: %q", want, out)
+		}
+	}
+
+	// 2. 混一个不存在的:必须非零 —— 否则 `command -v a b && …` 会走错分支。
+	if out, _, _ := s.Run(context.Background(),
+		`command -v ls definitely-not-installed-xyz; echo "rc=$?"`, false); !strings.Contains(out, "rc=1") {
+		t.Errorf("有一个名字不存在时应当非零,got %q", out)
+	}
+
+	// 3. 混一个函数:那条路径交给 mvdan/sh,不能因为"有一个要我们处理"就整体改写
+	//    而把函数答成"不存在"。这里断言函数仍被认出来(rc=0 且能调用)。
+	out, exit, errsOut = s.Run(context.Background(),
+		`f() { echo fn-ok; }; command -v f; f`, false)
+	if exit != 0 {
+		t.Fatalf("函数混在多名字路径里被误伤: exit=%d out=%q errs=%v", exit, out, errsOut)
+	}
+	if !strings.Contains(out, "fn-ok") {
+		t.Errorf("函数没被认出来(或调用失败): %q", out)
+	}
+}
+
 // ① 层的 `which` 本身:三个层各给什么,以及找不到时的行为。
 func TestWhichCommandReportsEachLayer(t *testing.T) {
 	s := NewSession()

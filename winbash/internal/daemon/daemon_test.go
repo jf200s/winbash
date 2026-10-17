@@ -27,7 +27,8 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-func uniqueEndpoint(t *testing.T) string {	t.Helper()
+func uniqueEndpoint(t *testing.T) string {
+	t.Helper()
 	return filepath.Join(t.TempDir(), "winbash-test.port")
 }
 
@@ -76,6 +77,62 @@ func TestDaemonExitsAfterIdleTimeout(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("daemon did not exit after idle timeout")
+	}
+}
+
+// ★ 一条跑得比 idle 还长的命令,结束后不能立刻被判成「已经空闲了整整一个 idle」。
+//
+// 这条钉的是 d.lastUsed 的刷新时机。修之前它只在 pickSession / statusText 里更新,
+// 而 watchdog 判的是它 —— 于是一条跑了 5s 的命令、在 idle=2s 下,一结束就让
+// since(d.lastUsed) 从 5s 起算 > 2s,watchdog 下一个 tick 就把 daemon 关了。
+//
+// 实测(修之前):idle=2s + `sleep 5`,命令结束后 1.2s 端口文件就没了;
+// 而 idle=2s + `echo` 同条件仍存活 —— 说明问题只在「命令跑得比 idle 久」时才显形。
+//
+// 真实后果:任何超过 30 分钟(默认 idle)的 `go test` / 构建跑完之后,常驻 daemon
+// 立刻消失,下一次调用要重新冷启 —— 正是本项目「常驻省时间」的反面。
+//
+// 判据用**端口文件**而不是 --status:后者自己会刷新 d.lastUsed,拿它当探针等于
+// 边测边改被测物(第一版就是这么写成假绿的)。
+func TestLongCommandDoesNotImmediatelyLookIdle(t *testing.T) {
+	if testing.Short() {
+		t.Skip("要真跑一条 5s 的命令")
+	}
+	ep := uniqueEndpoint(t)
+	const idle = 2 * time.Second
+
+	done := make(chan struct{})
+	go func() {
+		_ = Serve(ep, idle, DefaultReadTimeout)
+		close(done)
+	}()
+	// 等端口文件出现(daemon 起来了)。复用现有辅助,不另写一套轮询。
+	waitForEndpoint(t, ep, 10*time.Second)
+
+	// 发一条比 idle 长的命令。走真 client(与线上同一条路径)。
+	resp, err := client.Run(ep, "sleep 5; echo cmd-done", "", false)
+	if err != nil {
+		t.Fatalf("长命令失败: %v", err)
+	}
+	if resp.Exit != 0 {
+		t.Fatalf("长命令 exit=%d out=%q", resp.Exit, resp.Out)
+	}
+
+	// 命令刚结束:daemon 必须还活着。
+	// 1.2s < idle(2s),所以只要 d.lastUsed 在收工时被刷过就必然还活着;
+	// 若没刷,它会被算成"已空闲 5s+"而在下一次 tick(≤1s)就退。
+	time.Sleep(1200 * time.Millisecond)
+	if _, err := os.Stat(ep); err != nil {
+		t.Fatalf("长命令结束后 1.2s 端口文件就没了(daemon 已退出):" +
+			"说明 d.lastUsed 没在收工时刷新 —— 任何比 idle 长的命令跑完都会白丢常驻")
+	}
+
+	// 反过来也要成立:真的空闲超过 idle 之后必须**正常**退出,
+	// 否则这个修复就等于"永不退出",那也是坏的。
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("空闲超过 idle 之后 daemon 仍不退出:修复过头了")
 	}
 }
 
