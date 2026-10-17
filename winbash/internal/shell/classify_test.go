@@ -67,6 +67,34 @@ func TestPrintfDashVIsRejectedNotSilentlyMangled(t *testing.T) {
 	}
 }
 
+// ★ `printf '%(%Y)T'`(strftime 格式)不支持 —— README 已知差异表里有这条,
+// 但修之前它**没有任何测试**(全仓库搜 `strftime` / `%(` 在测试里零命中)。
+//
+// 行为本身是对的(mvdan/sh 报 `invalid format char: (` 并 exit 1),问题在于
+// **没人钉住它**:哪天上游把 strftime 实现了、或者我们把 printf 换成自己的实现,
+// 这条差异会**静默**地从「已知限制」变成「其实能用」或「静默输出错东西」,
+// 而文档还写着不支持。
+//
+// 所以这里钉两件事:非零退出(不能假装成功)、以及把不支持的格式名点出来
+// (而不是吐一个看起来像日期的垃圾)。
+func TestPrintfStrftimeFormatIsRejectedLoudly(t *testing.T) {
+	s := NewSession()
+	defer s.Close()
+
+	out, exit, errsOut := s.Run(context.Background(), `printf '%(%Y)T\n'`, false)
+	if exit == 0 {
+		t.Fatalf("strftime 格式应当报错退出,实际 exit=0 out=%q", out)
+	}
+	// 不能静默输出一段像模像样的东西(比如把 %(%Y)T 原样打出来)。
+	if strings.Contains(out, "%(") {
+		t.Fatalf("不支持的格式被静默原样输出了: %q", out)
+	}
+	combined := out + strings.Join(errsOut, " ")
+	if !strings.Contains(combined, "format") && !strings.Contains(combined, "格式") {
+		t.Fatalf("报错没有指出是格式问题,排查会没有抓手: %q", combined)
+	}
+}
+
 func TestProcessSubstitutionIsRejectedBeforeRunning(t *testing.T) {
 	// 实测缺口：Windows 上 mvdan/sh 会把 TODO 文本打到 stdout
 	//

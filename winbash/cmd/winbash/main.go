@@ -124,6 +124,17 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	// --serve / --stop / --status 是三个**互斥**的管理动作,必须三选一。
+	//
+	// 不校验的后果不是"忽略一个"那么轻 —— 它们按 if 顺序取第一个,而 `if serve` 在最前,
+	// 于是实测:`--serve --stop` **真的去 serve 并常驻**,使用者想停掉 daemon,却把
+	// 自己挂在一个前台 daemon 上;`--serve --status` 同样挂住。这是「不静默做错事」
+	// 的直接违反,而且是最容易踩到的一种(两个开关都在手边、以为可以一起给)。
+	if n := btoi(serve) + btoi(stop) + btoi(status); n > 1 {
+		fmt.Fprintln(stderr, "winbash: --serve / --stop / --status 是三个互斥的管理动作,只能给一个")
+		return 2
+	}
+
 	if serve {
 		if err := daemon.Serve(endpoint, idle, daemon.DefaultReadTimeout); err != nil {
 			fmt.Fprintln(stderr, "winbash: serve:", err)
@@ -190,6 +201,14 @@ func run(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, e)
 	}
 	return resp.Exit
+}
+
+// btoi 把 bool 当 0/1 用,给「有几个互斥开关被给了」这种计数用。
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // defaultEndpoint 是端口文件的路径。按用户名区分,避免同机多用户互踩。

@@ -301,7 +301,13 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 
 ## 已知差异与限制
 
-与真 bash 相比的差异(全部有测试钉住,见 `internal/shell/corpus_test.go`):
+与真 bash 相比的差异。**这些差异的回归测试不在一个文件里** —— 原先这句话写的是「全部有测试钉住,见 `internal/shell/corpus_test.go`」,那是不准确的(那张表有 31 条,而 `corpus_test.go` 里只有一个 Test 函数)。实际分布是这样:
+
+- **`corpus_test.go` / `pbb_corpus_test.go` 是差分测试**(拿真 bash 的实际输出当参照)。它们的 `known:` 语料是**豁免说明** —— 「这几条差异存在,比对时跳过」。所以一条差异被列进 `known:`,只说明它被**承认**,不说明它被**钉住**。这两件事别混。
+- 真正把行为写死的是各层专项测试:`classify_test.go`(printf/trap 类缺口)、`commandv_test.go`、`grep_test.go` + `grep_binary_test.go` + `grep_classes_test.go` + `grep_class_scanner_test.go`、`ls_test.go`、`cat_test.go`、`msyspath_e2e_test.go`、`msysargv_test.go`、`trapguard_test.go`、`oilspec_gaps_test.go`、`internal/winmgmt/pwshcmd_test.go`、`internal/daemon/guard_test.go`、`cmd/winbash/e2e_test.go`。
+- 有 6 条只是**弱覆盖**(测试覆盖了相邻行为,但没有逐字钉住这条差异):显式 `Git\bin\bash.exe` 的第二跳吃引号、`grep -E 'a*?'` 的匹配数差异、`ls` 默认不列点文件、`ls -l` 的四列、`grep -r` 的 `./` 前缀、`pwsh -c "$env:X"` 的空展开。改这些地方时不能指望测试变红。**这份清单是照测试注释与断言盘的,不是机器判定** —— 某个用例后来被加强了,这里就会偏保守(写"弱"而其实够强),不会反过来。
+
+**原先完全没有测试钉住的 2 条,本轮已补上**:`cat -n` 的号码格式(`%6d<TAB>`、跨文件累加,见 `cat_test.go` 的 `TestCatNumberedUsesSixWideTabFormat` / `TestCatNumberedKeepsCountingAcrossFiles`,以及未实现开关要响亮拒绝的 `TestCatUnimplementedFlagsAreRejected`)与 `printf '%(%Y)T'`(strftime 报 `invalid format char` 且 exit 1,见 `classify_test.go` 的 `TestPrintfStrftimeFormatIsRejectedLoudly`)。补之前这两条是「文档承认、行为也对、但改坏不会变红」的状态。
 
 | 现象 | 说明 |
 |---|---|

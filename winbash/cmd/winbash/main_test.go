@@ -126,6 +126,41 @@ func TestUnknownFlagIsAUsageError(t *testing.T) {
 }
 
 // --fresh 只对「执行脚本」这条路有意义。和 --serve/--stop/--status 一起给时
+// ★ --serve / --stop / --status 三者互斥,任意两个同用都是用法错误。
+//
+// 修之前它们按 if 顺序取第一个,而 `if serve` 在最前 —— 于是实测:
+//
+//	--serve --stop    → **真的去 serve 并常驻**(超时 4s 都没返回)
+//	--serve --status  → 同样挂住
+//
+// 这比"忽略一个"严重得多:使用者想停掉 daemon,结果把自己挂在一个前台 daemon 上。
+// 两个开关都在手边、以为可以一起给,是最容易踩的一种。
+func TestControlFlagsAreMutuallyExclusive(t *testing.T) {
+	combos := [][]string{
+		{"--serve", "--stop"},
+		{"--serve", "--status"},
+		{"--stop", "--status"},
+		{"--serve", "--stop", "--status"},
+	}
+	for _, c := range combos {
+		// 这里不会真的挂住:互斥校验在 `if serve` 之前。若它退化了,这个测试会卡住 ——
+		// go test 的默认超时会把整包判红,不会静默通过。
+		code, _, errOut := runCLI(t, c...)
+		if code != 2 {
+			t.Errorf("%v: code=%d want 2(互斥的管理动作不能静默取第一个)", c, code)
+		}
+		if !strings.Contains(errOut, "互斥") {
+			t.Errorf("%v: stderr 应当说明互斥,got %q", c, errOut)
+		}
+	}
+	// 单独给的时候不能被误伤。
+	for _, ctl := range []string{"--stop", "--status"} {
+		if code, _, errOut := runCLI(t, ctl); code == 2 {
+			t.Errorf("单独 %s 不该是用法错误,stderr=%q", ctl, errOut)
+		}
+	}
+}
+
 // 报用法错误,而不是默默忽略 —— 静默忽略会让人以为隔离生效了。
 func TestFreshWithControlFlagsIsAUsageError(t *testing.T) {
 	for _, ctl := range []string{"--serve", "--stop", "--status"} {
