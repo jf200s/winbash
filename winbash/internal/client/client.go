@@ -53,6 +53,11 @@ type Option func(*ipc.Request)
 // set -e / trap 也不留给后面的命令。语义与代价见 ipc.Request.Fresh。
 func Fresh() Option { return func(r *ipc.Request) { r.Fresh = true } }
 
+// Session 让这条命令落到指定的会话里。空串等同于「不指定」(默认会话)。
+//
+// 同名会话内仍然串行且状态持久;不同名会话之间才并行。语义见 ipc.Request.Session。
+func Session(name string) Option { return func(r *ipc.Request) { r.Session = name } }
+
 // RunTimeout 同 Run,但给整个往返设一个上限(timeout<=0 表示不设限)。
 //
 // 这个上限会同时传给 daemon(见 ipc.Request.TimeoutMS):client 放弃不代表

@@ -29,6 +29,7 @@ const maxMessageBytes = 64 << 20
 //	1 一次性 stdin:Request.Stdin []byte 走 JSON base64,受 64MiB 帧上限约束。
 //	2 流式 stdin:请求头之后跟**裸字节流**,不再缓存到内存(理由见 StdinMode)。
 //	3 Request.Fresh:一条命令可以要求跑在**一次性会话**里(理由见 Fresh 字段)。
+//	4 Request.Session:一条命令可以指定落到哪个**会话**里(理由见 Session 字段)。
 //
 // 1 → 2 必须**两端同时**升级:如果 client 切到流式、daemon 还是 1,那么 daemon
 // 只解请求头就去执行,根本不读后面那串字节 —— 于是 stdin 静默丢失,而脚本照样
@@ -38,8 +39,11 @@ const maxMessageBytes = 64 << 20
 // 就忽略 —— 于是 `--fresh` 静默变成「复用会话」,调用方以为隔离了、其实没有。
 // 这种「看起来生效、实际没生效」正是本项目所有版本检查要防的形态。
 //
+// 3 → 4 同样必须同时升级:旧 daemon 不认识 session 字段,会当没写 —— 于是
+// `--session build` 静默退化成默认会话,调用方以为已经隔离了。与 2 → 3 是同一个理由。
+//
 // 改动协议时把它 +1,并在两端的检查处同步更新说明。
-const ProtoVersion = 3
+const ProtoVersion = 4
 
 // StdinMode 的取值:一次请求的 stdin 走什么形态。
 const (
@@ -117,6 +121,18 @@ type Request struct {
 	// 代价:② 层的常驻 pwsh 引擎挂在 Session 上,所以 fresh 请求一旦用到 ② 层,
 	// 要重新拉起一次(约 350ms);只用 ①/③ 层没有额外开销。
 	Fresh bool `json:"fresh,omitempty"`
+
+	// Session 是要落到的会话名。空串 = 默认会话(与引入本字段之前完全等价)。
+	//
+	// 同名会话内严格串行且会话状态(变量/函数/set -e/trap)照旧跨命令持久;不同
+	// 会话名之间才真正并行。这样「跨命令状态持久」和「并发执行」都保住了 ——
+	// 代价是状态边界从整个 daemon 缩到一个会话,而这是并行的必要条件:
+	// shell.Session 里的 interp.Runner 本身不并发安全。
+	//
+	// 为什么必须显式传(而不是自动识别会话):client 每次调用都是**新进程**,没有
+	// 稳定身份可用来自动路由。CLI 侧由 --session 或环境变量 WINBASH_SESSION_NAME
+	// 提供(见 cmd/winbash/main.go)。
+	Session string `json:"session,omitempty"`
 }
 
 // Response 是 daemon 返回给客户端的一条结果。
