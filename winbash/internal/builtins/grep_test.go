@@ -66,12 +66,79 @@ func TestGrepMatchesLineAndPrintsIt(t *testing.T) {
 	}
 }
 
-func TestGrepDefaultIsLiteralNotRegex(t *testing.T) {
+// 默认方言是 **BRE**,与真 grep 一致:`.` 是元字符(匹配任意字符),不是字面点。
+//
+// 这条测试原先断言的是**相反**的事("dot must be literal without -E"),依据是
+// compileGrep 注释里那句「与 BRE 在 AI 常用场景下等价」—— 那句是错的。实测真 grep
+// 对同一输入 `printf 'abc\n' | grep -c 'a.c'` 给 1,而旧实现给 0:静默少匹配。
+func TestGrepDefaultIsBRE(t *testing.T) {
 	r := strings.NewReader("a.c\nabc\n")
 	var out bytes.Buffer
 	Grep(context.Background(), ".", []string{"a.c"}, r, &out, io.Discard)
-	if out.String() != "a.c\n" {
-		t.Fatalf("dot must be literal without -E: %q", out.String())
+	// `.` 是元字符,所以 `a.c` 两行都匹配 —— 真 grep 的 BRE 就是这个结果。
+	if out.String() != "a.c\nabc\n" {
+		t.Fatalf("dot must be a metacharacter without -E: %q", out.String())
+	}
+}
+
+// BRE 的锚点、重复与分组:这几条曾静默给错值(全是 0),而它们是最高频的写法。
+//
+// 期望值**全部来自真 grep**(`/usr/bin/grep` 对同一份输入),不是手写 —— 手写的第一版
+// 就把 `\(ab\)c` 和 `a\.c` 写错了,正是本项目反复强调的那条:参照物必须是真的。
+func TestGrepBreAnchorsRepetitionGroups(t *testing.T) {
+	const input = "abc\nabbbc\nxyz\n"
+	cases := []struct{ pattern, want string }{
+		{"^abc", "abc\n"},          // 行首锚定
+		{"abc$", "abc\n"},          // 行尾锚定
+		{"^abc$", "abc\n"},         // 整行
+		{"ab*c", "abc\nabbbc\n"},   // `*` 重复
+		{"[ab]bc", "abc\nabbbc\n"}, // 字符类
+		{"[ab]", "abc\nabbbc\n"},   // 字符类
+		{"a.c", "abc\n"},           // `.` 是通配
+		{"a\\.c", ""},              // \. 是字面点(这份输入里没有)
+		{"\\(ab\\)c", "abc\n"},     // BRE 分组
+		{"a\\(b\\)", "abc\nabbbc\n"},
+		{"x\\{2\\}", ""},           // BRE 的区间重复 \{n\}
+		{"^$", ""},                 // 空行锚定
+	}
+	for _, c := range cases {
+		var out bytes.Buffer
+		Grep(context.Background(), ".", []string{c.pattern}, strings.NewReader(input), &out, io.Discard)
+		if out.String() != c.want {
+			t.Errorf("pattern %q: got %q, want %q(真 grep 的 BRE 行为)", c.pattern, out.String(), c.want)
+		}
+	}
+}
+
+// BRE 里裸的 `( ) { } + ? |` 是**字面**,不是元字符 —— 这是与 -E 最容易搞混的一对。
+// 全部期望值同样取自真 grep。
+func TestGrepBrePlainParensAreLiteral(t *testing.T) {
+	cases := []struct{ pattern, input, want string }{
+		{"a+b", "a+b\nab\n", "a+b\n"},
+		{"a?b", "a?b\nab\n", "a?b\n"},
+		{"a|b", "a|b\na\n", "a|b\n"},
+		{"(ab)", "(ab)\nab\n", "(ab)\n"},
+		{"a{2}", "a{2}\naa\n", "a{2}\n"},
+	}
+	for _, c := range cases {
+		var out bytes.Buffer
+		Grep(context.Background(), ".", []string{c.pattern}, strings.NewReader(c.input), &out, io.Discard)
+		if out.String() != c.want {
+			t.Errorf("pattern %q: got %q, want %q(BRE 里这些是字面)", c.pattern, out.String(), c.want)
+		}
+	}
+}
+
+// `\d` 这类"反斜杠 + 普通字符"是本项目**刻意**与 GNU 不同的地方,单独钉住。
+//
+// GNU grep 忽略反斜杠,`grep '\d'` 会同时匹配 `\d` 与 `d`;我们只匹配**字面**的 `\d`
+// (两个字符)。理由:让使用者在拿到"没匹配"时不会误以为 Perl 简写生效了。
+// 这条差异记在 README 已知差异表里 —— 测试在这里是为了它哪天变了能被发现。
+func TestGrepBackslashNonMetaIsLiteralNotGNU(t *testing.T) {
+	var out bytes.Buffer
+	Grep(context.Background(), ".", []string{"\\d"}, strings.NewReader("\\d\nd\n"), &out, io.Discard)
+	if out.String() != "\\d\n" {
+		t.Fatalf("`\\d` 应当只匹配字面的 \\d(GNU 会连 d 一起匹配):%q", out.String())
 	}
 }
 

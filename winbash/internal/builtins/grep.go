@@ -251,10 +251,86 @@ func afterPatternOptionErr(opt string) error {
 	}
 }
 
+// breToEre 把 POSIX BRE(grep 的默认方言)翻译成 ERE,好交给 CompilePOSIX。
+//
+// 为什么需要它:这里原本用 QuoteMeta 把整个 pattern 当**字面**,注释还写着
+// 「与 BRE 在 AI 常用场景下等价」—— 实测是错的。真 grep 默认是 BRE,而
+// `. * [ ] ^ $ \` 在 BRE 里**全是元字符**,于是下面这些高频写法全部**静默给错值**
+// (同一份 `abc\nabbbc\nxyz\n` 输入,`grep -c` 的结果):
+//
+//	pattern   winbash(旧)   真 grep
+//	^abc      0             1
+//	abc$      0             1
+//	a.c       0             1
+//	ab*c      0             2
+//	[ab]      0             2
+//
+// `grep -q '^foo' file` 是最常见的一类判断,静默不匹配会让 if 直接走错分支 ——
+// 比报错坏得多,也正是本项目底线要消灭的形态。
+//
+// 两边真正的差别只有下面这几对,逐字符翻过去即可:
+//
+//	BRE \( \) \{ \} \+ \? \|   → ERE ( ) { } + ? |           分组 / 重复 / 交替
+//	BRE 裸 ( ) { } + ? |       → ERE \( \) \{ \} \+ \? \|     它们在 BRE 里是**字面**
+//	BRE \X(X 是 . * [ ] ^ $ \) → ERE \X                      两边都要转义才是字面
+//	BRE \X(X 是普通字符)       → ERE \\X                     沿用既有决策:\d 找字面 "\d"
+//	BRE 裸 . * ^ $ / […] 类     → 原样                        两边语义一致
+//
+// 最后一条里那个"字面 `\d`"是**刻意**的、与 GNU grep 不同(GNU 会忽略反斜杠只匹配
+// `d`):本项目选择让 `grep '\d'` 报出它找的是哪两个字符,而不是悄悄退化成 Perl 简写。
+// 这条差异记在 README 的已知差异表里。
+//
+// 字符类内部两边规则相同(类内的 `\` 只是普通字符),所以整段照抄 —— 交给
+// normalizeEreClasses 去修 Go 不认类内 `\` 的问题,边界由 classEnd 判定(唯一实现)。
+func breToEre(pattern string) string {
+	var b strings.Builder
+	b.Grow(len(pattern) + 8)
+	for i := 0; i < len(pattern); {
+		switch c := pattern[i]; c {
+		case '\\':
+			if i+1 >= len(pattern) {
+				// 孤立的反斜杠留在末尾:转成 `\\`(字面反斜杠)而不是让 CompilePOSIX
+				// 抛一句没有上下文的语法错。
+				b.WriteString(`\\`)
+				i++
+				continue
+			}
+			n := pattern[i+1]
+			switch {
+			case strings.IndexByte("(){}+?|", n) >= 0:
+				// BRE 的元字符:ERE 里直接写。
+				b.WriteByte(n)
+			case strings.IndexByte(`.*[]^$\`, n) >= 0:
+				// 两边都要转义才是字面(\. \* \[ \] \^ \$ \\)。
+				b.WriteByte('\\')
+				b.WriteByte(n)
+			default:
+				// 既有决策:`\d` 找的是**字面**的 `\d` 两个字符。
+				b.WriteString(`\\`)
+				b.WriteByte(n)
+			}
+			i += 2
+		case '[':
+			// 字符类整段照抄,边界交给 classEnd(POSIX 类规则唯一那份实现)。
+			end := classEnd(pattern, i)
+			b.WriteString(pattern[i:end])
+			i = end
+		case '(', ')', '{', '}', '+', '?', '|':
+			// 这些在 BRE 里是**字面**,进 ERE 必须转义。
+			b.WriteByte('\\')
+			b.WriteByte(c)
+			i++
+		default:
+			b.WriteByte(c)
+			i++
+		}
+	}
+	return b.String()
+}
+
 // compileGrep 按方言决策编译 pattern,失败时返回「问题 + 怎么办」两行文案。
 //
-// 默认(无 -E):QuoteMeta 后按字面匹配。这与 grep 的 BRE 在 AI 常用场景下等价 ——
-// `grep 'a.c' f` 在真 grep 里也匹配字面 a.c,把点当通配才是意外。
+// 默认(无 -E):先把 BRE 翻成 ERE(见 breToEre),再走与 -E 相同的路径。
 //
 // -E:走 regexp.CompilePOSIX,即 POSIX ERE,最接近 `grep -E`。
 // Perl 简写(\d \w \s \D \W \S)在这里没有定义,先显式拒收再编译 ——
@@ -262,15 +338,10 @@ func afterPatternOptionErr(opt string) error {
 // 但那条信息不会告诉使用者「你写的是 Perl 方言」,更不会给出替代写法。
 func compileGrep(pattern string, opts *grepOpts) (re *regexp.Regexp, problem, remedy string) {
 	if !opts.extended {
-		lit := regexp.QuoteMeta(pattern)
-		if opts.ignoreCase {
-			lit = "(?i)" + lit
-		}
-		r, err := regexp.Compile(lit)
-		if err != nil {
-			return nil, "模式无法编译: " + err.Error(), "检查模式里是否有孤立的反斜杠"
-		}
-		return r, "", ""
+		// 默认方言 = 真 grep 的 **BRE**。翻译成 ERE 之后走与 -E 完全相同的编译
+		// 路径:两种方言的差别只在翻译层,后面的方言校验、-i、leftmost-longest
+		// 因此只有一份实现(见 breToEre 里那张对照表)。
+		pattern = breToEre(pattern)
 	}
 
 	if cls, ok := firstPerlClass(pattern); ok {

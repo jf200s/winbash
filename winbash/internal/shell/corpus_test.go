@@ -165,6 +165,21 @@ var bashCorpus = []corpusCase{
 	{script: `x=$(printf 'a\nb'); echo $x`},
 	{script: `echo a b c | wc -w`},
 	{script: `printf 'a\nb\n' | grep b`},
+	// BRE 方言:锚点 / 重复 / 字符类 / 分组。这几条曾经**静默给错值** —— 默认方言
+	// 被实现成"整串字面",而真 grep 的 BRE 里 `. * [ ] ^ $ \` 全是元字符,于是
+	// `grep '^abc'`、`grep 'a.c'` 一律 0 匹配、exit 1。`grep -q '^foo'` 这类判断
+	// 会直接走错分支,而且没有任何提示。
+	{script: `printf 'abc\nabbbc\nxyz\n' | grep '^abc'`},
+	{script: `printf 'abc\nabbbc\nxyz\n' | grep 'abc$'`},
+	{script: `printf 'abc\nabbbc\nxyz\n' | grep 'a.c'`},
+	{script: `printf 'abc\nabbbc\nxyz\n' | grep 'ab*c'`},
+	{script: `printf 'abc\nabbbc\nxyz\n' | grep '[ab]bc'`},
+	{script: `printf 'abc\nabbbc\nxyz\n' | grep '\(ab\)c'`},
+	{script: `printf 'a\nb\n' | grep -c '^a$'`},
+	{script: `printf 'foo\nbar\n' | grep -q '^foo' && echo hit`},
+	// BRE 里裸的 `+ ? | ( ) { }` 是**字面**,不能因为"看起来像正则"就当成元字符。
+	{script: `printf 'a+b\nab\n' | grep 'a+b'`},
+	{script: `printf 'a|b\na\n' | grep 'a|b'`},
 	{script: `echo hello | tr a-z A-Z`},
 	{script: `seq 3 | tail -1`},
 	{script: `echo a:b | cut -d: -f2`},
