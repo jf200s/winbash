@@ -18,6 +18,7 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"os/exec"
@@ -30,10 +31,19 @@ import (
 )
 
 // newTestDaemon 造一个只够测记账逻辑的 daemon(sessions 必须是非 nil 的 map)。
+//
+// shutdownDone / stopCtx / stopStop 也一并建好 —— 少了它们,任何走到 shutdown 的
+// 代码路径都会以 `close of nil channel` 或 `nil func` 崩掉,而那种崩溃会**掩盖**
+// 测试本该给出的诊断信息(实测踩过:watchdog 的变异验证一开始只看到 panic,
+// 看不出是哪条断言该红)。
 func newTestDaemon() *daemon {
+	stopCtx, stopStop := context.WithCancel(context.Background())
 	return &daemon{
-		sessions: map[string]*sessionEntry{},
-		done:     make(chan struct{}),
+		sessions:     map[string]*sessionEntry{},
+		done:         make(chan struct{}),
+		shutdownDone: make(chan struct{}),
+		stopCtx:      stopCtx,
+		stopStop:     stopStop,
 	}
 }
 
@@ -353,6 +363,42 @@ func TestPickSessionRejectsAtLimitButDefaultDoesNotCount(t *testing.T) {
 	// 清理:把建出来的会话关掉,免得测试结束时留下 pwsh 之类的余留。
 	for _, e := range d.sessions {
 		_ = e.sess.Close()
+	}
+}
+
+// ★ daemon 开始关停后,pickSession 必须**立刻拒绝**,不能还在建会话。
+//
+// 这是 pickSession 的第一道关(拿锁后先看 stopping)。它的意义:关停流程已经
+// 开始摘会话表了,此刻再建一条新会话,那条会话的 worker 没人负责关 —— 泄漏一个
+// Session(② 层跑过就会有常驻 pwsh)。
+//
+// 白盒测这条是合适的:端到端要精确落在"stopping 已置位、但 daemon 还没停止监听"
+// 的窗口里,靠 sleep 碰运气必然 flaky。而这里的语义是确定的纯逻辑。
+//
+// **这条测试的鉴别力边界**(变异验证实测出来,写下来免得下一个人误判):
+// 把**第一处** stopping 检查改成 `d.stopping && false`,这条测试仍然绿 —— 因为
+// pickSession 后面还有第二处检查(锁外建完 Session 之后那次),它同样会 return
+// error 并 Close 掉白建的那份。两者**功能等价**,差别只是多花几微秒建一个 Session
+// 再关掉。所以第一处是**性能优化**(避免白建),第二处才是正确性保证。
+// 这条测试钉的是那个对外契约(「stopping 时必须报错、且不入表」),两处检查任一
+// 存在都能满足 —— 想钉住"第一处必须存在"就得数 Session 分配次数,那是实现细节,
+// 不值得为它写测试。把第一处删掉也不会出事,只是白建一份。
+func TestPickSessionRejectsWhenStopping(t *testing.T) {
+	d := newTestDaemon()
+	d.stopping = true
+
+	if _, err := d.pickSession("any"); err == nil {
+		t.Fatal("stopping 时 pickSession 必须报错")
+	} else if !strings.Contains(err.Error(), "正在退出") {
+		t.Fatalf("错误信息没说清原因: %v", err)
+	}
+	// 默认会话也一样 —— 关停中不该有任何新会话被建出来。
+	if _, err := d.pickSession(""); err == nil {
+		t.Fatal("stopping 时默认会话也不该被建出来")
+	}
+	// 一条都不该进表。
+	if n := len(d.sessions); n != 0 {
+		t.Fatalf("关停中还建出了 %d 条会话", n)
 	}
 }
 
