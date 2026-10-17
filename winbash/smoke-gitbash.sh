@@ -77,6 +77,12 @@ check "cat 往返"            "hello" "$(wb -c "echo hello > $TXT; cat $TXT")"
 check "管道 ls|grep"        "1"     "$(wb -c 'ls | grep -c winbash')"
 check "cat 二进制安全"      "5"     "$(wb -c "printf '\000\377\376\001\200' > $BIN; cat $BIN" | wc -c | tr -d ' ')"
 check "ls|head|wc 管链"     "3"     "$(wb -c 'ls | head -3 | wc -l' | tr -d ' ')"
+# ls -l 是 7 列(权限 链接数 属主 属组 大小 时间 名字),与真 bash 对齐;
+# 第一行必须是 total —— 脚本靠 `tail -n +2` 跳过它,少了就会吃掉第一条数据。
+check "ls -l 首行是 total"    "1"  "$(wb -c 'ls -l' | head -1 | grep -c '^total ' | tr -d ' ')"
+check "ls -l 至少 7 列"       "1"  "$(wb -c 'ls -l' | sed -n 2p | awk '{if (NF >= 7) print 1; else print 0}')"
+check "ls -l 单文件无 total"  "0"  "$(wb -c 'ls -l winbash.exe' | grep -c total | tr -d ' ')"
+check "ls 短格式无装饰"       "0"  "$(wb -c 'ls' | grep -c 'total\|rwx\|rw-' | tr -d ' ')"
 check "svc list 三列"       "3"     "$(wb -c 'svc list --running' | head -1 | awk -F'\t' '{print NF}' | tr -d ' ')"
 
 echo "-- 第二类:值正确性(本项目的灵魂)"
