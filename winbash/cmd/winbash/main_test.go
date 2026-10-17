@@ -9,7 +9,23 @@ import (
 	"time"
 
 	"winbash/internal/daemon"
+	"winbash/internal/shell"
 )
+
+// TestMain 先摘掉 WINBASH_SESSION。
+//
+// 本包测的是 **CLI 自己的行为**,而它经常在 winbash 会话里被跑 —— README「开发」节
+// 给的命令就是 `go test ./...`,而那时执行它的 shell 正是 winbash。③ 层会把
+// EnvNested=1 派给所有子进程,测试进程继承下来后,client 把每次调用都当成"嵌套",
+// `--status`/`--stop` 刻意拒绝,于是 3 条 daemon 管理用例必然红 ——
+// 而且失败信息看着像产品 bug(用户就这么撞上过)。
+//
+// 用 TestMain 而不是每个用例 t.Setenv:这个包**每一个**用例都该在非嵌套前提下跑,
+// 一处声明比 N 处复制更难漏。测试对自身环境的要求要自己说,不能靠"你恰好在 Git Bash 里跑"。
+func TestMain(m *testing.M) {
+	_ = os.Unsetenv(shell.EnvNested)
+	os.Exit(m.Run())
+}
 
 // run 现在接收 args 与 stdout/stderr,所以能直接在测试里驱动 —— 这填掉了审计报告
 // 点出的 cmd/winbash 0% 覆盖。原先它读**全局** flag.CommandLine 且只写 os.Stdout/

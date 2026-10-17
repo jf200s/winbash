@@ -36,6 +36,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# 构建残留会让下面「数含 winbash 的条目」那两条断言多算一个:daemon 常驻时
+# `go build` 覆盖运行中的 exe,Windows 会把旧的改名成 winbash.exe~ 留在原地
+# (不是偶发)。它不是源码,清掉才算干净的基线;被占用时删不掉也不影响其它断言。
+rm -f winbash.exe~ 2>/dev/null
+
 echo "-- 第一类:AI 常用命令集"
 check "ls 列出自己"        "1"     "$($EXE -c 'ls' | grep -c '^winbash.exe$')"
 check "cat 往返"            "hello" "$($EXE -c 'echo hello > wb-smoke.txt; cat wb-smoke.txt')"
