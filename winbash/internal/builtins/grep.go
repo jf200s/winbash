@@ -99,7 +99,10 @@ func Grep(ctx context.Context, cwd string, argv []string, in io.Reader, out, err
 
 			info, serr := os.Stat(abs)
 			if serr != nil {
-				report(serr, "先确认路径存在,或用 winbash -c 'ls 目录' 看有哪些名字")
+				fmt.Fprintln(errw, errs.Errorf("grep",
+					userPathProblem("cannot access", f, serr, abs),
+					"先确认路径存在,或用 winbash -c 'ls 目录' 看有哪些名字"))
+				code = errs.ExitError
 				continue
 			}
 

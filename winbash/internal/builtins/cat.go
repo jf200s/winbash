@@ -3,6 +3,7 @@ package builtins
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -41,7 +42,9 @@ func Cat(ctx context.Context, cwd string, argv []string, in io.Reader, out, errw
 	for _, name := range files {
 		if name == "-" {
 			if cerr := copyCat(out, SafeStdin(in), numbered, &lineNo); cerr != nil {
-				fmt.Fprintln(errw, errs.Errorf("cat", cerr.Error(), "读标准输入时出错"))
+				fmt.Fprintln(errw, errs.Errorf("cat",
+					catCopyProblem("(standard input)", cerr),
+					catCopyRemedy(cerr)))
 				code = errs.ExitError
 			}
 			continue
@@ -58,7 +61,22 @@ func Cat(ctx context.Context, cwd string, argv []string, in io.Reader, out, errw
 		if err != nil {
 			// 与 bash 一致:打不开这个就跳过,继续处理后面的,只把退出码置非零。
 			// 直接 return 会让 `cat a b` 在 a 缺失时连 b 都读不到。
-			fmt.Fprintln(errw, errs.Errorf("cat", err.Error(), "确认文件存在,或用 winbash -c 'ls 目录' 查看"))
+			fmt.Fprintln(errw, errs.Errorf("cat",
+				userPathProblem("cannot open", name, err, abs),
+				"确认文件存在,或用 winbash -c 'ls 目录' 查看"))
+			code = errs.ExitError
+			continue
+		}
+
+		// 目录必须在这里拦住:**Windows 上 os.Open 一个目录是成功的**,失败要到
+		// 第一次 Read 才发生,而且报的是 `Incorrect function.` —— 实测原先它一路
+		// 掉进下面那个"写输出时出错"的分支,归因完全错了(实际是读不出来)。
+		// 真 bash 对 `cat 某目录` 给的是 `Is a directory`。
+		if fi, serr := f.Stat(); serr == nil && fi.IsDir() {
+			f.Close()
+			fmt.Fprintln(errw, errs.Errorf("cat",
+				fmt.Sprintf("cannot read '%s': Is a directory", name),
+				"要看目录内容用 ls;要递归就用 find"))
 			code = errs.ExitError
 			continue
 		}
@@ -66,11 +84,50 @@ func Cat(ctx context.Context, cwd string, argv []string, in io.Reader, out, errw
 		cerr := copyCat(out, f, numbered, &lineNo)
 		f.Close()
 		if cerr != nil {
-			fmt.Fprintln(errw, errs.Errorf("cat", cerr.Error(), "写输出时出错"))
+			fmt.Fprintln(errw, errs.Errorf("cat",
+				catCopyProblem(name, cerr),
+				catCopyRemedy(cerr)))
 			code = errs.ExitError
 		}
 	}
 	return code
+}
+
+// catCopyError 标明 copyCat 的错误是**读**出来的还是**写**出去的。
+//
+// 为什么要区分:原先两种情况共用一句"写输出时出错",于是 `cat 目录`(读错误)
+// 被报成写失败 —— 实测误导过一次。真 bash 的措辞也分开:`Is a directory` 是读侧,
+// 管道断开(Broken pipe)是写侧。
+type catCopyError struct {
+	op  string // "read" 或 "write"
+	err error
+}
+
+func (e *catCopyError) Error() string { return e.err.Error() }
+func (e *catCopyError) Unwrap() error { return e.err }
+
+// catCopyProblem 生成 copyCat 失败时的"问题"行。
+func catCopyProblem(subject string, err error) string {
+	var ce *catCopyError
+	if errors.As(err, &ce) && ce.op == "write" {
+		// 写侧失败没有文件名可言:对象是管道/终端,不是被读的那个文件。
+		return "cannot write output: " + posixErrText(ce.err, "")
+	}
+	verb := "cannot read"
+	if subject == "(standard input)" {
+		verb = "cannot read standard input:"
+		return fmt.Sprintf("%s %s", verb, posixErrText(err, ""))
+	}
+	return userPathProblem(verb, subject, err, "")
+}
+
+// catCopyRemedy 给出对应的下一步。
+func catCopyRemedy(err error) string {
+	var ce *catCopyError
+	if errors.As(err, &ce) && ce.op == "write" {
+		return "输出端已关闭(常见于 `cat 大文件 | head`);这不影响文件本身"
+	}
+	return "确认这个文件可读(权限、是否被占用),或换一个文件试"
 }
 
 // parseCatArgs 拆出开关与文件名。
@@ -118,8 +175,25 @@ func parseCatArgs(argv []string) (numbered bool, files []string, err error) {
 // 逐行读而不是给每行补 \n:最后一行没有换行符时也要原样输出,不能凭空加一个。
 func copyCat(out io.Writer, r io.Reader, numbered bool, lineNo *int) error {
 	if !numbered {
-		_, err := io.Copy(out, r)
-		return err
+		// 显式读写循环而不是 io.Copy:io.Copy 不告诉我们错误来自读侧还是写侧,
+		// 而调用方要据此选措辞(`cannot read 'x'` vs `cannot write output`)。
+		// 实测过 `cat 目录`:Windows 上 open 目录成功、第一次 Read 才失败,
+		// 若两侧混为一谈就会报成"写输出时出错" —— 归因完全反了。
+		buf := make([]byte, 64*1024)
+		for {
+			n, rerr := r.Read(buf)
+			if n > 0 {
+				if _, werr := out.Write(buf[:n]); werr != nil {
+					return &catCopyError{op: "write", err: werr}
+				}
+			}
+			if rerr != nil {
+				if rerr == io.EOF {
+					return nil
+				}
+				return &catCopyError{op: "read", err: rerr}
+			}
+		}
 	}
 	br := bufio.NewReaderSize(r, 64*1024)
 	for {
@@ -127,17 +201,17 @@ func copyCat(out io.Writer, r io.Reader, numbered bool, lineNo *int) error {
 		if len(raw) > 0 {
 			*lineNo++
 			if _, werr := fmt.Fprintf(out, "%6d\t", *lineNo); werr != nil {
-				return werr
+				return &catCopyError{op: "write", err: werr}
 			}
 			if _, werr := out.Write(raw); werr != nil {
-				return werr
+				return &catCopyError{op: "write", err: werr}
 			}
 		}
 		if err != nil {
 			if err == io.EOF {
 				return nil
 			}
-			return err
+			return &catCopyError{op: "read", err: err}
 		}
 	}
 }

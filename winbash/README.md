@@ -211,6 +211,30 @@ BRE 这一条是修过的:**早先默认按整串字面匹配**,于是这几个�
 找不到的命令给**三行式错误**(问题 + 怎么办)并返回 `127`;已识别的坑(bash 指向损坏的 WSL relay、
 MSYS 的 `/v` 参数改写、把 POSIX 路径喂给 Windows 工具)会在原错误之后补一条翻译,原错误不改写。
 
+**路径错误用 POSIX 措辞,不泄漏 Win32 细节**(2026-10-18)。`ls` / `cat` / `grep` 遇到路径失败时,
+"问题"那行与真 Git Bash 逐字对齐:
+
+```
+winbash: ls
+         问题: cannot access 'nope.txt': No such file or directory
+         怎么办: 先确认路径存在,或用 winbash -c 'ls 上级目录' 看有哪些名字
+```
+
+真 bash:`ls: cannot access 'nope.txt': No such file or directory`(只差三行式外壳)。
+
+修之前是 `GetFileAttributesEx C:\Users\...\nope.txt: The system cannot find the file
+specified.` —— 三个问题都直接影响「AI 能不能自己修」:**泄漏 Win32 API 名**(`GetFileAttributesEx`
+/ `CreateFile`)、**把用户写的相对路径换成绝对路径**、**用 Win32 长句而不是 POSIX 措辞**。
+措辞在 `internal/builtins/oserr.go`,六类错误(`No such file or directory` / `Not a directory` /
+`Permission denied` / `Is a directory` / 非法字符 / 未知 errno 的 `I/O error (Win32 error N)`)。
+
+两处细节值得知道:
+- **`Not a directory` 与 `No such file or directory` 在 Windows 上是同一个 errno(3)**,
+  靠"路径里有没有把文件当目录用"的结构检查区分 —— 真 bash 分得很清,而它决定 AI 下一步是改结构还是找文件。
+- **`cat 某目录`**:Windows 上 `os.Open` 一个目录会**成功**,失败要到第一次 `Read` 才发生(给
+  `Incorrect function.`)。所以 `cat` 在 open 之后显式 stat 判目录,而不是靠错误码猜 —— 猜 `ERROR_INVALID_FUNCTION`
+  是错的,那是通用错误码。
+
 ## 安全边界
 
 daemon 监听 `127.0.0.1`,端口写在一个**端口文件**里 —— 两行:地址 + 一个 128 位随机 token,
