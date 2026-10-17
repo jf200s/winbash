@@ -78,7 +78,7 @@ git worktree add .worktrees/<slug> -b <类型>/<slug>
 
 ## 5. 并发的物理约束（本项目的硬边界，违反会产假失败）
 
-- **daemon 端点必须隔离**：默认端口文件按用户名共享（`%TEMP%\winbash-<用户名>.port`）。任何**并发**跑的测试、冒烟、手工实测，都要显式带独立 `--endpoint <临时文件>` —— 否则并行线会互停、互抢对方的 daemon。仓库自己的做法见 `winbash/cmd/winbash/e2e_test.go` 的 `benchEndpoint`。
+- **daemon 端点必须隔离**：默认端口文件按用户名共享（`%TEMP%\winbash-<用户名>.port`）。任何**并发**跑的测试、冒烟、手工实测，都要显式带独立 `--endpoint <临时文件>` —— 否则并行线会互停、互抢对方的 daemon。仓库自己的做法见 `winbash/cmd/winbash/e2e_test.go` 的 `benchEndpoint`；`smoke-gitbash.sh` 也自带一个（`${TMPDIR:-/tmp}/wb-smoke-$$.port`）+ 带 PID 的临时文件，并且**拒绝**从 winbash 会话里启动（以 `2` 退出并说明：那 4 条 daemon 管理断言会假红）。
 - **`-race` 与 benchmark 串行跑**：抢 CPU 会让计时数字失真（README 里"22 ms / 70 ms"已因此不可信，别再造一批不可信的数）。
 - **`smoke-gitbash.sh` 必须从真 Git Bash 跑**（它拿 Git Bash 当对照）：`& 'C:\Program Files\Git\bin\bash.exe' ./smoke-gitbash.sh`。
 - **写子代理并发上限 2–3**（同一仓库、同一套测试二进制，CPU 会顶满）；**只读子代理 4–6** 无压力。

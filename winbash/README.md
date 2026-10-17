@@ -367,6 +367,12 @@ $env:WINBASH_BENCH=1; go test ./cmd/winbash/ -run Latency -v
 `TestMain` 会把 ③ 层派生的 `WINBASH_SESSION` 摘掉 —— 否则 client 会把每次调用都当成"嵌套",
 `--status`/`--stop` 刻意拒绝,3 条 daemon 管理用例必然红(而且看着像产品 bug,不像环境问题)。
 
+`smoke-gitbash.sh` 反过来**不宽容**:开头发现 `WINBASH_SESSION` 就直接以 `2` 退出并说明原因,
+因为那 4 条 daemon 管理断言会齐刷刷假红 —— 从 winbash 会话里启动它的人看到的不是"入口错了",
+而是"daemon 管理坏了"。另外它用**自己的临时端点**与带 PID 的临时文件
+(`go test` 里的 `benchEndpoint` 是同一个理由),所以跑一次 smoke 不会停掉你正在用的 daemon
+(会话里的变量、`set -e`、`trap` 都还在),两条 smoke 也能并行跑。
+
 约束:**唯一直接依赖**是 `mvdan.cc/sh/v3`(实测带入 `golang.org/x/sys`、`golang.org/x/term` 两个间接依赖)。
 依赖镜像要设 `GOPROXY=https://goproxy.cn,direct`(`proxy.golang.org` 在本机不通)。
 设计文档与实现计划在 `docs/superpowers/` 下。
