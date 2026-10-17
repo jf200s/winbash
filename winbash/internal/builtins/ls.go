@@ -23,8 +23,8 @@ import (
 // 额外信息一律通过显式的 -l 索取,或通过 --json 拿结构化形式。
 func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int {
 	var (
-		long, all, human bool
-		paths            []string
+		long, all, human, dirOnly bool
+		paths                     []string
 	)
 
 	// 逐字符解析,支持 -la 这类组合写法(bash 惯例)。
@@ -37,7 +37,7 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 		// 长开关整个报出来。拆成单字符会把 "--nope" 报成 "--",
 		// 使用者拿着这个提示没法定位问题。
 		if strings.HasPrefix(a, "--") {
-			remedy := "支持的参数: -l -a -h -1"
+			remedy := "支持的参数: -l -a -h -1 -d"
 			if a == "--recursive" {
 				// ls 不做递归是对的(① 层的 ls 只列一层,语义可控),但"不认识的参数"
 				// 没说下一步 —— 递归列目录在 bash 里的标准解法是 find,直接给出来。
@@ -54,12 +54,16 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 				all = true
 			case 'h':
 				human = true
+			case 'd':
+				// 列**目录本身**而不是它的内容。`ls -d */` 只看子目录名、
+				// `ls -ld 某个目录` 只看那个目录的属性,是极常见的写法。
+				dirOnly = true
 			case '1':
 				// 每行一个 —— 这本来就是我们的默认形态,所以接受它。
 				// 不接受反而更坏:`ls -1` 是极常见的写法,而它在这里的预期行为
 				// 恰好就是现状(给了 -l 时被 -l 压过,与 bash 一致)。
 			default:
-				remedy := "支持的参数: -l -a -h -1"
+				remedy := "支持的参数: -l -a -h -1 -d"
 				if c == 'R' {
 					remedy = "ls 不递归;要递归列目录用 find: find . -name '*' (只看文件用 find . -type f)"
 				}
@@ -71,6 +75,60 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 
 	if len(paths) == 0 {
 		paths = []string{"."}
+	}
+
+	// `-d`:每个参数**只列它自己**,不展开目录。所以整批参数一起处理、
+	// 一起排序、一次输出 —— 而不是像目录展开那样逐路径分组。
+	//
+	// 语义全部对着真 Git Bash 实测过(2026-10-18):
+	//
+	//	ls -d            → "."              (默认参数 "." 不展开)
+	//	ls -d dirA       → "dirA"
+	//	ls -d */         → "dirA/" "dirB/"  (**保留参数里的尾斜杠**)
+	//	ls -d *          → "dirA" "dirB" "f1.txt" "f2.txt"   (按名字排序)
+	//	ls -d f1.txt dirA dirB → "dirA" "dirB" "f1.txt"      (排序,不按原序)
+	//	ls -d dirB dirA dirB   → "dirA" "dirB" "dirB"        (重复参数保留)
+	//	ls -l -d */      → 长格式,**没有 total 行**
+	//	ls -d nope_xyz   → rc=2 + stderr
+	//
+	// 两个容易写错的点:
+	//  1. **名字要用参数原文**(`p`),不能用 filepath.Base(abs)。这样 `*/` 展开出的
+	//     尾斜杠、用户写的 `dirA/`、绝对路径都原样保留,与 bash 行为一致。
+	//  2. **不打 total 行**。GNU ls 只在列目录内容时给 total;-d 列的是参数本身。
+	if dirOnly {
+		items := make([]lsItem, 0, len(paths))
+		code := errs.ExitOK
+		for _, p := range paths {
+			abs, err := ResolvePath(cwd, p)
+			if err != nil {
+				fmt.Fprintln(errw, errs.Errorf("ls", err.Error(), "检查路径写法: "+p))
+				code = errs.ExitError
+				continue
+			}
+			info, serr := os.Stat(abs)
+			if serr != nil {
+				fmt.Fprintln(errw, errs.Errorf("ls", serr.Error(),
+					"先确认路径存在,或用 winbash -c 'ls 上级目录' 看有哪些名字"))
+				code = errs.ExitError
+				continue
+			}
+			it := lsItem{name: p, info: info}
+			if long {
+				it.links = linkCount(abs)
+			}
+			items = append(items, it)
+		}
+		// SliceStable:重复参数(如 `ls -d a a`)必须都留着,而排序只需可复现。
+		sort.SliceStable(items, func(i, j int) bool { return items[i].name < items[j].name })
+
+		var widths lsWidths
+		if long {
+			widths = lsMeasure(items, human)
+		}
+		for _, it := range items {
+			writeLsEntry(out, it.name, it, long, human, widths)
+		}
+		return code
 	}
 
 	code := errs.ExitOK
