@@ -303,6 +303,89 @@ func TestFreshSessionIsIsolated(t *testing.T) {
 	}
 }
 
+// TestManageCommandsGiveUpWhileDaemonBusy 钉住 --status / --stop 的 5s 上限。
+//
+// 为什么必须是端到端:daemon 是**一条连接串行处理**的(Serve 里 Accept → handle 同步),
+// 所以一条长命令跑着时,管理命令连上去只能排队。上限若被改回"无限等",使用者看到的是
+// 挂死 —— 上个版本就是这么来的,而 README 当时把 5s 写成「有代码、未实测」。
+// 单元测试证不到这件事:它需要「同一个 daemon 上先长命令、后管理命令」这个序列。
+//
+// 口径:上限本身是 manageTimeout(5s,client 侧),断言取 4s–20s ——
+// 下限防"根本没排队就失败了"(那会让这条测试变成空转),上限防"上限被改掉了还在等"。
+func TestManageCommandsGiveUpWhileDaemonBusy(t *testing.T) {
+	const manageCap = 5 * time.Second
+	exe := buildWinbash(t)
+	endpoint := benchEndpoint(t)
+	t.Cleanup(func() { runWinbash(t, exe, endpoint, "--stop") })
+
+	// 先让 daemon 起来 —— 后面要占住的是**这个** daemon。
+	if out, code := runWinbash(t, exe, endpoint, "-c", "echo warm"); code != 0 {
+		t.Fatalf("预热失败 exit=%d out=%q", code, out)
+	}
+
+	// 占住它:命令先落一个标记(证明它真的开始执行了),再 sleep 到 12s ——
+	// 长过下面两次测量(各 5s),又不至于把测试拖太久。
+	//
+	// 注意这里让 sleep **自然结束**,不靠杀掉 busy 的 client:daemon 跑命令时并不监听
+	// 连接断开(实测杀 client 之后它仍占着,一直到 sleep 自己结束),所以"断开即恢复"
+	// 是个不存在的假设。
+	// 标记路径必须带引号 —— t.TempDir() 落在 C:\Users\<用户名>\ 下,本机用户名含空格。
+	marker := filepath.ToSlash(filepath.Join(t.TempDir(), "busy.marker"))
+	busy := exec.Command(exe, "--endpoint", endpoint, "--timeout", "60s", "-c", "touch '"+marker+"'; sleep 12")
+	busy.Stdout, busy.Stderr = io.Discard, io.Discard
+	if err := busy.Start(); err != nil {
+		t.Fatalf("启动长命令失败: %v", err)
+	}
+	t.Cleanup(func() { _ = busy.Process.Kill() })
+	waitForFile(t, marker, 10*time.Second)
+
+	for _, op := range []string{"--status", "--stop"} {
+		start := time.Now()
+		out, code := runWinbash(t, exe, endpoint, op)
+		elapsed := time.Since(start)
+
+		if code != 1 {
+			t.Fatalf("%s 在 daemon 忙时应当以 1 退出,got %d out=%q", op, code, out)
+		}
+		if elapsed < manageCap-time.Second || elapsed > 20*time.Second {
+			t.Fatalf("%s 花了 %s,应在上限 %s 附近(4s–20s):上限没生效,或者根本没排队",
+				op, elapsed.Round(time.Millisecond), manageCap)
+		}
+		if !strings.Contains(out, "没有响应") {
+			t.Errorf("%s 的错误没点明「没有响应」: %q", op, out)
+		}
+	}
+
+	// 上限只该让调用方"早点放弃",不该把 daemon 弄坏 —— 尤其 --stop 那次超时
+	// 不该顺手把它停掉(请求还排在队列里,daemon 根本没读到)。
+	// sleep 结束后 daemon 应当自己回到 Accept:这里等它,而不是假设立即恢复。
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		out, code := runWinbash(t, exe, endpoint, "--timeout", "5s", "-c", "echo alive")
+		if code == 0 && strings.TrimSpace(out) == "alive" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("长命令结束后 daemon 没恢复可用:exit=%d out=%q", code, out)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// waitForFile 等一个文件出现(最多 timeout)。用它确认"长命令真的开始执行了",
+// 而不是靠 sleep 猜 —— 猜早了会让整条测试变成空转。
+func waitForFile(t *testing.T, path string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("%s 在 %s 内没有出现:长命令没跑起来,后面的断言无效", path, timeout)
+}
+
 func p50(ds []time.Duration) time.Duration {
 	s := append([]time.Duration{}, ds...)
 	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })

@@ -43,7 +43,7 @@ winbash.exe --stop      # 停掉 daemon(不会为了停掉它而先把它拉起�
 | `-c` / `--script` | 要执行的脚本(也可以直接写位置参数:`winbash ls -l`) |
 | `--json` / `-j` | 输出类型化 JSON 数组。**是整次调用的开关,写在 `-c` 之前** |
 | `--serve` | 前台运行 daemon |
-| `--stop` / `--status` | 停掉 / 查看 daemon(都不会把它拉起来) |
+| `--stop` / `--status` | 停掉 / 查看 daemon(都不会把它拉起来)。两者都有 **5 s 上限**:daemon 串行处理连接,被一条长命令占着时它们会以 `1` 退出并说明"可能正忙",而不是无限等下去(实现在 `client.manageTimeout`,端到端测试 `TestManageCommandsGiveUpWhileDaemonBusy` 钉着) |
 | `--endpoint` | 端口文件路径,默认 `%TEMP%\winbash-<用户名>.port`(按用户名区分,同机多用户不互踩)。文件里是**两行**:地址 + 随机 token |
 | `--idle` | 空闲多久后 daemon 退出,默认 `30m`(`0` = 永不) |
 | `--timeout` | 单次请求超时,默认 `300s`(`0` = 不设限)。这个上限**同时**告诉 daemon:客户端放弃后它也要停手,否则一条无限循环会把后续命令全部饿死。**嵌套里也生效**(内层走的是本进程执行,同样受这个上限约束) |
