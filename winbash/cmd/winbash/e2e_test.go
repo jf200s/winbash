@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -9,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -384,6 +386,136 @@ func waitForFile(t *testing.T, path string, timeout time.Duration) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("%s 在 %s 内没有出现:长命令没跑起来,后面的断言无效", path, timeout)
+}
+
+// countServeDaemons 数「命令行里带这个端点、且带 --serve」的 winbash 进程数。
+//
+// 两个细节都不能省:
+//   - 必须按**端点**过滤:别的测试、使用者自己的 daemon 都在跑,不过滤就数不准
+//     (与 benchEndpoint 是同一条理由,隔离要在统计这一侧也成立);
+//   - 必须用 WMI 而不是 tasklist:要按命令行过滤,而 tasklist 看不到命令行。
+func countServeDaemons(t *testing.T, endpoint string) int {
+	t.Helper()
+	ps := fmt.Sprintf(
+		`@(Get-CimInstance Win32_Process -Filter "Name='winbash.exe'" | `+
+			`Where-Object { $_.CommandLine -and $_.CommandLine -like '*--serve*' -and $_.CommandLine -like '*%s*' }).Count`,
+		endpoint)
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", ps)
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("枚举 --serve 进程失败: %v\n%s", err, out.String())
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(out.String()))
+	if err != nil {
+		t.Fatalf("进程计数解析不了: %q", out.String())
+	}
+	return n
+}
+
+// runWinbashCode 与 runWinbash 同效,但不用 t.Fatalf ——
+// 并发测试要在 goroutine 里调用,而 t.Fatalf 只能从测试自己的 goroutine 调。
+func runWinbashCode(exe, endpoint string, args ...string) (string, int) {
+	full := append([]string{"--endpoint", endpoint}, args...)
+	cmd := exec.Command(exe, full...)
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	err := cmd.Run()
+	code := 0
+	if ee, ok := err.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	} else if err != nil {
+		code = -1
+	}
+	return out.String(), code
+}
+
+// TestConcurrentFirstStartSpawnsOneDaemon 钉住「并发首次启动只起一个 daemon」。
+//
+// 修之前(实测 8 个 client 同时首次调用):8 个 --serve 进程同时活着,端口文件只指向
+// 最后一个写入的,其余 7 个是孤儿 —— --status 看不到、--stop 停不掉,各自还抱着一个
+// Session,要等 30 分钟空闲才自己退。根因不是"后来者绑定失败退出":daemon 用
+// 127.0.0.1:0 取随机端口,并发起的每一个都能绑定成功,必须靠跨进程锁去重。
+func TestConcurrentFirstStartSpawnsOneDaemon(t *testing.T) {
+	exe := buildWinbash(t)
+	endpoint := benchEndpoint(t)
+	t.Cleanup(func() { runWinbash(t, exe, endpoint, "--stop") })
+
+	const n = 8
+	var wg sync.WaitGroup
+	outs := make([]string, n)
+	codes := make([]int, n)
+	wg.Add(n)
+	start := time.Now()
+	for i := 0; i < n; i++ {
+		go func(i int) {
+			defer wg.Done()
+			outs[i], codes[i] = runWinbashCode(exe, endpoint, "-c", "echo ok")
+		}(i)
+	}
+	wg.Wait()
+	elapsed := time.Since(start)
+
+	// 1. 每一条都必须成功。注意这一条**单独不足以**说明问题:修之前它们也都成功,
+	//    只是各连各的 daemon。它守的是"锁别把人挡在门外"。
+	for i, c := range codes {
+		if c != 0 {
+			t.Errorf("第 %d 个并发 client 失败 exit=%d out=%q", i, c, outs[i])
+		}
+	}
+
+	// 2. 只准留一个 daemon —— 这就是本测试的存在理由。修之前这里是 8。
+	if got := countServeDaemons(t, endpoint); got != 1 {
+		t.Fatalf("并发 %d 个首次启动后存活 daemon = %d,应当只有 1 个"+
+			"(多出来的就是孤儿:--status 看不到、--stop 停不掉)", n, got)
+	}
+
+	// 3. 持锁只该覆盖「拉起 daemon」,不该把并发请求串成一条长队。
+	//    8 个 client 每个约 15ms 启动开销,加上一次 daemon 冷启,给足余量取 10s ——
+	//    这里要抓的是"锁一直没放"这种退化,不是卡毫秒。
+	if elapsed > 10*time.Second {
+		t.Errorf("并发 %d 个首次调用花了 %v,像是启动锁没有及时释放", n, elapsed.Round(time.Millisecond))
+	}
+
+	// 4. 停掉之后不该有残留。
+	if out, code := runWinbash(t, exe, endpoint, "--stop"); code != 0 {
+		t.Fatalf("--stop 失败 exit=%d out=%q", code, out)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for countServeDaemons(t, endpoint) != 0 && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := countServeDaemons(t, endpoint); got != 0 {
+		t.Fatalf("--stop 之后仍有 %d 个 daemon 存活", got)
+	}
+}
+
+// TestStaleStartLockIsTakenOver 钉住陈旧锁的接管。
+//
+// 持锁者可能被强杀(taskkill、宿主回收、用户 Ctrl+C 掉了宿主),锁文件会留下。
+// 若不做接管,这个端点就**永久**起不来 daemon —— 一次强杀 = 该端点报废,
+// 而这种失败看起来像"daemon 在 20s 内没有起来",极难归因。
+func TestStaleStartLockIsTakenOver(t *testing.T) {
+	exe := buildWinbash(t)
+	endpoint := benchEndpoint(t)
+	t.Cleanup(func() { runWinbash(t, exe, endpoint, "--stop") })
+
+	// 造一把"持锁者已经死了"的残留锁:文件在,但 mtime 老到远超 staleLockBudget。
+	lock := endpoint + ".lock"
+	if err := os.WriteFile(lock, []byte("999999\n0\n"), 0o600); err != nil {
+		t.Fatalf("造陈旧锁失败: %v", err)
+	}
+	old := time.Now().Add(-5 * time.Minute)
+	if err := os.Chtimes(lock, old, old); err != nil {
+		t.Fatalf("改锁文件 mtime 失败: %v", err)
+	}
+
+	if out, code := runWinbash(t, exe, endpoint, "-c", "echo ok"); code != 0 {
+		t.Fatalf("陈旧锁把启动挡住了: exit=%d out=%q", code, out)
+	}
+	if _, err := os.Stat(lock); !os.IsNotExist(err) {
+		t.Errorf("正常放锁之后锁文件仍然存在(stat err=%v)", err)
+	}
 }
 
 func p50(ds []time.Duration) time.Duration {

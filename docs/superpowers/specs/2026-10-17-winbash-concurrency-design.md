@@ -301,6 +301,10 @@ sessions=2 running=1
 两步分开提交、分开验证（每步都要能独立回滚）：
 
 1. **P0 孤儿修复**（只动 `internal/client`，加一条锁辅助 + 3 条端到端测试）：不涉语义，可立即合。
+   **已完成（2026-10-17）**：`acquireStartLock` + `staleLockBudget`，回归
+   `TestConcurrentFirstStartSpawnsOneDaemon`（并发 8 个 → 恒为 1 个 daemon）
+   与 `TestStaleStartLockIsTakenOver`（陈旧锁接管）。变异验证过：旁路锁后该测试立刻
+   报「存活 daemon = 8」并失败，与实测一致。
 2. **P1 会话与并发**（`internal/ipc` 升版本、`internal/daemon` 会话池、`internal/client` 传参、README/已知差异表、测试 A/B/C）：改动大，合入前必须做「同一 daemon 上先 A 后 B」的手工端到端序列（含并发首次启动、跨会话并行、`--stop` 打断、空闲退出）。
 
 文档与实现必须同步：改了行为就同步 README 的「已知差异与限制」表（`--session`、`MaxSessions`、`--stop` 宽限、协议 4）。

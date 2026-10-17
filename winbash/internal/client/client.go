@@ -364,6 +364,29 @@ func ensureDaemon(endpoint string, idle time.Duration) (endpointInfo, error) {
 	if info, err := readEndpoint(endpoint); err == nil {
 		return info, nil
 	}
+
+	// 从这里往下是「没有 daemon,要拉起一个」——必须跨进程互斥。
+	//
+	// 不互斥会怎样(实测):8 个 client 同时首次调用,每个都读到「没有 daemon」,
+	// 于是各 spawn 一个。daemon 用 127.0.0.1:0 取随机端口,所以**它们全都绑定成功**,
+	// 不存在"后来者失败退出"这种天然去重 —— 结果 8 个 --serve 进程同时活着,
+	// 端口文件只指向最后写入的那一个,其余 7 个是孤儿:--status 看不到、--stop 停不掉,
+	// 各自还抱着一个 Session(用到 ② 层的还各抱一个 pwsh)白占内存,要等 30 分钟空闲才退。
+	release, alreadyUp, err := acquireStartLock(endpoint)
+	if err != nil {
+		return endpointInfo{}, err
+	}
+	if alreadyUp {
+		// 等锁的那段时间里,持锁者已经把 daemon 起来了。
+		return readEndpoint(endpoint)
+	}
+	defer release()
+
+	// 抢到锁之后要**再读一次**:上一个持锁者可能刚好在放锁之前写好了端口文件。
+	// 少了这一次,我们就会在一个已经健康的 daemon 旁边再起一个 —— 正是要消灭的那件事。
+	if info, err := readEndpoint(endpoint); err == nil {
+		return info, nil
+	}
 	if err := spawnDaemon(endpoint, idle); err != nil {
 		return endpointInfo{}, fmt.Errorf("client: 启动 daemon 失败: %w", err)
 	}
@@ -375,6 +398,69 @@ func ensureDaemon(endpoint string, idle time.Duration) (endpointInfo, error) {
 		time.Sleep(pollInterval)
 	}
 	return endpointInfo{}, fmt.Errorf("client: daemon 在 %s 内没有起来", startupBudget)
+}
+
+// startLockPath 是与端点配套的启动锁文件路径。
+//
+// 放在端口文件旁边(同一个目录),所以端点隔离到哪、锁就隔离到哪 —— 两个跑在不同
+// --endpoint 上的测试不会互相挡。
+func startLockPath(endpoint string) string { return endpoint + ".lock" }
+
+// staleLockBudget 是判定「这把锁是陈旧残留」的时长。
+//
+// 必须**明显大于** startupBudget(20s):持锁者正常工作时最长就是花这么久等 daemon 起来,
+// 这个时长之内都不能怀疑它。留 10s 余量。
+const staleLockBudget = startupBudget + 10*time.Second
+
+// acquireStartLock 抢「拉起 daemon」这把跨进程锁。
+//
+// 三个返回值各有用途:
+//   - release != nil:抢到了,调用方必须在 spawn + 等就绪之后调用它(持锁只覆盖这段,
+//     **绝不覆盖命令执行** —— 否则并发就没了)。
+//   - alreadyUp:没抢到锁,但等锁期间端口文件出现了,说明别人已经起好了,直接用。
+//   - err:真失败(建不了锁文件,或等到 startupBudget 还是没结果)。
+//
+// 为什么用「锁文件 + O_EXCL」而不是命名互斥量:后者要直接引 golang.org/x/sys/windows,
+// 而本项目的硬约束是「唯一直接依赖 mvdan.cc/sh/v3」(x/sys 目前只是它带进来的间接依赖)。
+// 为一把锁破这条约束不划算;O_CREATE|O_EXCL 在 Windows 上同样是原子的。
+func acquireStartLock(endpoint string) (release func(), alreadyUp bool, err error) {
+	path := startLockPath(endpoint)
+	deadline := time.Now().Add(startupBudget)
+	for {
+		f, oerr := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if oerr == nil {
+			// 写 pid 与时间戳只为事后排查"这把锁是谁留下的",判定陈旧看的是 mtime。
+			_, _ = fmt.Fprintf(f, "%d\n%d\n", os.Getpid(), time.Now().UnixNano())
+			_ = f.Close()
+			return func() { _ = os.Remove(path) }, false, nil
+		}
+		if !os.IsExist(oerr) {
+			return nil, false, fmt.Errorf("client: 建启动锁 %s 失败: %w", path, oerr)
+		}
+
+		// 别人正在拉起 daemon。它一起来端口文件就会出现,所以每一轮都先看这个 ——
+		// 比单纯"等锁消失"更快,也不怕持锁者忘了删锁。
+		if _, rerr := readEndpoint(endpoint); rerr == nil {
+			return nil, true, nil
+		}
+
+		// 持锁者可能被强杀(taskkill、宿主回收),锁文件会留下。
+		// 不靠"读 pid 再判断进程存活":Windows 上 os.FindProcess 恒成功,
+		// 真要做存活探测就得引平台代码 —— 与上面避开 x/sys 是同一条理由。
+		if st, serr := os.Stat(path); serr == nil && time.Since(st.ModTime()) > staleLockBudget {
+			if rmerr := os.Remove(path); rmerr == nil {
+				continue // 接管成功,立刻重抢
+			}
+			// 删不掉(权限/被占用)就别空转,落到下面的超时分支等它自己过期。
+		}
+
+		if time.Now().After(deadline) {
+			return nil, false, fmt.Errorf(
+				"client: 等其它 winbash 进程拉起 daemon 超时(%s);锁文件 %s 仍在。"+
+					"若确实没有别的 winbash 在跑,删掉这个锁文件再试", startupBudget, path)
+		}
+		time.Sleep(pollInterval)
+	}
 }
 
 // readEndpoint 解析端口文件的两行:地址 + token。
