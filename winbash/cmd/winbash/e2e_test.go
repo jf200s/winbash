@@ -19,6 +19,8 @@ import (
 //
 // 为什么必须这样:项目的一条主判据是"不等待"(spec §9),而它取决于
 // 「client 每次都新建、daemon 常驻」这件事 —— 包内调用看不见它。
+//
+// 注:本包的 TestMain 在 main_test.go(摘 WINBASH_SESSION 等),不要在这里再写一个。
 
 // buildWinbash 构建一个测试专用的可执行文件。
 func buildWinbash(t *testing.T) string {
@@ -113,6 +115,20 @@ func TestDaemonIsReusedAcrossClientProcesses(t *testing.T) {
 	}
 	if _, code := runWinbash(t, exe, endpoint, "--status"); code == 0 {
 		t.Fatal("stop 之后 status 仍然成功:daemon 没有真的退出")
+	}
+	// 端口文件必须真的被删掉,而不只是"连不上"。
+	// 这两件事不一样:文件还在但进程没了,--status 一样失败(所以上面那条抓不到),
+	// 而残留的文件会让后来的 client 去连一个已经不存在的地址。
+	// 复审指出这里原先只有注释、没有断言。
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(endpoint); os.IsNotExist(err) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("--stop 之后端口文件 %s 仍然存在", endpoint)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -478,8 +494,12 @@ func TestSameSessionKeepsStateAndStaysSerial(t *testing.T) {
 		t.Errorf("会话 s1 的变量泄漏到了默认会话,got %q", got)
 	}
 
-	// 4. 同一会话内**并发**投递也必须串行、且 FIFO:
-	//    第一条先写 COUNT 再 sleep,第二条读它 —— 若乱序就会读到空。
+	// 4. 同一会话内**并发**投递也必须串行、且 FIFO。
+	//
+	//    关键在赋值的位置:必须放在 sleep **之后**。早先写 `ORDER=first; sleep 0.3`,
+	//    变量在 t≈0 就落进会话,而读命令 t≈100ms 才发 —— 即使实现完全不串行,读命令
+	//    也照样能看到 first,这条断言就成了空转(实测复审抓到了这一点)。
+	//    改成先睡再赋值:只有"读命令真的等了写命令"才可能读到 first。
 	var wg sync.WaitGroup
 	wg.Add(2)
 	var writeOut, readOut string
@@ -487,17 +507,19 @@ func TestSameSessionKeepsStateAndStaysSerial(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		writeOut, writeCode = runWinbashCode(exe, endpoint,
-			"--session", "s3", "-c", "ORDER=first; sleep 0.3")
+			"--session", "s3", "-c", "sleep 0.5; ORDER=first")
 	}()
-	// 稍等，确保第一条真的先入队（并发投递的先后本来就是不确定的，
-	// 这里要测的是"入队之后不会乱序"，不是"入队顺序可预测"）。
-	time.Sleep(100 * time.Millisecond)
+	// 等写命令真的开始跑(它已经进了会话队列),再发读命令 —— 于是读命令排在它后面。
+	time.Sleep(150 * time.Millisecond)
+	readStart := time.Now()
 	go func() {
 		defer wg.Done()
 		readOut, readCode = runWinbashCode(exe, endpoint,
 			"--session", "s3", "-c", "echo ${ORDER:-<unset>}")
 	}()
 	wg.Wait()
+	readElapsed := time.Since(readStart)
+
 	if writeCode != 0 || readCode != 0 {
 		t.Fatalf("同会话并发投递失败: write exit=%d out=%q / read exit=%d out=%q",
 			writeCode, writeOut, readCode, readOut)
@@ -505,6 +527,13 @@ func TestSameSessionKeepsStateAndStaysSerial(t *testing.T) {
 	if got := strings.TrimRight(readOut, "\r\n"); got != "first" {
 		t.Errorf("同会话内的两条请求乱序了(后一条读到 %q,期望 first):"+
 			"队列没有保证 FIFO,状态会静默损坏", got)
+	}
+	// 再加一条时间判据:读命令若真的排在写命令(0.5s)后面,它自己的耗时必然
+	// 覆盖剩下的等待。只靠"读到 first"仍可能被一个恰好慢的实现蒙对,
+	// 而"读命令必须等"是这条测试真正要钉的语义。
+	if readElapsed < 300*time.Millisecond {
+		t.Errorf("读命令只花了 %s 就返回 —— 它没有等前面的写命令(sleep 0.5s),同会话没串行",
+			readElapsed.Round(time.Millisecond))
 	}
 }
 
@@ -526,8 +555,16 @@ func TestSessionLimitIsRejected(t *testing.T) {
 		t.Fatalf("预热失败 exit=%d out=%q", code, out)
 	}
 
+	// 先在第一个会话里落一个状态。这一条是"不回收 LRU"的关键:
+	// 若实现改成回收最久未用的那条,lim-01 会被销毁,而**重建一个同名会话再跑
+	// echo alive 一样是 exit 0** —— 只看退出码是抓不到的(复审抓到的假绿)。
+	// 所以先写一个变量,拒绝第 17 个之后把它读回来。
+	if out, code := runWinbash(t, exe, endpoint, "--session", "lim-01", "-c", "MARK=kept"); code != 0 {
+		t.Fatalf("往 lim-01 写状态失败 exit=%d out=%q", code, out)
+	}
+
 	// 每个会话跑一条 ① 层命令:不碰 ② 层,所以不会各拉一个 pwsh(引擎是按需的)。
-	for i := 1; i <= 16; i++ {
+	for i := 2; i <= 16; i++ {
 		sess := fmt.Sprintf("lim-%02d", i)
 		if out, code := runWinbash(t, exe, endpoint, "--session", sess, "-c", "true"); code != 0 {
 			t.Fatalf("第 %d 个会话就失败了(上限应当允许 16 个):exit=%d out=%q", i, code, out)
@@ -535,17 +572,22 @@ func TestSessionLimitIsRejected(t *testing.T) {
 	}
 
 	// 第 17 个必须被拒绝,而且错误要点明上限与处置。
+	// 断言 exit **恰好是 1**(不是"非零"):契约是 1,回归成 2(用法错误)也该被抓到。
 	out, code := runWinbash(t, exe, endpoint, "--session", "lim-17", "-c", "true")
-	if code == 0 {
-		t.Fatalf("第 17 个会话没被拒绝(out=%q);上限失效了", out)
+	if code != 1 {
+		t.Fatalf("第 17 个会话应当以 exit 1 拒绝,got %d out=%q", code, out)
 	}
 	if !strings.Contains(out, "上限") {
 		t.Errorf("错误没点明会话上限: %q", out)
 	}
 
-	// 被拒绝之后,已有会话必须**照常可用**(不能因为一次拒绝把池子弄坏)。
-	if out, code := runWinbash(t, exe, endpoint, "--session", "lim-01", "-c", "echo alive"); code != 0 {
+	// 被拒绝之后,已有会话必须**照常可用**,而且它的**状态还在**
+	// —— 这一条才真正钉住"不回收最久未用"。
+	if out, code := runWinbash(t, exe, endpoint, "--session", "lim-01", "-c", "echo ${MARK:-<lost>}"); code != 0 {
 		t.Fatalf("拒绝第 17 个会话之后 lim-01 不可用了:exit=%d out=%q", code, out)
+	} else if got := strings.TrimRight(out, "\r\n"); got != "kept" {
+		t.Errorf("lim-01 的状态丢了(got %q):说明上限触发时回收了已有会话,"+
+			"而那是静默销毁状态", got)
 	}
 }
 

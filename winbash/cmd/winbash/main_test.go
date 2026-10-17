@@ -12,7 +12,7 @@ import (
 	"winbash/internal/shell"
 )
 
-// TestMain 先摘掉 WINBASH_SESSION。
+// TestMain 先摘掉 WINBASH_SESSION 与 WINBASH_SESSION_NAME。
 //
 // 本包测的是 **CLI 自己的行为**,而它经常在 winbash 会话里被跑 —— README「开发」节
 // 给的命令就是 `go test ./...`,而那时执行它的 shell 正是 winbash。③ 层会把
@@ -24,6 +24,10 @@ import (
 // 一处声明比 N 处复制更难漏。测试对自身环境的要求要自己说,不能靠"你恰好在 Git Bash 里跑"。
 func TestMain(m *testing.M) {
 	_ = os.Unsetenv(shell.EnvNested)
+	// WINBASH_SESSION_NAME 是 --session 的默认值来源:不摘掉的话,预热命令会落进一个
+	// **具名**会话,白占一个名额,TestSessionLimitIsRejected 就会在第 16 个而不是第 17
+	// 个报上限 —— 而那条错误信息会把人引向"上限算错了",不是"环境没清干净"。
+	_ = os.Unsetenv("WINBASH_SESSION_NAME")
 	os.Exit(m.Run())
 }
 

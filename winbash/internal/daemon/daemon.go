@@ -77,6 +77,13 @@ type sessionEntry struct {
 	// 不并发安全(见 Session 的注释)—— busy 时直接读 Dir()/EngineStatus() 就是数据竞争。
 	snapDir  string
 	snapPwsh string
+
+	// stopped 表示该会话的 worker 已经退出、不再接受任何 job(受 daemon.mu 保护)。
+	//
+	// 它与 jobs 的 send 必须在**同一个临界区**里判断 —— 这正是 submit 存在的理由:
+	// 若先判后发,worker 可能在两者之间退出并排空,于是 job 落进一个没有接收者的
+	// 缓冲队列,那条连接就只能等 client 自己的超时(默认 300s)。
+	stopped bool
 }
 
 // daemon 持有全部跨连接状态。
@@ -90,7 +97,14 @@ type daemon struct {
 
 	mu       sync.Mutex
 	sessions map[string]*sessionEntry // key 是会话名,空串 = 默认会话
-	running  int                      // 正在执行的 job 数(受 mu 保护)
+	running  int                      // 已投递、尚未跑完的 job 数(受 mu 保护)
+	// stopping 表示会话表已被摘空,不再接受任何新 job(受 mu 保护)。
+	// pickSession 建会话与 takeSessions 摘表都在 mu 下,所以它对"建会话窗口"是密不透风的。
+	stopping bool
+	// lastUsed 是**任意**请求(含 --status / --stop)到达的时刻,空闲退出看它。
+	// 为什么不用「每条会话的 lastUsed」:那样只靠 --status 探活的客户端保不住 daemon
+	// —— 旧实现把 idle 挂在 Accept 的 deadline 上,任何连接都会重置它,那才是原本的语义。
+	lastUsed time.Time
 
 	stopOnce sync.Once
 	done     chan struct{} // shutdown 开始时关闭
@@ -136,13 +150,15 @@ func Serve(endpoint string, idleTimeout, readTimeout time.Duration) error {
 	restrictEndpointFile(endpoint)
 
 	stopCtx, stopStop := context.WithCancel(context.Background())
+	now := time.Now()
 	d := &daemon{
 		ln:       ln.(*net.TCPListener),
 		addr:     ln.Addr().String(),
 		token:    token,
 		endpoint: endpoint,
 		idle:     idleTimeout,
-		started:  time.Now(),
+		started:  now,
+		lastUsed: now, // 空闲起点是启动时刻,不是零值(零值会让它一启动就"已空闲")
 		sessions: make(map[string]*sessionEntry),
 		done:     make(chan struct{}),
 		stopCtx:  stopCtx,
@@ -150,12 +166,21 @@ func Serve(endpoint string, idleTimeout, readTimeout time.Duration) error {
 
 		shutdownDone: make(chan struct{}),
 	}
-	// 兜底:shutdown 通常已经把会话收干净了(shutdown 与这里走同一个 takeSessions,
-	// 谁先摘到谁负责关),但 watchdog/Accept 报错等路径仍可能抢在它前面让 Serve 返回。
+	// 兜底清理。正常关停(shutdown/watchdog)会先把会话表摘空并逐条等 worker 退出,
+	// 这里就是空操作;真正兜住的是「Accept 因非关停原因报错」那条路径 —— 那时
+	// d.done 可能还没关,worker 还在 select 里,所以这里**必须先关 done**,
+	// 否则它们永远不会退出(goroutine 泄漏),而下面的兜底关会话也因为等不到
+	// worker 而只能跳过。
+	//
 	// 会话持有 ② 层的常驻 pwsh 与 ① 层的状态,退出时一定要收干净 ——
 	// 否则每重启一次 daemon 就留下一个 pwsh 进程。
 	defer func() {
-		d.closeAllSessions()
+		d.stopOnce.Do(func() {
+			close(d.done)
+			d.stopAccepting()
+		})
+		// 给 worker 一点时间看到 done 并退出(它们是异步的)。
+		d.closeSessions(d.takeSessions(), 2*time.Second)
 		stopStop()
 	}()
 
@@ -194,8 +219,11 @@ func Serve(endpoint string, idleTimeout, readTimeout time.Duration) error {
 //
 // 不能用「Accept 超时」当空闲判据:Accept 的等待与新连接数无关,而一个正在跑的
 // 长命令期间可能完全没有新连接 —— 旧逻辑会把一个正忙的 daemon 判成空闲。
-// 这里三个条件都看:距启动已过 idle、没有 job 在跑、并且每条会话都超过 idle
-// 没人用过。
+//
+// 判据是「没有 job 在跑 + 距**最后一次任何请求**已过 idle」。用 daemon 级的
+// d.lastUsed 而不是逐会话的 lastUsed:旧语义里任何连接都会重置 Accept 的 deadline,
+// 所以「每 10 分钟 --status 探活一次」能保住 daemon。只看会话的话,--status 不经过
+// 会话队列、不刷新任何会话,daemon 会在 idle 到点时自退 —— 那是相对旧行为的回归。
 func (d *daemon) watchdog() {
 	if d.idle <= 0 {
 		return
@@ -213,18 +241,7 @@ func (d *daemon) watchdog() {
 		case <-t.C:
 			d.mu.Lock()
 			busy := d.running > 0
-			// 空闲起点是**启动时刻**:一个刚起来、还没人用过的 daemon 不算空闲。
-			// 少了这一条,它在 idle/10 之后就会自判空闲退出 —— 默认 idle=30min 时
-			// 那是 3 分钟,而原来的语义(在 Accept 上挂 idle deadline)是「启动后
-			// 30 分钟没人连才退」。常驻带来的加速(尤其 ② 层 pwsh 的冷启动)就
-			// 因为这条差一而被白丢。
-			idle := time.Since(d.started) >= d.idle
-			for _, e := range d.sessions {
-				if time.Since(e.lastUsed) < d.idle {
-					idle = false
-					break
-				}
-			}
+			idle := time.Since(d.lastUsed) >= d.idle
 			d.mu.Unlock()
 			if !busy && idle {
 				d.shutdown(0)
@@ -316,6 +333,11 @@ func (d *daemon) runShutdown(grace time.Duration) {
 func (d *daemon) takeSessions() []*sessionEntry {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	// 置 stopping:pickSession 从此拒绝建新会话。
+	// 少了这一步会漏:pickSession 与这里都在 mu 下,但若只在"摘表"时清空 map,
+	// 一个正在 pickSession 里建会话的请求会在摘表之后把新 entry 塞回一张已空的表
+	// —— 它逃过这次清理,只能等 Serve defer 的零预算兜底(那条路径压根不等 worker)。
+	d.stopping = true
 	entries := make([]*sessionEntry, 0, len(d.sessions))
 	for name, e := range d.sessions {
 		entries = append(entries, e)
@@ -324,37 +346,43 @@ func (d *daemon) takeSessions() []*sessionEntry {
 	return entries
 }
 
-// closeAllSessions 是 Serve 的兜底清理:shutdown 没走到时也要把 pwsh 收干净。
-func (d *daemon) closeAllSessions() {
-	d.closeSessions(d.takeSessions(), 0)
-}
-
-// closeSessions 关闭一批 Session,但先等各自的 worker 退出来。
+// closeSessions 关闭一批 Session,但**只关那些 worker 已经退出的**。
 //
 // 为什么必须等:worker 正在 Run 的时候去 Close 会话,就是与它对 interp.Runner /
-// engine 的读写并发 —— 而 shell.Session 明确不并发安全。正常路径上 worker 早就被
-// d.done 通知退出了,等待是零成本的;真等不到(budget 到点)才强行关:那时宁可
-// 让那一个 pwsh 随进程一起消失,也不能让一个还在跑的 handler 攥着一个半死的会话。
+// engine 的字段读写并发 —— 而 shell.Session 明确不并发安全。这不只是"理论上的
+// 数据竞争":EngineStatus() 里 `s.engine.Pid()` 在 engine 被并发置 nil 之后就是
+// nil 解引用,会 panic。
 //
-// budget<=0 时只做一次非阻塞检查(兜底路径不拖慢退出)。
+// 等不到怎么办:**就不关**。让那个 Session 随进程一起消失。这是刻意的取舍 ——
+// 关停路径之后进程马上就退了,OS 会收掉 pwsh 子进程;而"抢着关"换来的是
+// 一次真实的 panic 或数据竞争,那代价大得多。早先的实现"budget 到点就强行 Close"
+// 与它自己的注释(上面这段)自相矛盾。
 func (d *daemon) closeSessions(entries []*sessionEntry, budget time.Duration) {
 	deadline := time.Now().Add(budget)
+	skipped := 0
 	for _, e := range entries {
-		d.waitWorker(e, deadline)
+		if !d.waitWorker(e, deadline) {
+			skipped++
+			continue
+		}
 		_ = e.sess.Close()
+	}
+	if skipped > 0 {
+		// 不静默:告诉使用者有几条会话是"随进程一起消失"的(避免误以为是泄漏 bug)。
+		fmt.Fprintf(os.Stderr, "daemon: %d 个会话的 worker 未在预算内退出,跳过主动关闭(随进程回收)\n", skipped)
 	}
 }
 
-// waitWorker 等一个会话的 worker 退出。
-func (d *daemon) waitWorker(e *sessionEntry, deadline time.Time) {
+// waitWorker 等一个会话的 worker 退出,返回它是否真的退出了。
+func (d *daemon) waitWorker(e *sessionEntry, deadline time.Time) bool {
 	for {
 		select {
 		case <-e.workerDone:
-			return
+			return true
 		default:
 		}
 		if !time.Now().Before(deadline) {
-			return
+			return false
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -451,38 +479,101 @@ func (d *daemon) handleConn(conn net.Conn, readTimeout time.Duration) {
 		return
 	}
 
-	// 投递到该会话的队列。带 d.done 分支:daemon 正在退出时立刻给出确定答复,
-	// 而不是把这条连接留在队列里等它自己的超时。
-	select {
-	case <-d.done:
+	// 投递到该会话的队列。
+	//
+	// 必须走 submit(而不是裸 select + send):投递与"这条会话还在不在收"要在**同一个
+	// 临界区**里判断,否则 worker 可能在那两步之间退出并排空,于是 job 落进一个没有
+	// 接收者的缓冲队列 —— 那条连接再也拿不到响应,只能等 client 自己的超时。
+	if err := d.submit(e, job{req: req, conn: conn}); err != nil {
 		_ = writeResponse(conn, ipc.Response{
 			OK:     false,
-			Errors: []string{"daemon: daemon 正在退出"},
+			Errors: []string{"daemon: " + err.Error()},
 			Exit:   1,
 		})
 		closeConnGracefully(conn)
-	case e.jobs <- job{req: req, conn: conn}:
+	}
+}
+
+// submit 把一条 job 投进会话队列,并把它计入 d.running。
+//
+// 三个要点,每个都对着一个实际会踩到的坑:
+//
+//  1. **判断与 send 在同一把锁里**。先判后发的话,worker 可以在两者之间退出并排空,
+//     那条 job 就永远没有接收者(连接只能等 client 超时)。
+//  2. **send 用非阻塞的 select/default**。队列满(64)时持锁阻塞会死锁:worker 正卡在
+//     一条长命令里,而它结束时要回来拿这把锁更新 running。
+//     满了就给调用方一个明确错误 —— 拒绝比静默堆积好。
+//  3. **running 在投递时就 +1**,而不是等 runJob 开始。否则「已投递、还没开始」的 job
+//     不在计数里,--stop 的宽限会以为没人在跑而立刻取消它们(它们连一次执行都没有过)。
+func (d *daemon) submit(e *sessionEntry, j job) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	if d.stopping {
+		return fmt.Errorf("daemon 正在退出")
+	}
+	if e.stopped {
+		return fmt.Errorf("会话 %q 已停止接收请求(daemon 正在退出)", e.name)
+	}
+	select {
+	case e.jobs <- j:
+		d.running++
+		e.lastUsed = time.Now()
+		return nil
+	default:
+		return fmt.Errorf("会话 %q 的队列已满(每个会话最多排 64 条)。\n"+
+			"怎么办: 等前面的命令跑完,或者改用另一个会话名并发", e.name)
 	}
 }
 
 // pickSession 取(没有就建)一条具名会话。
 //
-// 加锁做两件事:查表/建表,以及刷新 lastUsed(空闲退出的依据)。
-// NewSession 只是构造 runner 与搜索路径,不派生任何进程,所以在锁里建是可以的;
-// ② 层的 pwsh 是懒启动的,真正的开销在 Run 里。
+// 加锁做两件事:查表/建表,以及刷新 lastUsed。
+//
+// NewSession 放在**锁外**做:它虽然不派生进程,但要 getcwd、构造搜索路径、建 runner
+// 与六个 handler。在锁里做会把这代价压到所有连接上(包括 --status 与其他会话的记账)。
+// 代价是可能白建一份(别人抢先建了) —— 那种情况下面把它 Close 掉,它还没跑过任何
+// 命令、也没起 ② 层引擎,Close 是几微秒的事。
 func (d *daemon) pickSession(name string) (*sessionEntry, error) {
+	// 先快速看一眼:已有就直接用,不必白建。
 	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	select {
-	case <-d.done:
+	if d.stopping {
+		d.mu.Unlock()
 		return nil, fmt.Errorf("daemon 正在退出")
-	default:
 	}
-
 	if e, ok := d.sessions[name]; ok {
 		e.lastUsed = time.Now()
+		d.lastUsed = time.Now()
+		d.mu.Unlock()
 		return e, nil
+	}
+	d.mu.Unlock()
+
+	// 锁外建。建完再抢锁:期间可能有人建了同名会话,也可能 daemon 开始关停。
+	sess := shell.NewSession()
+	e := &sessionEntry{
+		name: name,
+		sess: sess,
+		// 队列容量 64:满了由 submit 明确拒绝(不静默丢弃,也不持锁阻塞)。
+		jobs:       make(chan job, 64),
+		lastUsed:   time.Now(),
+		workerDone: make(chan struct{}),
+		// 建会话这一刻没有任何 job 在跑,是安全读 Session 字段的时机之一。
+		snapDir:  sess.Dir(),
+		snapPwsh: sess.EngineStatus(),
+	}
+
+	d.mu.Lock()
+	if d.stopping {
+		d.mu.Unlock()
+		_ = sess.Close()
+		return nil, fmt.Errorf("daemon 正在退出")
+	}
+	if existing, ok := d.sessions[name]; ok {
+		d.mu.Unlock()
+		_ = sess.Close() // 白建的那份,还没用过
+		existing.lastUsed = time.Now()
+		return existing, nil
 	}
 
 	// 到上限就拒绝,不回收最久未用的那条:回收等于**静默销毁状态**,而状态正是
@@ -499,25 +590,17 @@ func (d *daemon) pickSession(name string) (*sessionEntry, error) {
 			}
 		}
 		if named >= maxSessions {
+			d.mu.Unlock()
+			_ = sess.Close()
 			return nil, fmt.Errorf("具名会话数已达上限 %d(每个会话一个独立 shell 会话,"+
 				"用到 ② 层时还会各持一个常驻 pwsh)。\n怎么办: 先 `winbash --stop` 清空,"+
 				"或者复用已有的会话名", maxSessions)
 		}
 	}
 
-	sess := shell.NewSession()
-	e := &sessionEntry{
-		name: name,
-		sess: sess,
-		// 队列容量 64:满了就在投递处背压,不静默丢弃。
-		jobs:       make(chan job, 64),
-		lastUsed:   time.Now(),
-		workerDone: make(chan struct{}),
-		// 建会话这一刻没有任何 job 在跑,是安全读 Session 字段的时机之一。
-		snapDir:  sess.Dir(),
-		snapPwsh: sess.EngineStatus(),
-	}
 	d.sessions[name] = e
+	d.lastUsed = time.Now()
+	d.mu.Unlock()
 	go d.serveSession(e)
 	return e, nil
 }
@@ -527,22 +610,59 @@ func (d *daemon) pickSession(name string) (*sessionEntry, error) {
 // 为什么不用一把 mutex 串行整条会话:mutex 不保证先来先服务,同一会话里
 // `X=1` 与 `echo $X` 一旦乱序就是静默的状态损坏(见 sessionEntry)。
 //
-// 退出条件只有 d.done(队列**不**会 close):关闭一个还有人在 select 里投递的
-// channel 会 panic —— "select 里有 done 分支"挡不住这一点,两个 case 同时就绪时
-// 运行时会随机选,选中 send 分支就是 send on closed channel。所以关停改用 done 通知。
+// 退出条件只有 d.done(队列**不**会 close):关闭一个还有人在投递的 channel 会 panic
+// —— "select 里有 done 分支"挡不住这一点,两个 case 同时就绪时运行时会随机选,
+// 选中 send 分支就是 send on closed channel。所以关停改用 done 通知 + stopped 标志。
+//
+// 退出分两步(顺序不能反):先在锁内把自己标成 stopped(从此 submit 一律拒绝),
+// 再排空队列。若反过来,排空期间新 job 还能进来,排空就永远追不上。
 func (d *daemon) serveSession(e *sessionEntry) {
 	defer close(e.workerDone)
 	for {
 		select {
 		case <-d.done:
-			// 退出前把已经排队、但还没轮到的请求明确拒掉:留着它们只会让对应
-			// 的 client 干等自己的超时。
+			d.stopAcceptingJobs(e)
 			d.rejectQueued(e)
 			return
 		case j := <-e.jobs:
+			// 这里再判一次 done:两个 case 同时就绪时 Go 随机选,选中 jobs 分支
+			// 就说明我们在关停期间还要再跑一条 —— 那不划算(--stop 已经开始了),
+			// 直接拒掉更符合"正在退出"的承诺。
+			select {
+			case <-d.done:
+				d.stopAcceptingJobs(e)
+				d.rejectQueued(e)
+				// 把手里这条也拒掉 —— 它还没开始跑,不该被算成"执行过"。
+				d.rejectJob(j)
+				return
+			default:
+			}
 			d.runJob(e, j)
 		}
 	}
+}
+
+// stopAcceptingJobs 在锁内把会话标成 stopped:从此 submit 一律拒绝。
+func (d *daemon) stopAcceptingJobs(e *sessionEntry) {
+	d.mu.Lock()
+	e.stopped = true
+	d.mu.Unlock()
+}
+
+// rejectJob 把一条还没开始跑的 job 答复成「正在退出」。
+//
+// 它不该计入 running(从没执行过),由这里减回去 —— 与 submit 里的 +1 配对。
+func (d *daemon) rejectJob(j job) {
+	d.mu.Lock()
+	d.running--
+	d.mu.Unlock()
+
+	_ = writeResponse(j.conn, ipc.Response{
+		OK:     false,
+		Errors: []string{"daemon: daemon 正在退出"},
+		Exit:   1,
+	})
+	closeConnGracefully(j.conn)
 }
 
 // rejectQueued 把队列里剩下的请求逐个答复成「正在退出」。
@@ -550,12 +670,7 @@ func (d *daemon) rejectQueued(e *sessionEntry) {
 	for {
 		select {
 		case j := <-e.jobs:
-			_ = writeResponse(j.conn, ipc.Response{
-				OK:     false,
-				Errors: []string{"daemon: daemon 正在退出"},
-				Exit:   1,
-			})
-			closeConnGracefully(j.conn)
+			d.rejectJob(j)
 		default:
 			return
 		}
@@ -568,7 +683,8 @@ func (d *daemon) runJob(e *sessionEntry, j job) {
 	req := j.req
 
 	d.mu.Lock()
-	d.running++
+	// running 的 +1 在 submit 里做(投递即计入,否则"已投递未开始"的 job 不在
+	// 计数里,--stop 的宽限会以为没人在跑而立刻取消它们)。这里只标记 busy。
 	e.busy = true
 	e.lastUsed = time.Now()
 	d.mu.Unlock()
@@ -693,6 +809,12 @@ func (d *daemon) runJob(e *sessionEntry, j job) {
 func (d *daemon) statusText(conn net.Conn) string {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+
+	// --status 本身也算一次"有人在用这个 daemon",要刷新空闲计时。
+	// 否则「每 10 分钟 --status 探活」保不住 daemon —— 旧语义里任何连接都会重置
+	// Accept 的 idle deadline,这是相对旧行为的回归(见 watchdog 的注释)。
+	// 注意它**不**刷新任何会话的 lastUsed:那会让一个没人用的会话永远"活着"。
+	d.lastUsed = time.Now()
 
 	// cwd 用默认会话的目录(它跟着 cd 变)。默认会话还没建起来时(还没有任何一条
 	// 命令落到它)报 daemon 进程自己的 cwd —— 不编一个值,也不为了打印去建会话:
