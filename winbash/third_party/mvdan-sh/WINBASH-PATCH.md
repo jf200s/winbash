@@ -2,7 +2,7 @@
 
 **来源**：`mvdan.cc/sh/v3 v3.14.1`（未经修改的上游源码，复制自 Go module cache）
 **为何进库**：`go.mod` 里有一条 `replace mvdan.cc/sh/v3 => ./third_party/mvdan-sh`。
-**补丁范围**：三个补丁 —— 两个内建选项（`interp/builtin.go`，外加 `interp/runner.go` 一处调用点）、一处错误分类修正（`interp/runner.go`，见 §3）。共约 45 行。
+**补丁范围**：四个补丁 —— 两个内建选项（`interp/builtin.go`，外加 `interp/runner.go` 一处调用点）、一处错误分类修正（`interp/runner.go`，见 §3）、一处措辞对齐（`interp/builtin.go` + `interp/runner.go`，见 §4）。共约 85 行。
 
 ---
 
@@ -109,11 +109,64 @@ default:                       r.exit.fatal(err)
 `TestRedirectFailureDoesNotAbortScript` 专门盯**控制流**（不是字符串）——把补丁退回
 类型断言，这条会红并指出根因。
 
+### 4. `cd` 与 `>&` / `<&` 的措辞对齐真 bash
+
+**位置**：`interp/builtin.go` 的 `(*Runner).changeDir`（`cd` / `pushd` / `popd` 共用）
+与 `case "cd"` 的参数检查；`interp/runner.go` 的 `(*Runner).redir` 里 `case syntax.DplOut`
+与 `case syntax.DplIn` 的 `default`。
+
+**为什么在 winbash 侧拦不住**：这三处都在 mvdan/sh 的**内建**里，走不到 winbash 的
+`builtins` 措辞层（那一层只处理 ①/② 层命令）。`cd` 更特殊 —— 它直接改 runner 的当前目录，
+连 OpenHandler 都不过。
+
+**修前 → 修后**（全部对着真 Git Bash 实测，2026-10-18）：
+
+| 写法 | 修前 | 修后 = 真 bash |
+|---|---|---|
+| `cd <不存在>` | `cd: no such file or directory: "<路径>"` | `cd: <路径>: No such file or directory` |
+| `cd <一个文件>` | `cd: no such file or directory: "<路径>"` | `cd: <路径>: Not a directory` |
+| `cd ""` | `cd: empty directory path` | `cd: null directory` |
+| `cd a b` | `usage: cd [dir]` | `cd: too many arguments` |
+| `unset OLDPWD; cd -` | `cd: null directory` ← 把「没 cd 过」说成「空目录」 | `cd: OLDPWD not set` |
+| `cd <无权限>` | `cd: permission denied: "<路径>"` | `cd: <路径>: Permission denied` |
+| `echo x >& 99` | `unhandled >& arg: "99"` | `99: Bad file descriptor` |
+| `echo x <& 99` | `unhandled <& arg: "99"` | `99: Bad file descriptor` |
+
+三处共性缺陷：**路径被 `%q` 多包了一对引号**、**消息首字母小写**（POSIX 的 `strerror`
+是大写）、**错误原因被丢掉**（`cd` 把「stat 失败」与「不是目录」合并成一个分支，
+连 `err` 都不看）。
+
+**`err != nil` 与 `!info.IsDir()` 必须拆成两个分支**。上游是
+`if err != nil || !info.IsDir()` 一个分支报同一个措辞，于是 `cd <一个文件>` 说
+"不存在"——它其实存在，只是不是目录。拆开之后 `err == nil` 时**必须**先判 `IsDir()`，
+再往下走 `PWD` / `OLDPWD` 的更新（那两步在函数末尾，前置判定写错会静默漏掉）。
+
+**上游测试同步改了 13 处期望值**（`interp/interp_test.go`）：包括 `cd ''`、`noexist`、
+`>a && cd a`、`>&5`、5 处 `permission denied`、3 处 `pushd`/`popd`（共用 `changeDir`），
+以及 `ABS_PATH_A` 宏的定义（`%q` → 裸字符串，因为措辞不再带引号）。
+其中 `>a && cd a` 那条**变准确了**：`a` 是刚创建的文件，所以现在是 `Not a directory`。
+
+**已知遗留**（不算回归，都是另一件事）：
+
+- `cd <路径>` 报错里的路径是 **Windows 绝对形式**（如 `C:\Program Files\Git\no-such-dir`），
+  不是用户写的 `/no-such-dir`。根因在 winbash 的 `normalizeCdPath`：它在参数进 interp
+  **之前**就把 POSIX 路径改写成了 Windows 形式，而 interp 没有 API 能把原串带回来。
+  这与 `pwd` 的既定设计一致（`pwd` 刻意给 `D:\...`，以便直接喂给 Windows 工具），
+  所以本轮只对齐措辞、不动路径。
+- `exec 3>&1` 仍是 `unsupported redirect fd: 3` —— 那是**功能缺失**（不支持 fd 3），
+  不是措辞问题，属于另一个任务。
+
+**回归**:`internal/shell/cdwording_test.go`（7 条 / 18 子用例）。7 处变异全部抓到。
+
 ## 验证
 
 18 条用例与真 Git Bash 逐条对照，**全部一致**（含反向回归：未带 `-d`/`-n` 的 `read`/`mapfile`、以及原有的 `mapfile -d ""` 都不受影响）。语料回归在
 `internal/shell/pbb_corpus_test.go` 的 `read -d` / `mapfile -n` 小节，期望值由
 `go test ./internal/shell/ -update-pbb-corpus` 从**真 Git Bash** 生成，不手写。
+
+§4 的措辞补丁另有 **13 条** cd / 重定向用例与真 Git Bash 逐条对照（`cmd/winbash/e2e` 之外
+的直接实测，脚本见本轮工作记录），修前 6 类不一致、修后措辞全部一致。剩下 2 类差异是
+**已记录的遗留**（Windows 绝对路径形式、不支持 fd 3），见 §4 末。
 
 ## 升级流程
 
@@ -125,9 +178,20 @@ default:                       r.exit.fatal(err)
    `grep -n 'case "-d"' third_party/mvdan-sh/interp/builtin.go`（`read` 段）、
    `grep -n '"-n"' third_party/mvdan-sh/interp/builtin.go`（`mapfile` 段）、
    `grep -n 'errors.As(err, &pathErr)' third_party/mvdan-sh/interp/runner.go`（§3；
-   若新版已经不再用 `switch err.(type)` 而改用 `errors.As`，这一处就不用打了）；
+   若新版已经不再用 `switch err.(type)` 而改用 `errors.As`，这一处就不用打了）、
+   `grep -n 'null directory' third_party/mvdan-sh/interp/builtin.go`（§4 的 `cd`；
+   若新版自己就分开了 `err != nil` 与 `!info.IsDir()`、且措辞与真 bash 一致，
+   这一处就不用打了）、
+   `grep -n 'Bad file descriptor' third_party/mvdan-sh/interp/runner.go`（§4 的 `>&`/`<&`）；
 3. 如果上游已实现且行为一致，**删掉本补丁与 `replace` 行**，回到正常依赖；
 4. 跑 `go test ./... -count=1` 与 `smoke-gitbash.sh`，两者都必须绿。
+
+**注意 §4 会打破上游自己的测试**：`interp/interp_test.go` 里 13 处期望值断言的正是被改掉的
+旧措辞。重打补丁时要一并改回（清单见 §4），否则 `go test ./interp/` 会红一片 ——
+那是**预期内的红**，不是补丁打错了。截至 v3.14.1，`go test ./interp/` 还有 **1 条既存失败**
+（`TestRunnerRun/#377`，`foo=~; test -d $foo` 在 Windows 上被含空格的路径拆词）、
+`go test ./syntax/` 有 1 条既存失败（`TestPrintMultiline`）—— 两者在**未打补丁的上游源码上
+同样失败**，已用 `git stash` 对照确认。
 
 ## 为什么不选别的做法
 

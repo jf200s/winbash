@@ -271,6 +271,39 @@ echo x > /c/Windows/System32/drivers/etc/__nope
   `Incorrect function.`)。所以 `cat` 在 open 之后显式 stat 判目录,而不是靠错误码猜 —— 猜 `ERROR_INVALID_FUNCTION`
   是错的,那是通用错误码。
 
+**`cd` 与 `>&` / `<&` 也补完了**(2026-10-18)。它们比上面那批更难,因为都在 mvdan/sh 的
+**内建**里:`cd` 直接改 runner 的当前目录,连 `OpenHandler` 都不过;`>&` / `<&` 是语法层
+的重定向处理。所以只能给上游打补丁(`WINBASH-PATCH.md` §4):
+
+```
+cd nosuch          修前: cd: no such file or directory: "nosuch"
+                   修后: cd: C:\Program Files\Git\nosuch: No such file or directory
+                   真 bash: cd: nosuch: No such file or directory
+cd plain.txt       修前: cd: no such file or directory: "plain.txt"     ← 它明明存在
+                   修后: cd: plain.txt: Not a directory
+cd ""              修前: cd: empty directory path
+                   修后: cd: null directory                             (真 bash 同)
+cd a b             修前: usage: cd [dir]
+                   修后: cd: too many arguments                         (真 bash 同)
+unset OLDPWD; cd - 修前: cd: null directory      ← 把「你还没 cd 过」说成「你给了个空目录」
+                   修后: cd: OLDPWD not set                             (真 bash 同)
+echo x >& 99       修前: unhandled >& arg: "99"
+                   修后: 99: Bad file descriptor                        (真 bash 同)
+```
+
+三处共性缺陷:路径被 `%q` 多包一对引号、消息首字母小写、**错误原因被丢掉**。
+最要紧的是第二行 —— 上游把「stat 失败」与「不是目录」合成一个分支,于是 `cd` 一个
+**存在的文件**会说"不存在"。这决定 AI 下一步是去建目录还是查自己的路径,所以必拆。
+
+`cd ""` 与 `cd -`(OLDPWD 未设置)这两条**都是空串**,但真 bash 给的措辞不同
+(`null directory` / `OLDPWD not set`)。所以区分只能在 `case "cd"` 里做 ——
+那是唯一还知道「用户写的是 `-`」的地方;等空串流进 `changeDir` 就已经分不出来了。
+
+`cd` 报错里仍是 **Windows 绝对路径**(不是用户写的 `nosuch`),根因是 winbash 的
+`normalizeCdPath` 在参数进 interp **之前**就改写了,而 interp 没有 API 能把原串带回来。
+这与 `pwd` 的既定设计一致(见下表 `pwd` 那行),所以本轮只对齐措辞。
+回归在 `internal/shell/cdwording_test.go`(7 条 / 18 子用例)。
+
 ## 安全边界
 
 daemon 监听 `127.0.0.1`,端口写在一个**端口文件**里 —— 两行:地址 + 一个 128 位随机 token,
@@ -382,9 +415,10 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 | `command -v find` / `type find` | 这两个是 mvdan/sh 的内建,按进程 PATH 回答(给 System32 那个)。准确答案用 `which find`。**`command -v` 已被 guard 接管**:①/② 层内建与只在 Git Bash `usr\bin` 里的工具都答得对,**多名字也行**(`command -v ls cat`;`TestCommandVHandlesMultipleNames`)。一条残余缺口:**混合写法**会放行给 mvdan/sh —— 例如 `command -v ls git` 里 `ls` 仍被漏报(`git` 在进程 PATH 里、mvdan 自己答得对,而 `CallHandler` 只能返回一条命令,没法逐名字替换)。要逐个判存在就分开写:`command -v ls && command -v git`。`type -p` / `type -t` 与 `type find` 同待遇:**未接管**,按进程 PATH 回答 |
 | 显式写 `Git\bin\bash.exe` 时参数里的双引号 | 那个 47 KB 的 exe **不是 MSYS 程序**,是 Git for Windows 的原生 launcher(导入表只有 `KERNEL32`/`msvcrt`/`SHELL32`,没有 `msys-2.0.dll`)。它把命令行**转发**给 `usr\bin\bash.exe`,这一跳用 MSVC 规则重拼,参数里的 `"` 到真 bash 手里已经变成 `\` —— **不是我们的转义问题**:对原生目标用标准 MSVC 规则是对的,坏在第二跳不受我们控制。按 PATH 找 `bash`(`which bash` 给的就是 `usr\bin\bash.exe`)完全正常,只有显式写全路径到 `bin\` 才会撞上 |
 | `set -u` / `${v:?}` | 退出码 `1`(bash 的 `-c` 给 `127`),错误文本不带 `bash: line N:` 前缀——都非零、都点名变量 |
-| `cd` 的失败措辞 | 走 mvdan/sh 的内建实现,与真 bash 有两处不同(2026-10-18 实测):给的是 `cd: no such file or directory: "C:\Program Files\Git\x"`(**绝对路径** + 小写),真 bash 是 `cd: /x: No such file or directory`;`cd` 到一个文件时它说 `no such file or directory`,真 bash 说 `Not a directory`。退出码都是 `1`、都不静默,只是措辞与 bash 不齐。要判「目录在不在」用 `test -d` 而不是解析 `cd` 的报错 |
+| `cd` 的失败措辞 | **已修(2026-10-18)**,只剩路径形式这一处差异。现在给 `cd: <路径>: No such file or directory` / `Not a directory` / `Permission denied` / `null directory` / `too many arguments` / `OLDPWD not set`,与真 bash 逐条一致(修前是 `no such file or directory: "<带引号>"` 小写 + 把「不是目录」也说成「不存在」)。**剩余差异**:报错里的路径是 **Windows 绝对形式**(`cd: C:\Program Files\Git\x: …`),不是用户写的 `x`;根因是 `normalizeCdPath` 在参数进 interp 之前就改写了,而 interp 没有 API 带回原串 —— 这与 `pwd` 给 `D:\...` 是同一个既定设计。回归:`internal/shell/cdwording_test.go` |
+| `cd` 到**无权限**目录 | Windows 上 `cd /c/Windows/System32/config` 会**成功**(rc=0),真 bash 报 `Permission denied`、rc=1。原因是 Windows 的 ACL 与 `AccessExec` 判定不把它当"不可进入"(同一目录 `test -x` 两边都返回真)。这是**平台权限模型差异**,不是措辞问题 —— 在 Windows 上普通用户确实能列这个目录 |
+| `>&` / `<&` 的非法编号 | **已修(2026-10-18)**:`echo x >& 99` / `2>&99` / `<& 99` 现在给 `99: Bad file descriptor`(真 bash 同),修前是 `unhandled >& arg: "99"`(露内部 token 名)。**剩余差异**:⓵ `>&bad`(非数字)真 bash **静默**按 `&>bad` 处理、创建文件、rc=0,我们报 `bad: Bad file descriptor` —— 按「不静默做错事」的底线,响亮更好;⓶ `exec 3>&1` 仍给 `unsupported redirect fd: 3`,那是**功能缺失**(不支持 fd 3),不是措辞问题;⓷ `echo x >&-`(关闭 stdout)真 bash 写时报 `write error: Bad file descriptor`、rc=1,我们用 `io.Discard` 让写"成功"、rc=0(既存,非本轮引入) |
 | 从目录重定向输入(`source adir` / `cat < adir` / `read < adir`) | **已修(2026-10-18)**,但有一条**语义差异要记住**。Windows 上 `os.Open` 一个目录会**成功**(`O_RDONLY`),失败要到第一次 Read 才发生 —— 所以修前这些报错带着 `Incorrect function.`、绝对路径,`read`/`mapfile` 甚至**完全静默**。现在在 open 阶段就判目录,统一给 `<你写的路径>: Is a directory`。**语义差异**:`read < 目录` / `mapfile < 目录` 在真 bash 里是 open 成功、失败在读(`read` 报错返回 1、脚本继续;`mapfile` 干脆静默 n=0),而我们是「重定向失败、命令不执行」—— `read` 那条脚本层面一致(都 rc=1、都不终止),`mapfile` 那条从「静默成功」变成「响亮失败」(按项目底线,响亮是更好的那边)。回归:`internal/shell/readerr_test.go` |
-| 脚本报错里的文件名 | `./script` 执行出错时,mvdan/sh 用**绝对路径**当脚本名(`C:/Users/.../script: line 1: …`),真 bash 用你写的那个(`./script: line 1: …`)。只影响报错前缀,不影响退出码 |
 | 脚本报错里的文件名 | `./script` 执行出错时,mvdan/sh 用**绝对路径**当脚本名(`C:/Users/.../script: line 1: …`),真 bash 用你写的那个(`./script: line 1: …`)。只影响报错前缀,不影响退出码 |
 | `${#关联数组[@]}` | mvdan/sh 的缺口:恒返回 `1`(键列表 `${!m[@]}` 与取值都是对的) |
 | `IFS` 给**多字符** | mvdan/sh 把整个串当分隔符,真 bash 只取**第一个字符**(`IFS=BC` 等价 `IFS=B`)。**静默**差异,光看输出看不出对错 —— 要按多字符分,请用 `IFS=,` 这类单字符,或先 `tr` 转换 |
