@@ -411,3 +411,93 @@ func TestLsMissingPathIsAnErrorNotSilence(t *testing.T) {
 		t.Fatalf("code=%d err=%q", code, errw.String())
 	}
 }
+
+// ★ 单个文件参数的名字必须是**参数原文**,不是 basename。
+//
+// 真 GNU 对**所有**操作数都输出参数原文(实测真 Git Bash 2026-10-18):
+//
+//	ls /abs/real.txt  → "/abs/real.txt"
+//	ls ./real.txt     → "./real.txt"
+//
+// 这条一度只在 `ls -d` 分支做对,普通分支给的是 `filepath.Base`,于是同一个二进制里
+// 有两种口径。它危害的实际形态:AI 用 `ls <绝对路径>` 拿到裸文件名,再拿它去拼别的
+// 路径时就会丢目录。
+//
+// 为什么这条测试以前没有:既有的 `TestLsDefaultIsOneNamePerLine` 等都用 `t.TempDir()`
+// 当 cwd、只传裸名字,所以"Base 与原文相同",测不出区别 —— 是结构性盲区。
+func TestLsFileArgumentKeepsVerbatimText(t *testing.T) {
+	dir := t.TempDir()
+	abs := filepath.Join(dir, "real.txt")
+	if err := os.WriteFile(abs, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 绝对路径:必须原样输出,**不能**截成 real.txt。
+	out, errw, code := lsIn(t, dir, abs)
+	if code != 0 {
+		t.Fatalf("绝对路径: code=%d errw=%q", code, errw)
+	}
+	if got := strings.TrimSpace(out); got != abs {
+		t.Fatalf("绝对路径参数应当原样输出 %q(真 bash 就是这么做的),"+
+			"得到 %q —— 用 filepath.Base 会截成裸文件名", abs, got)
+	}
+
+	// `./` 前缀:必须保留。
+	out, _, code = lsIn(t, dir, "./real.txt")
+	if code != 0 {
+		t.Fatalf("./rel: code=%d", code)
+	}
+	if got := strings.TrimSpace(out); got != "./real.txt" {
+		t.Fatalf("`./real.txt` 应当原样输出,得到 %q —— "+
+			"丢了 `./` 之后,下游若直接拼接就会落到别的目录", got)
+	}
+
+	// 反向:名字得是**这个**文件的,不能把整个目录都列出来。
+	// 判据取 TrimSpace 之后的行数 —— 行尾那个换行不算多行。
+	if lines := strings.Split(strings.TrimSpace(out), "\n"); len(lines) != 1 {
+		t.Fatalf("传一个文件只该输出一行,得到 %d 行:%q", len(lines), out)
+	}
+}
+
+// ★ 空字符串路径参数必须**响亮拒绝**,不能静默当成当前目录。
+//
+// 修之前(实测 2026-10-18)的两个坏形态:
+//
+//	ls ""     → rc=0,列出**当前目录的全部内容**
+//	ls -d ""  → rc=0,输出一个空行
+//	真 bash   → rc=2,`ls: cannot access '': No such file or directory`
+//
+// `ls ""` 那条最坏:调用方(典型是 AI)拿到的是一份看起来完全正常的目录列表,
+// 于是会以为列的就是它传的那个目录 —— 静默给出错值,正是项目底线要防的形态。
+//
+// 根因是 ResolvePath 把 `""` 当 cwd(那个分支是为 `cd ""` 不改目录服务的)。
+// 修法是**只收窄 ls 自己的口径**,不动 ResolvePath —— 它对 cd 是对的。
+func TestLsRejectsEmptyPathArgument(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, argv := range [][]string{
+		{""},
+		{"-d", ""},
+		{"-l", ""},
+		{"a.txt", ""}, // 混在合法参数里也要拒绝,不能只处理第一个
+	} {
+		out, errw, code := lsIn(t, dir, argv...)
+		if code == 0 {
+			t.Fatalf("参数 %q: 空字符串路径必须非零退出,否则会静默列出当前目录 "+
+				"(out=%q)", argv, out)
+		}
+		if code != 2 {
+			t.Fatalf("参数 %q: 这是用法错误,应当 exit=2,得到 %d", argv, code)
+		}
+		if !strings.Contains(errw, "空字符串") {
+			t.Fatalf("参数 %q: 错误行要点明是空字符串的问题,得到 %q", argv, errw)
+		}
+		// 绝不能有 stdout —— 一份"看起来正常"的列表正是最坏的结果。
+		if strings.TrimSpace(out) != "" {
+			t.Fatalf("参数 %q: 被拒时不该有任何 stdout 输出,得到 %q", argv, out)
+		}
+	}
+}
