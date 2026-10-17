@@ -95,6 +95,25 @@ var pbbCases = []pbbCase{
 	{"IFS 影响 $*", "OTHERS / (IFS 与位置参数)", `set -- a b c; IFS=-; printf '%s\n' "$*"`, ""},
 	{"here-string 与 read", "OTHERS / (here-string)", `read -r a b <<< "one two three"; printf '%s|%s\n' "$a" "$b"`, ""},
 	{"命令替换嵌套", "OTHERS / (命令替换)", `printf '%s\n' "$(printf '%s' "$(echo deep)")"`, ""},
+
+	// ---- FILE HANDLING:read -d(依赖 third_party/mvdan-sh 的本地补丁) ----
+	//
+	// 这四条在补丁之前是**静默错值**:上游报 `read: invalid option "-d"`,但外层
+	// 退出码仍是 0、变量留空 —— 调用方看到"成功"却拿到空数据。
+	{"read -d '' 读到 EOF", "FILE HANDLING / Read a file to an array (bash<4)", `read -d "" x < testdata/pbb-f.txt; printf '[%s] exit=%s\n' "$x" "$?"`, ""},
+	{"read -d '' -ra 切分成数组", "FILE HANDLING / Read a file to an array (bash<4)", `IFS=$'\n' read -d "" -ra fd < testdata/pbb-f.txt; printf '[%s]' "${fd[@]}"; echo`, ""},
+	{"read -rd '' 组合开关", "FILE HANDLING / Read a file to an array (bash<4)", `read -rd "" x < testdata/pbb-f.txt; printf '[%s]\n' "$x"`, ""},
+	{"read -d 自定义分隔", "FILE HANDLING / (read -d)", `printf 'a:b:c' | { IFS=: read -d : x; printf '[%s]\n' "$x"; }`, ""},
+
+	// ---- FILE HANDLING:mapfile -n(依赖同一补丁) ----
+	//
+	// bible 的 head / tail / lines 三个函数全靠 -n;补丁前它们的产出是"空数组 +
+	// exit 0",而且 -- 这是重点 -- 光看输出分不清是"文件真的空"还是"选项没被支持"。
+	{"mapfile -tn 取前 N 行", "FILE HANDLING / Get the first N lines", `mapfile -tn 2 line < testdata/pbb-f.txt; printf '[%s]' "${line[@]}"; echo`, ""},
+	{"mapfile -tn 0 取末尾切片", "FILE HANDLING / Get the last N lines", `mapfile -tn 0 line < testdata/pbb-f.txt; printf '[%s]' "${line[@]: -2}"; echo`, ""},
+	{"lines 函数(mapfile -tn 0)", "FILE HANDLING / Get the number of lines", `lines() { mapfile -tn 0 l < "$1"; printf '%s\n' "${#l[@]}"; }; lines testdata/pbb-f.txt`, ""},
+	{"mapfile -n 0 等于全部", "FILE HANDLING / Get the first N lines", `mapfile -tn 0 line < testdata/pbb-f.txt; printf 'n=%s\n' "${#line[@]}"`, ""},
+	{"mapfile -n 超过总行数", "FILE HANDLING / Get the first N lines", `mapfile -tn 99 line < testdata/pbb-f.txt; printf 'n=%s\n' "${#line[@]}"`, ""},
 } // pbbCases
 
 var updatePbb = flag.Bool("update-pbb-corpus", false,

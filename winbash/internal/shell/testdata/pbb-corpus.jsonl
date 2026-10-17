@@ -35,3 +35,12 @@
 {"name":"IFS 影响 $*","out":["a-b-c"],"exit":0,"source":"OTHERS / (IFS 与位置参数)"}
 {"name":"here-string 与 read","out":["one|two three"],"exit":0,"source":"OTHERS / (here-string)"}
 {"name":"命令替换嵌套","out":["deep"],"exit":0,"source":"OTHERS / (命令替换)"}
+{"name":"read -d '' 读到 EOF","out":["[line1","line2","line3] exit=1"],"exit":0,"source":"FILE HANDLING / Read a file to an array (bash\u003c4)"}
+{"name":"read -d '' -ra 切分成数组","out":["[line1][line2][line3]"],"exit":0,"source":"FILE HANDLING / Read a file to an array (bash\u003c4)"}
+{"name":"read -rd '' 组合开关","out":["[line1","line2","line3]"],"exit":0,"source":"FILE HANDLING / Read a file to an array (bash\u003c4)"}
+{"name":"read -d 自定义分隔","out":["[a]"],"exit":0,"source":"FILE HANDLING / (read -d)"}
+{"name":"mapfile -tn 取前 N 行","out":["[line1][line2]"],"exit":0,"source":"FILE HANDLING / Get the first N lines"}
+{"name":"mapfile -tn 0 取末尾切片","out":["[line2][line3]"],"exit":0,"source":"FILE HANDLING / Get the last N lines"}
+{"name":"lines 函数(mapfile -tn 0)","out":["3"],"exit":0,"source":"FILE HANDLING / Get the number of lines"}
+{"name":"mapfile -n 0 等于全部","out":["n=3"],"exit":0,"source":"FILE HANDLING / Get the first N lines"}
+{"name":"mapfile -n 超过总行数","out":["n=3"],"exit":0,"source":"FILE HANDLING / Get the first N lines"}
