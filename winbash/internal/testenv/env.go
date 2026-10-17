@@ -60,3 +60,35 @@ func CleanBashEnv() []string {
 	}
 	return out
 }
+
+// WithPosixPath 把 dir 插到 PATH 最前面,返回新的环境列表。
+//
+// 为什么需要:差分测试的参照物是 Git Bash,而它要用的 Unix 工具(ls/wc/tr/sort/find/
+// xargs)都在 Git 的 usr\bin 里 —— **宿主 PATH 不保证含它**。从 PowerShell 跑
+// `go test` 时 PATH 里只有 `Git\cmd`(那个只有 git.exe),于是"真 bash"连 ls 都找不到:
+//
+//	command -v ls   → 参照侧 exit 1,而 winbash 给 0
+//
+// 这种红与 winbash 无关,纯属参照物环境不完整,却会把人引向"我们的 ls 有问题"。
+// 参照侧的环境必须由我们自己给全,不能指望调用者的 shell —— 与 CleanBashEnv
+// 固定 MSYS/locale 是同一条理由(参照物不可信,整组差分测试就没有意义)。
+func WithPosixPath(env []string, dir string) []string {
+	if dir == "" {
+		return env
+	}
+	out := make([]string, 0, len(env)+1)
+	replaced := false
+	for _, kv := range env {
+		name, val, ok := strings.Cut(kv, "=")
+		if ok && strings.EqualFold(name, "PATH") {
+			out = append(out, "PATH="+dir+string(os.PathListSeparator)+val)
+			replaced = true
+			continue
+		}
+		out = append(out, kv)
+	}
+	if !replaced {
+		out = append(out, "PATH="+dir)
+	}
+	return out
+}

@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"winbash/internal/testenv"
@@ -303,26 +304,41 @@ EOF`},
 //
 // 注意不能直接用 PATH 里的 `bash`:本机实测那个是**损坏的 WSL relay**
 // (`execvpe(/bin/bash) failed`),拿它做参照系会把所有断言带偏。
+//
+// 也**不要**优先用 `C:\Program Files\Git\bin\bash.exe`:它只有 47 KB,是 Git for
+// Windows 的**原生 launcher**(导入表里只有 KERNEL32/msvcrt/SHELL32/SHLWAPI/USER32,
+// 没有 msys-2.0.dll),它把命令行**转发**给 usr\bin\bash.exe —— 那一跳用 MSVC 规则
+// 重新拼,于是含双引号的脚本到真 bash 手里已经被吃掉了:
+//
+//	echo -e "a\tb"   → 真 bash 收到 `echo -e \a\tb\` → 输出 `atb\`
+//
+// 拿它当参照系,等于把"转发损坏"当成"真 bash 的行为",再把 winbash 的正确结果
+// 判成错 —— 这正是本组测试一度 5 条红的原因。所以参照物只认 usr\bin 那份。
 func findRealBash(t *testing.T) string {
 	t.Helper()
+	if usrBin := gitBashUsrBin(); usrBin != "" {
+		if c := filepath.Join(usrBin, "bash.exe"); fileExists(c) {
+			return c
+		}
+	}
 	candidates := []string{
+		`C:\Program Files\Git\usr\bin\bash.exe`,
+		`C:\Program Files (x86)\Git\usr\bin\bash.exe`,
 		`C:\Program Files\Git\bin\bash.exe`,
 		`C:\Program Files (x86)\Git\bin\bash.exe`,
 	}
 	for _, c := range candidates {
-		if st, err := os.Stat(c); err == nil && !st.IsDir() {
-			return c
-		}
-	}
-	// 退一步:usr\bin 的同级 bin 目录。
-	if usrBin := gitBashUsrBin(); usrBin != "" {
-		c := filepath.Join(filepath.Dir(filepath.Dir(usrBin)), "bin", "bash.exe")
-		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+		if fileExists(c) {
 			return c
 		}
 	}
 	t.Skip("这台机器上没有真 Git Bash,无法做真 bash 对照")
 	return ""
+}
+
+func fileExists(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
 }
 
 // runRealBash 跑一条语料,拿期望的 stdout 与退出码。
@@ -337,8 +353,28 @@ func findRealBash(t *testing.T) string {
 // 这个意图写在代码里,免得以后有人往一边加环境依赖。
 func runRealBash(t *testing.T, bash, script string) (string, int) {
 	t.Helper()
+	// 真 Git Bash 是 MSYS/Cygwin 程序:它用 build_argv 解析命令行,而 Go 默认的
+	// syscall.EscapeArg 拼的是 MSVC CRT 规则 —— `\"` 到 build_argv 那里会变成
+	// 「字面 \ + 引号结束」。于是**参照值先坏掉了**,失败信息还指着 winbash:
+	//
+	//	echo -e "a\tb"        bash 侧"期望"变成 atb\
+	//	echo "$(pwd | wc -l)" bash 侧直接 exit=2(脚本文本已被损坏)
+	//
+	// 我们自己启动 MSYS 程序时早就是按它那套规则拼的(见 msysargv.go),参照侧同理。
+	// 参照物不可信,整组差分测试就没有意义 —— 这正是 testenv 那个包存在的理由。
 	cmd := exec.Command(bash, "-c", script)
-	cmd.Env = testenv.CleanBashEnv()
+	// 只有目标是**真的 MSYS 程序**时才用 build_argv 那套引号规则。usr\bin\bash.exe
+	// 是(导入 msys-2.0.dll);一旦退回到 Git\bin\bash.exe 那个原生 launcher,就得用
+	// Go 默认规则 —— 给它套 MSYS 引号,它会把单引号原样转发给下一跳,所有用例当场
+	// exit=127(实测)。
+	if isMSYSBinary(bash) {
+		cmd.SysProcAttr = &syscall.SysProcAttr{CmdLine: strings.Join([]string{
+			quoteMSYSArg(bash), "-c", quoteMSYSArg(script),
+		}, " ")}
+	}
+	// 参照侧的 PATH 由我们给全:bash 所在的 usr\bin 必须在前,否则它连 ls 都找不到
+	// (宿主从 PowerShell 跑 go test 时 PATH 里只有 Git\cmd)。理由见 testenv.WithPosixPath。
+	cmd.Env = testenv.WithPosixPath(testenv.CleanBashEnv(), filepath.Dir(bash))
 	cmd.Stdin = strings.NewReader("")
 	out, err := cmd.Output()
 	code := 0

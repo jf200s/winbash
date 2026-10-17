@@ -172,7 +172,7 @@ func TestUpdatePbbCorpus(t *testing.T) {
 	var buf bytes.Buffer
 	for _, c := range pbbCases {
 		cmd := exec.Command(bash, "-c", c.script)
-		cmd.Env = testenv.CleanBashEnv()
+		cmd.Env = testenv.WithPosixPath(testenv.CleanBashEnv(), filepath.Dir(bash))
 		cmd.Stdin = strings.NewReader("")
 		var out, errb bytes.Buffer
 		cmd.Stdout = &out
