@@ -305,7 +305,8 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 
 - **`corpus_test.go` / `pbb_corpus_test.go` 是差分测试**(拿真 bash 的实际输出当参照)。它们的 `known:` 语料是**豁免说明** —— 「这几条差异存在,比对时跳过」。所以一条差异被列进 `known:`,只说明它被**承认**,不说明它被**钉住**。这两件事别混。
 - 真正把行为写死的是各层专项测试:`classify_test.go`(printf/trap 类缺口)、`commandv_test.go`、`grep_test.go` + `grep_binary_test.go` + `grep_classes_test.go` + `grep_class_scanner_test.go`、`ls_test.go`、`cat_test.go`、`msyspath_e2e_test.go`、`msysargv_test.go`、`trapguard_test.go`、`oilspec_gaps_test.go`、`internal/winmgmt/pwshcmd_test.go`、`internal/daemon/guard_test.go` + `internal/daemon/stdin_cwd_test.go`、`cmd/winbash/e2e_test.go`。
-  (`stdin_cwd_test.go` 是 2026-10-18 补的:`daemon` 包里 **stdin 流式转发**与 **cwd 切换**原先覆盖率是 **0%** —— 两条主路径只有 e2e 间接带着。补完 `startStdinStream` 0→91.7%、`shellQuote` 0→100%、`rejectJob` 0→100%,该包总覆盖 71.6%→80.5%。)
+  (`stdin_cwd_test.go` 是 2026-10-18 补的:`daemon` 包里 **stdin 流式转发**与 **cwd 切换**原先覆盖率是 **0%** —— 两条主路径只有 e2e 间接带着。`state_test.go` 同日补的是**会话池记账与关停超时**(`entryStatusLocked` 40→100%、`waitWorker` 50→100%、`closeSessions` 67→100%、`submit` 73→100%、`tokenOK` 67→100%、`pickSession` 53→75%)。该包总覆盖 **71.6% → 86.6%**。)
+- 还有三条**刻意不测**的(写了就是不稳定测试):`pickSession` 里「锁外建 Session 期间 daemon 开始关停」与「别人抢先建了同名」两处竞态窗口 —— 只在极窄调度窗口命中,靠 sleep 碰运气必然 flaky,而注入 hook 会让生产代码为测试让步;`newToken` 的 `rand.Read` 失败分支同理(需注入随机源)。这三处靠 code review 保证。
 - 有 5 条只是**弱覆盖**(测试覆盖了相邻行为,但没有逐字钉住这条差异):显式 `Git\bin\bash.exe` 的第二跳吃引号、`grep -E 'a*?'` 的匹配数差异、`ls` 默认不列点文件、`grep -r` 的 `./` 前缀、`pwsh -c "$env:X"` 的空展开。改这些地方时不能指望测试变红。**这份清单是照测试注释与断言盘的,不是机器判定** —— 某个用例后来被加强了,这里就会偏保守(写"弱"而其实够强),不会反过来。
   (原先这里还有一条 `ls -l` 的四列;那一列已经补成 7 列,不再算"弱覆盖",见表格里对应的行。)
 
