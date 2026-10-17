@@ -112,6 +112,17 @@ func stdinIsStream() bool {
 	return info.Mode()&os.ModeCharDevice == 0
 }
 
+// manageTimeout 是 --status / --stop 这类**管理操作**的上限。
+//
+// 它们原先传 timeout=0(不设上限),而 exchange 里只有 timeout>0 才 SetDeadline ——
+// 于是 daemon 被一条长命令占住时(daemon 串行处理连接),`winbash --status` 会
+// **永久挂起**。实测:daemon 忙时 `timeout 5 winbash --status` 退出码 124(被外层
+// 杀掉),而同样忙的状态下 `--timeout 2s -c 'echo x'` 是准时返回的。
+//
+// 管理操作的意义恰恰是「看它活着没」,无限等是最坏的失败形态:看上去像挂死,
+// 使用者只能 Ctrl+C —— 那比一句"它可能正忙"糟得多。
+const manageTimeout = 5 * time.Second
+
 // Stop 让 daemon 退出。
 //
 // mustExist 的语义在这里很要紧:daemon 没在跑时**不把它拉起来** ——
@@ -122,8 +133,12 @@ func Stop(endpoint string) error {
 		return fmt.Errorf("client: 你正跑在一个 winbash 会话里,不能停掉自己所在的 daemon" +
 			"(嵌套的 winbash 是独立的,它不连 daemon);要停请在外面执行 winbash --stop")
 	}
-	resp, err := oneShot(endpoint, ipc.Request{Op: "stop"}, true, 0, 0)
+	resp, err := oneShot(endpoint, ipc.Request{Op: "stop"}, true, manageTimeout, 0)
 	if err != nil {
+		if isTimeout(err) {
+			return fmt.Errorf("client: --stop 在 %v 内没有响应 —— daemon 可能正被一条长命令占着"+
+				"(它串行处理连接);等它跑完再重试", manageTimeout)
+		}
 		return err
 	}
 	if !resp.OK {
@@ -139,8 +154,12 @@ func Status(endpoint string) (string, error) {
 		return "", fmt.Errorf("client: 你正跑在一个 winbash 会话里,看不到 daemon 状态" +
 			"(嵌套的 winbash 不连 daemon);要看状态请在外面执行 winbash --status")
 	}
-	resp, err := oneShot(endpoint, ipc.Request{Op: "status"}, true, 0, 0)
+	resp, err := oneShot(endpoint, ipc.Request{Op: "status"}, true, manageTimeout, 0)
 	if err != nil {
+		if isTimeout(err) {
+			return "", fmt.Errorf("client: --status 在 %v 内没有响应 —— daemon 可能正被一条长命令占着"+
+				"(它串行处理连接);等它跑完再重试", manageTimeout)
+		}
 		return "", err
 	}
 	return string(resp.Out), nil
