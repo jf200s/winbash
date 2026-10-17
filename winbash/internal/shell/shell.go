@@ -105,8 +105,9 @@ func (s *switchWriter) Write(p []byte) (int, error) {
 
 // EnvNested 是「正跑在 winbash 会话里」的标记,由 ② 层与 ③ 层派生给子进程。
 //
-// 为什么需要它:daemon 一条连接串行处理(见 daemon.Serve),会话里某条命令正在跑时,
-// 若它又去连同一个 daemon,两边会互相等到 client 的 300s 超时 —— 实测
+// 为什么需要它:请求是投到**会话队列**里严格 FIFO 串行执行的(每个会话一个 worker,
+// 见 daemon.serveSession),而不是整个 daemon 一把锁 —— 但会话里某条命令正在跑时,
+// 若它又去连同一个 daemon 并落到**同一个会话**,两边仍会互相等到 client 的 300s 超时 —— 实测
 // `winbash -c 'winbash -c echo'` 正是这样挂住的。真 bash 的嵌套 bash 是两个独立进程,
 // 所以这里也照办:带着标记的 client 改走本地一次性会话(client.Run 的嵌套分支)。
 //
@@ -844,10 +845,11 @@ func (s *Session) SetStdinBytes(b []byte) {
 //
 // 为什么让调用方持有写端而不是把 reader 塞进 Session:Session 是 shell 层,
 // 不该知道 TCP/连接的存在;写端的生命周期与连接的生命周期本来就在 daemon 一侧,
-// 归它管分层才干净(见 daemon.handle 的停止时序)。
+// 归它管分层才干净(见 daemon.handleConn 里 job 的停止时序)。
 //
-// 两者互斥 —— 一次 Run 只能设其一。两者都在 Run 之前、由同一线程调用,
-// 串行的 daemon.handle 保证了这一点。
+// 两者互斥 —— 一次 Run 只能设其一。两者都在 Run 之前、由同一线程调用:每个会话
+// 一个 worker(daemon.serveSession),同一个 Session 上的 Run 在那条队列里严格 FIFO、
+// 不并发 —— 这正是这里不做额外加锁的依据。跨会话是并行的,但那时各自 Session 不同。
 //
 // 读端仍由 Run 结束时的 closeStdin 关闭并换回 /dev/null,调用方不必管读端。
 func (s *Session) StdinPipe() (io.WriteCloser, error) {

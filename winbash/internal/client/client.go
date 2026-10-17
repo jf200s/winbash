@@ -120,12 +120,16 @@ func stdinIsStream() bool {
 // manageTimeout 是 --status / --stop 这类**管理操作**的上限。
 //
 // 它们原先传 timeout=0(不设上限),而 exchange 里只有 timeout>0 才 SetDeadline ——
-// 于是 daemon 被一条长命令占住时(daemon 串行处理连接),`winbash --status` 会
-// **永久挂起**。实测:daemon 忙时 `timeout 5 winbash --status` 退出码 124(被外层
-// 杀掉),而同样忙的状态下 `--timeout 2s -c 'echo x'` 是准时返回的。
+// 于是 daemon 一时没回话,`winbash --status` 就会**永久挂起**。当年的实测(daemon
+// 串行、忙时):`timeout 5 winbash --status` 退出码 124(被外层杀掉),而同样忙的
+// 状态下 `--timeout 2s -c 'echo x'` 是准时返回的。
+//
+// 现在 daemon 并发处理连接、op 分派在会话队列**之前**(daemon.handleConn),所以
+// 「被一条长命令占着」已经不是管理操作会遇到的形态 —— 这个上限只剩**最后的保险**:
+// daemon 卡在关停、或已经不再接受连接时,让调用方拿到一句说明而不是无限等。
 //
 // 管理操作的意义恰恰是「看它活着没」,无限等是最坏的失败形态:看上去像挂死,
-// 使用者只能 Ctrl+C —— 那比一句"它可能正忙"糟得多。
+// 使用者只能 Ctrl+C —— 那比一句「它可能卡住了」糟得多。
 const manageTimeout = 5 * time.Second
 
 // Stop 让 daemon 退出。
@@ -141,8 +145,8 @@ func Stop(endpoint string) error {
 	resp, err := oneShot(endpoint, ipc.Request{Op: "stop"}, true, manageTimeout, 0)
 	if err != nil {
 		if isTimeout(err) {
-			return fmt.Errorf("client: --stop 在 %v 内没有响应 —— daemon 可能正被一条长命令占着"+
-				"(它串行处理连接);等它跑完再重试", manageTimeout)
+			return fmt.Errorf("client: --stop 在 %v 内没有响应 —— daemon 可能卡在关停上"+
+				"(它已经不再接受新命令了,不是在排队);稍后重试一次,或看 --status", manageTimeout)
 		}
 		return err
 	}
@@ -152,7 +156,7 @@ func Stop(endpoint string) error {
 	return nil
 }
 
-// Status 取 daemon 的状态(pid / cwd / ② 层引擎)。同样不拉起 daemon。
+// Status 取 daemon 的状态(pid / cwd / ② 层引擎 / 会话池明细)。同样不拉起 daemon。
 func Status(endpoint string) (string, error) {
 	if inSession() {
 		// 嵌套里看不了 daemon 状态:去连它只会等到 300s 超时(理由见 EnvNested)。
@@ -162,8 +166,8 @@ func Status(endpoint string) (string, error) {
 	resp, err := oneShot(endpoint, ipc.Request{Op: "status"}, true, manageTimeout, 0)
 	if err != nil {
 		if isTimeout(err) {
-			return "", fmt.Errorf("client: --status 在 %v 内没有响应 —— daemon 可能正被一条长命令占着"+
-				"(它串行处理连接);等它跑完再重试", manageTimeout)
+			return "", fmt.Errorf("client: --status 在 %v 内没有响应 —— daemon 可能卡在关停上"+
+				"(它已经不再接受新命令了,不是在排队);稍后重试一次", manageTimeout)
 		}
 		return "", err
 	}
@@ -328,7 +332,8 @@ func exchange(conn net.Conn, req ipc.Request, timeout time.Duration) (ipc.Respon
 	//
 	// 这支不 join:client 是短命进程,主流程拿到响应就返回、进程随之退出,
 	// 上游永不 EOF 把它卡住也不阻塞主流程。真正必须精确回收的是 daemon 侧那支
-	// (见 daemon.startStdinStream 的 stop)—— 它若不回收,串行的 handle 会被占死。
+	// (见 daemon.startStdinStream 的 stop)—— 它若不回收,那个会话的队列会被一直占着,
+	// 投给同一个会话的后续命令全部排不上。
 	if req.StdinMode == ipc.StdinStream {
 		go func() {
 			_, _ = io.Copy(conn, os.Stdin)
@@ -533,8 +538,9 @@ func inSession() bool {
 
 // runLocal 在**本进程内**跑一段脚本,不连 daemon。
 //
-// 为什么嵌套必须走这条路:daemon 一条连接串行处理(daemon.Serve),而这次调用正是
-// 从某条**正在 daemon 里跑着的**命令派生出来的。去连它 = 外层等内层、内层等外层,
+// 为什么嵌套必须走这条路:这次调用正是从**某条正在 daemon 里跑着的**命令派生出来的,
+// 而会话内的请求是严格 FIFO 串行的(每会话一个 worker)。内层去连同一个 daemon、又落到
+// 同一个会话,就得排在父命令后面;父命令却在等内层退出。去连它 = 外层等内层、内层等外层,
 // 两边僵到 client 的 300s 超时才散场。真 bash 的嵌套 bash 是两个独立进程,
 // 这里照样:起一个一次性会话,跑完就收。
 //

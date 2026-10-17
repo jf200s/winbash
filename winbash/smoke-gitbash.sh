@@ -119,9 +119,20 @@ check "stderr 无 exit status 噪音" "0" "$(wb -c 'ls | grep zzz' 2>&1 >/dev/nu
 check "printf -v 被拦下"     "1"     "$(wb -c "printf -v x '%s' a" >/dev/null 2>&1; echo $?)"
 check "trap DEBUG 被拦下"    "1"     "$(wb -c "trap 'true' DEBUG" >/dev/null 2>&1; echo $?)"
 check "trap INT 被拦下"      "1"     "$(wb -c "trap '' INT" >/dev/null 2>&1; echo $?)"
-check "trap EXIT 照常工作"   "bye"   "$(wb -c "trap 'echo bye' EXIT; echo hi" | tail -1)"
-check "callback 含 DEBUG 不误拦" "ok" "$(wb -c "trap 'echo DEBUG-hit' EXIT; echo ok" | head -1)"
+check "trap EXIT 照常工作"   "bye"   "$(wb --fresh -c "trap 'echo bye' EXIT; echo hi" | tail -1)"
+# 这两条必须用 --fresh:在**默认会话**里设 EXIT trap 会跨命令持久(README 的
+# 「会话级状态」写了这一点),于是后续每条命令都多打一行 —— 实测就把后面
+# 「默认会话也隔离」污染成 "none\nDEBUG-hit"。断言要隔离,别让断言本身改变被测状态。
+check "callback 含 DEBUG 不误拦" "ok" "$(wb --fresh -c "trap 'echo DEBUG-hit' EXIT; echo ok" | head -1)"
 check "进程替换被拦下"       "2"     "$(wb -c 'diff <(echo a) <(echo a)' >/dev/null 2>&1; echo $?)"
+
+echo "-- 会话(--session):同名内状态持久、跨名隔离、与 --fresh 互斥"
+check "同会话内状态持久"     "one"   "$(wb --session sm-a -c 'S=one'; wb --session sm-a -c 'echo $S')"
+check "跨会话隔离"           "none"  "$(wb --session sm-b -c 'echo ${S:-none}')"
+check "默认会话也隔离"       "none"  "$(wb -c 'echo ${S:-none}')"
+check "--fresh 与 --session 互斥" "2" "$(wb --fresh --session sm-a -c 'echo x' >/dev/null 2>&1; echo $?)"
+check "--session 与 --serve 互斥"  "2" "$(wb --session sm-a --serve >/dev/null 2>&1; echo $?)"
+check "status 报会话数"      "1"     "$(wb --status | grep -cE '^sessions=[0-9]+')"
 
 echo "-- 生命周期:--stop 之后必须能立刻继续用"
 wb --stop >/dev/null 2>&1
@@ -137,10 +148,10 @@ check "cat 串在管链中间"      "3"   "$(wb -c 'printf "a\nb\nc\n" | cat | w
 check "grep 无文件不崩 daemon" "1"  "$(wb -c 'grep zzz' >/dev/null 2>&1; echo $?)"
 check "崩过之后 daemon 还在"  "0"   "$(wb --status >/dev/null 2>&1; echo $?)"
 
-# 流式 stdin(请求头之后跟裸字节流)有两处能悄悄把**串行** handle 占死,
+# 流式 stdin(请求头之后跟裸字节流)有两处能悄悄把**那个会话的队列**占死,
 # 而那表现为「后面的命令全都慢/卡」,极难归因 —— 所以都用 timeout 兜着:
 # 挂住就返回 124,check 当场 FAIL,而不是让整个 smoke 卡死。
-echo "-- 流式 stdin(上游永不 EOF / 命令不读 stdin;这两处会占死串行 handle)"
+echo "-- 流式 stdin(上游永不 EOF / 命令不读 stdin;这两处会占死会话队列)"
 check "管道内容经 cat 往返"   "hello-from-stdin" "$(printf 'hello-from-stdin\n' | timeout 10 "$EXE" --endpoint "$EP" -c 'cat')"
 check "head -1 配 yes 不挂"   "y"                 "$(yes | timeout 10 "$EXE" --endpoint "$EP" -c 'head -1')"
 check "命令不读 stdin 不反压" "never-reads"       "$(yes | timeout 10 "$EXE" --endpoint "$EP" -c 'echo never-reads')"
