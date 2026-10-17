@@ -85,6 +85,19 @@ winbash: client: daemon 没有协议版本(它是旧版),与本客户端(3)不�
 | `grep` | `[-i -n -v -c -l -r -E -F -q] PATTERN [文件...]`;无文件 = 读 stdin |
 | `which` | `名字 [名字...]`;认识下面**四层**,①/② 层报名字,③ 层报绝对路径 |
 
+GNU grep 的两个高频选项 `--include` / `--exclude` **不支持**(① 层只有上表那些开关)。它们常被
+写在 PATTERN **之后**(`grep -rn x --include='*.go' .`),而真 grep 靠 getopt 的 **permutation**
+把选项挪到前面 —— 我们不做置换,所以这类写法里的 `--include` 会被当成**文件名**。修之前它的
+行为是**静默半错**:stderr 报一句"路径不存在",stdout 却把全部文件都搜了,最后 `exit 0`
+(过滤没生效而退出码说成功)。现在**响亮拒绝** `exit 2` 并给出替代写法:
+
+```bash
+find . -name '*.go' -exec grep -n PATTERN {} +     # 按文件名过滤
+```
+
+要 GNU 的完整方言就显式调真 grep(`<Git 安装根>\usr\bin\grep.exe`)。同理 `ls -R` 不支持 ——
+错误信息直接指向 `find`(递归列目录在 bash 里的标准解法),不再只说"不认识的参数"。
+
 `grep` 的方言:默认**字面匹配**(`grep '\d' x` 找的是 `\d` 这两个字符);`-E` 走 POSIX ERE。
 `-E` 里的 Perl 简写(`\d \w \s` 等)、`(?i)` 内联开关**明确拒收**,并给出 POSIX
 替代写法(`[0-9]` / `[[:digit:]]` / `[[:alpha:]]` / `[[:space:]]`)—— 真 bash 在这里是**静默**按字面
@@ -310,13 +323,16 @@ Session 上,所以要重新拉起一次(约 350 ms);只用 ①/③ 层没有额�
 cd winbash
 go build -o winbash.exe ./cmd/winbash
 go test ./... -count=1                      # 全量(含与真 Git Bash 的逐条语料对照)
-
 # 端到端冒烟:要从真 Git Bash 里跑,它拿 Git Bash 当对照
 & 'C:\Program Files\Git\bin\bash.exe' ./smoke-gitbash.sh
 
 # 延迟报告(默认跳过:数字依赖机器负载)
 $env:WINBASH_BENCH=1; go test ./cmd/winbash/ -run Latency -v
 ```
+
+`go test ./...` 从 **winbash 会话里**跑也是绿的:`cmd/winbash` 与 `internal/daemon` 的
+`TestMain` 会把 ③ 层派生的 `WINBASH_SESSION` 摘掉 —— 否则 client 会把每次调用都当成"嵌套",
+`--status`/`--stop` 刻意拒绝,3 条 daemon 管理用例必然红(而且看着像产品 bug,不像环境问题)。
 
 约束:**唯一直接依赖**是 `mvdan.cc/sh/v3`(实测带入 `golang.org/x/sys`、`golang.org/x/term` 两个间接依赖)。
 依赖镜像要设 `GOPROXY=https://goproxy.cn,direct`(`proxy.golang.org` 在本机不通)。
