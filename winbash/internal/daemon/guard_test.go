@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -147,6 +148,51 @@ func TestUnknownOpIsRejectedButEmptyOpRuns(t *testing.T) {
 	if !resp.OK || !strings.Contains(string(resp.Out), "EMPTY-OP-RAN") {
 		t.Fatalf("空 op 没能执行脚本(ok=%v exit=%d out=%q)—— 主路径被误伤了",
 			resp.OK, resp.Exit, resp.Out)
+	}
+}
+
+// ★ 版本不匹配时,报错必须把版本**归给对的人**。
+//
+// 修之前 daemon 侧传的是 CheckProto("daemon", req.Proto) —— 可 req 是**对端
+// (client)**发来的,req.Proto 就是 client 的版本。于是一个旧 client 连上新 daemon
+// 会看到:「daemon 的协议版本是 3,本客户端要 4」。而 3 是那个旧 client 的、
+// 4 才是 daemon 的 —— 两个数字全指错了对象,照着报错排查只会更糊涂。
+//
+// 这条测试从 daemon 侧(真正会打印这句话的地方)钉住它,而不是只测 CheckProto 的
+// 纯函数:bundle 传错参数的正是调用点,单测那个函数永远发现不了。
+func TestProtoMismatchBlamesTheRightSide(t *testing.T) {
+	ep := startDaemon(t, DefaultReadTimeout)
+	_, token := readEndpointFile(t, ep)
+
+	// 用一个"旧 client"的版本号 —— 对 daemon 而言对端就是 client。
+	oldClientProto := ipc.ProtoVersion - 1
+	resp, err := rawRequest(t, ep, ipc.Request{
+		Proto:  oldClientProto,
+		Token:  token,
+		Script: "echo should-not-run",
+	})
+	if err != nil {
+		t.Fatalf("版本不匹配时应当得到明确答复: %v", err)
+	}
+	if resp.OK {
+		t.Fatalf("版本不匹配必须拒绝,得到 ok=true")
+	}
+	msg := strings.Join(resp.Errors, " ")
+
+	// 关键断言:数字归给 client,不能说是 daemon 的版本。
+	if !strings.Contains(msg, "client") {
+		t.Fatalf("报错应当说清是 client 的版本不对(对端=client),实际:%q", msg)
+	}
+	if strings.Contains(msg, "daemon 的协议版本") {
+		t.Fatalf("报错把 client 的版本说成了 daemon 的 —— 方向反了:%q", msg)
+	}
+	// 「怎么办」必须还在(错误模型的硬要求)。
+	if !strings.Contains(msg, "--stop") {
+		t.Fatalf("报错没有指路: %q", msg)
+	}
+	// 版本号本身要出现在文案里,否则使用者不知道自己那端是几。
+	if !strings.Contains(msg, strconv.Itoa(oldClientProto)) {
+		t.Fatalf("报错没给出收到的版本号 %d: %q", oldClientProto, msg)
 	}
 }
 

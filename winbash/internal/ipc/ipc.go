@@ -161,16 +161,23 @@ type Response struct {
 // 把判断放在 ipc 而不是散在 client/daemon:两端的判据必须是同一份,
 // 否则就会出现「client 认为兼容、daemon 认为不兼容」的分叉 —— 那正是
 // ProtoVersion 要消灭的东西。
+//
+// 措辞刻意用中性的「本端」而不是「本客户端」:`what` 描述的是**对端**,而这
+// 两处调用里对端既可能是 daemon 也可能是 client(见 client.go / daemon.go)。
+// 写死"本客户端"会让 daemon 侧那条错误自相矛盾 —— 修之前正是这么写的,配合
+// daemon 侧误传 what="daemon"(它收到的其实是 **client** 的版本),于是旧 client
+// 连新 daemon 时会看到「daemon 的协议版本是 3,本客户端要 4」:3 是旧 client 的、
+// 4 是新 daemon 的,两个数字全标错了对象。
 func CheckProto(what string, got int) error {
 	switch {
 	case got == ProtoVersion:
 		return nil
 	case got == 0:
-		return fmt.Errorf("%s 没有协议版本(它是旧版),与本客户端(%d)不兼容\n"+
+		return fmt.Errorf("%s 没有协议版本(它是旧版),与本端(%d)不兼容\n"+
 			"怎么办: 运行 `winbash --stop` 停掉旧 daemon,下次调用会自动用新 exe 重建",
 			what, ProtoVersion)
 	default:
-		return fmt.Errorf("%s 的协议版本是 %d,本客户端要 %d\n"+
+		return fmt.Errorf("%s 的协议版本是 %d,本端要 %d\n"+
 			"怎么办: 两侧的 winbash.exe 版本不一致;统一后运行 `winbash --stop` 重建 daemon",
 			what, got, ProtoVersion)
 	}

@@ -472,7 +472,11 @@ func (d *daemon) handleConn(conn net.Conn, readTimeout time.Duration) {
 	//     时的推荐处置,于是陷入「要停它得先连上它」的死锁。
 	//  2. 只有执行脚本这条路的语义会随版本漂移(比如 stdin 的有无),stop/status 的
 	//     语义是稳定的。
-	if err := ipc.CheckProto("daemon", req.Proto); err != nil {
+	// what 必须是 "client":req 是**对端(client)**发来的,req.Proto 就是它的版本。
+	// 修之前这里写的是 "daemon",于是一个旧 client 连上新 daemon 时,错误会说
+	// 「daemon 的协议版本是 3」—— 而 3 是那个旧 client 的,新 daemon 是 4。
+	// 两个数字全指错了对象,照着报错排查只会更糊涂。
+	if err := ipc.CheckProto("client", req.Proto); err != nil {
 		_ = writeResponse(conn, ipc.Response{
 			OK:     false,
 			Errors: []string{"daemon: " + err.Error()},

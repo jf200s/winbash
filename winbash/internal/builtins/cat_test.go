@@ -14,6 +14,61 @@ import (
 
 func emptyIn() io.Reader { return strings.NewReader("") }
 
+// ★ `cat -n` 的号码格式与**跨文件累加**——README 的已知差异表里有这一条,
+// 但修之前它**没有任何测试**(全仓库搜 `cat -n` 只命中 README 与 cat.go 注释)。
+// 也就是说:这条差异被文档承认、行为也写对了,但改动它不会变红。
+//
+// 两件事都是 GNU/busybox 的既定行为,而且都不是"显然"的:
+//  1. 号码是 `%6d\t`(右对齐到 6 位 + 一个制表符),不是 `-n` 后跟空格;
+//  2. 多个文件**连续编号**,不每个文件从 1 重来(BSD cat 加 -n 也是累加,
+//     但很多人以为是分文件重来 —— 这条差异一旦改错,合并日志的行号会全错)。
+func TestCatNumberedUsesSixWideTabFormat(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "f.txt"), []byte("a\nb\n"), 0o644)
+
+	var out bytes.Buffer
+	if code := Cat(context.Background(), dir, []string{"-n", "f.txt"}, emptyIn(), &out, io.Discard); code != 0 {
+		t.Fatalf("cat -n 失败 exit=%d", code)
+	}
+	want := "     1\ta\n     2\tb\n"
+	if out.String() != want {
+		t.Fatalf("cat -n 格式不对\n got %q\nwant %q", out.String(), want)
+	}
+}
+
+func TestCatNumberedKeepsCountingAcrossFiles(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "a.txt"), []byte("a1\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "b.txt"), []byte("b1\n"), 0o644)
+
+	var out bytes.Buffer
+	if code := Cat(context.Background(), dir, []string{"-n", "a.txt", "b.txt"}, emptyIn(), &out, io.Discard); code != 0 {
+		t.Fatalf("cat -n 两个文件失败 exit=%d", code)
+	}
+	// 第二个文件的第一行必须是 2,不是 1。
+	want := "     1\ta1\n     2\tb1\n"
+	if out.String() != want {
+		t.Fatalf("行号没有跨文件累加\n got %q\nwant %q", out.String(), want)
+	}
+}
+
+// `cat -A` / `-b` / `-e` 未实现时**响亮拒绝**(exit 2 且指路),不静默当成文件名 ——
+// 与 README 同一条差异的另一半。静默当文件名会报"找不到 -A",把「没实现」伪装成
+// 「文件不存在」,排查方向就歪了。
+func TestCatUnimplementedFlagsAreRejected(t *testing.T) {
+	dir := t.TempDir()
+	for _, flag := range []string{"-A", "-b", "-e", "-s", "-v"} {
+		var out, errw bytes.Buffer
+		code := Cat(context.Background(), dir, []string{flag, "x"}, emptyIn(), &out, &errw)
+		if code != errs.ExitUsage {
+			t.Errorf("cat %s 应当 exit %d(用法错误),got %d", flag, errs.ExitUsage, code)
+		}
+		if !strings.Contains(errw.String(), "未实现") {
+			t.Errorf("cat %s 的报错没说「未实现」,会把排查引到「文件不存在」: %q", flag, errw.String())
+		}
+	}
+}
+
 func TestCatWritesFileVerbatim(t *testing.T) {
 	dir := t.TempDir()
 	content := "line1\n中文\n"
