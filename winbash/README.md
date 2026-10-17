@@ -48,6 +48,7 @@ winbash.exe --stop      # 停掉 daemon(不会为了停掉它而先把它拉起�
 | `--idle` | 空闲多久后 daemon 退出,默认 `30m`(`0` = 永不) |
 | `--timeout` | 单次请求超时,默认 `300s`(`0` = 不设限)。这个上限**同时**告诉 daemon:客户端放弃后它也要停手,否则一条无限循环会把后续命令全部饿死。**嵌套里也生效**(内层走的是本进程执行,同样受这个上限约束) |
 | `--fresh` / `--no-state` | 这条命令跑在**一次性会话**里:前面的变量 / `set -e` / `trap` / 函数影响不到它,它设的也不留给后面的命令。默认**不用**,会话照旧持久(见下文「会话级状态」) |
+| bash 的启动选项 | `-noprofile` / `--norc` / `--noediting` / `--posix` / `-l` / `-i` **接受但无作用**。把 winbash 设成默认 shell 后,宿主/工具链会按 bash 的约定拼命令行(实测 `winbash.exe -noprofile -c …`),不接受它们就等于**一条命令都跑不了**。它们要求的都是"别做额外的事"(不读 profile/rc、无行编辑),而 winbash 本来就不读 profile、没有交互 REPL,所以行为上已经满足 —— 不存在被忽略的副作用。要求**额外行为**的选项(如 `-s` 从 stdin 读脚本)不在名单里,照旧按未知 flag 报错 `2` |
 
 ## 升级与协议版本
 
@@ -241,7 +242,7 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 | `${v/#前缀/替换}`、`${v/%后缀/替换}` | **不支持,报错 `2`**。mvdan/sh 没实现,而且会静默原样输出——我们宁可报错 |
 | `printf %q`、`printf -v` | 同上:不支持但显式报错,并给替代写法 |
 | `command -v find` / `type find` | 这两个是 mvdan/sh 的内建,按进程 PATH 回答(给 System32 那个)。准确答案用 `which find` |
-| `set -u` / `${v:?}` | 退出码 `1`(bash 的 `-c` 给 `127`),错误文本不带 `bash: line N:` 前缀——都非零、都点名变量 |
+| 显式写 `Git\bin\bash.exe` 时参数里的双引号 | 那个 47 KB 的 exe **不是 MSYS 程序**,是 Git for Windows 的原生 launcher(导入表只有 `KERNEL32`/`msvcrt`/`SHELL32`,没有 `msys-2.0.dll`)。它把命令行**转发**给 `usr\bin\bash.exe`,这一跳用 MSVC 规则重拼,参数里的 `"` 到真 bash 手里已经变成 `\` —— **不是我们的转义问题**:对原生目标用标准 MSVC 规则是对的,坏在第二跳不受我们控制。按 PATH 找 `bash`(`which bash` 给的就是 `usr\bin\bash.exe`)完全正常,只有显式写全路径到 `bin\` 才会撞上 || `set -u` / `${v:?}` | 退出码 `1`(bash 的 `-c` 给 `127`),错误文本不带 `bash: line N:` 前缀——都非零、都点名变量 |
 | `${#关联数组[@]}` | mvdan/sh 的缺口:恒返回 `1`(键列表 `${!m[@]}` 与取值都是对的) |
 | `IFS` 给**多字符** | mvdan/sh 把整个串当分隔符,真 bash 只取**第一个字符**(`IFS=BC` 等价 `IFS=B`)。**静默**差异,光看输出看不出对错 —— 要按多字符分,请用 `IFS=,` 这类单字符,或先 `tr` 转换 |
 | `printf '%.0s'` 这类宽度为 0 的格式 | mvdan/sh 的内建 printf 不认(打 `invalid format char`),而且**退出码仍是 0** —— 唯一"有 stderr 但退出码不非零"的形态,靠退出码判断成败的调用方要当心 |

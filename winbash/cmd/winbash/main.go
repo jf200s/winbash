@@ -54,6 +54,28 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&endpoint, "endpoint", defaultEndpoint(), "daemon 的端口文件路径")
 	fs.DurationVar(&idle, "idle", 30*time.Minute, "空闲多久后 daemon 自行退出(0 = 永不);自动拉起 daemon 时也会转给它")
 	fs.DurationVar(&timeout, "timeout", 300*time.Second, "单次请求的超时(0 = 不设限)")
+
+	// bash 的**启动选项**。把 winbash 设成默认 shell 之后,宿主/工具链会按 bash 的
+	// 约定拼命令行(实测 Reasonix 的 persistent shell 就是 `winbash.exe -noprofile -c …`),
+	// 于是不认识它们 = 命令在**启动阶段**就失败,一句话都执行不了:
+	//
+	//	flag provided but not defined: -noprofile
+	//
+	// 为什么「接受但无作用」不等于静默做错事:这些选项要求的都是**别做额外的事**
+	// —— 不读 profile/rc、不开行编辑、POSIX 模式、login shell 只是多读几个 profile
+	// 文件。而 winbash 本来就不读 /etc/profile 与 ~/.bashrc、没有交互 REPL,所以
+	// 行为上已经满足,没有「被忽略的副作用」可言。
+	//
+	// 反过来,要求**额外行为**的选项不在这个名单里(`-s` 表示从 stdin 读脚本,语义
+	// 与 `-c` 不同),照旧按未知 flag 报错退出 2 —— 底线不变。
+	var bashStartup bool
+	for _, name := range []string{
+		"noprofile", "norc", "noediting", "posix", "login", "l", "interactive", "i",
+	} {
+		fs.BoolVar(&bashStartup, name, false,
+			"bash 启动选项:winbash 不读 profile、无交互 REPL,行为上已满足,因此无作用")
+	}
+
 	if err := fs.Parse(args); err != nil {
 		// 不认识的 flag 一律非零退出(项目底线)。用法已经由 FlagSet 打到 stderr。
 		return 2
