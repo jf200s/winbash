@@ -234,16 +234,23 @@ func (s *Session) execHandler(ctx context.Context, args []string) error {
 
 // callGuard 是所有简单命令在执行前都会经过的一道窄门。
 //
-// 它只做两件事,而且都限定在「mvdan/sh 的内建会**静默给出错结果**」这一种情况下:
+// 它只处理「mvdan/sh 的内建会**静默给出错结果**」这一类情况,而且是逐条列举的,
+// 不做通用改写:
 //
 //  1. `printf -v`:Windows 上不支持,原逻辑会把 `-v` 当普通参数原样输出。
-//  2. `command -v X`:原逻辑只查**进程 PATH** 与它自己的内建表 —— 于是对
+//  2. `trap ... DEBUG` / `trap ... RETURN`:mvdan/sh 不认这两个信号,而它自己只把
+//     `invalid signal specification` 写到 stderr、**退出码仍是 0**、hook 静默不执行。
+//     详见 trapGuard 的注释。
+//  3. `command -v X`:原逻辑只查**进程 PATH** 与它自己的内建表 —— 于是对
 //     winbash 自己的内建(`ls`)和只在 Git Bash usr\bin 里的工具(`sed`)都会说"没有"。
 //     AI 常写 `command -v X >/dev/null && …` 做存在性判断,这一误判是**静默**的。
 //     这里把这种"必然答错"的调用改写成我们的 `which X`(它认识四层)——
 //     其余一律不动,所以不存在语义回归。
 func (s *Session) callGuard(ctx context.Context, args []string) ([]string, error) {
 	if guarded, err := printfGuard(ctx, args); err != nil || len(guarded) == 0 {
+		return guarded, err
+	}
+	if guarded, err := trapGuard(args); err != nil || len(guarded) == 0 {
 		return guarded, err
 	}
 
@@ -356,6 +363,74 @@ func printfGuard(ctx context.Context, args []string) ([]string, error) {
 			`改用命令替换: var=$(printf '%s' 值)`))
 	}
 	return args, nil
+}
+
+// trapGuard 拦住 mvdan/sh 认不了的所有 trap 信号。
+//
+// 它只支持 **ERR** 与 **EXIT** 两个(源码里就是一个 switch,default 分支 failf)。
+// 其余信号(INT / TERM / USR1 / HUP / DEBUG / RETURN …)的行为是:
+//
+//	trap 'echo d' DEBUG; echo x
+//	→ stderr: trap: DEBUG: invalid signal specification
+//	→ stdout: x        (hook 静默不执行)
+//	→ 整体 exit 0
+//
+// 也就是说 **stderr 有话说、退出码却是 0**。调用方只看退出码会以为 hook 装上了 ——
+// 而「把信号设成空 handler」那种"想忽略 Ctrl+C"的写法更是彻底失效:一个字节都没生效。
+// 这是本项目要消灭的静默形态,所以这里统一拦成响亮失败。
+//
+// 拦法沿用 printf -v 的先例:三行式 + 替代写法,不去猜一个近似语义。
+// 为什么不实现:信号处理要在每条命令/函数返回点重入 interp.Runner,会搅乱 runner
+// 状态机(嵌套 Run、变量作用域、trap 自身的重入保护),风险与收益不成比例。
+//
+// 判定边界:只有出现在**信号位置**的名字才算。`trap 'echo DEBUG' INT` 里的 DEBUG
+// 是 callback 文本,不该被误拦 —— 所以先按 bash 的 `trap [[arg] sigspec ...]` 切出
+// 信号列表,再逐个比对白名单。
+func trapGuard(args []string) ([]string, error) {
+	if len(args) < 2 || args[0] != "trap" {
+		// `trap` 无参数在 bash 里是"列出当前 trap";mvdan/sh 静默返回空。
+		// 这里不拦:它不产生错误结果,只是少了个查询功能(记在 README 的已知差异里)。
+		return args, nil
+	}
+	// `-l` / `-p` 是真 flag,上游自己报 NOT IMPLEMENTED(exit 2),响亮,不插手。
+	// 注意 `-` 单独出现**不是** flag,而是 arg 位置上的"重置"(见下)。
+	if args[1] == "-l" || args[1] == "-p" {
+		return args, nil
+	}
+
+	// 按 bash 的 `trap [[arg] sigspec ...]` 切出信号列表:
+	//   trap INT              两个参数 → 第二个就是信号
+	//   trap '重置' -          三个参数 → args[1] 是 arg,信号从 args[2] 起
+	//   trap - INT            同上,`-` 是"恢复默认"的 arg,INT 仍是信号(要拦)
+	sigs := args[1:]
+	if len(args) >= 3 {
+		sigs = args[2:]
+	}
+	for _, sig := range sigs {
+		if sig == "ERR" || sig == "EXIT" {
+			continue // mvdan/sh 真正支持的两个
+		}
+		return nil, errors.New(errs.Errorf("trap",
+			"这台机器上不支持 trap "+sig+
+				"(mvdan/sh 只实现 ERR 与 EXIT;传其它信号会报 invalid signal specification,"+
+				"但退出码仍是 0、hook 静默不执行)",
+			trapRemedy(sig)))
+	}
+	return args, nil
+}
+
+// trapRemedy 给每种常见信号一句能落地的替代写法 —— 只报"不支持"等于把人留在原地。
+func trapRemedy(sig string) string {
+	switch sig {
+	case "DEBUG":
+		return `若只是想看每条命令,用 set -x(set +x 关掉);要"每条命令前做某事",就把那件事显式写在命令之间`
+	case "RETURN":
+		return `把收尾动作直接写在函数的最后一行,别靠 RETURN hook`
+	case "INT", "TERM", "HUP", "QUIT", "WINCH":
+		return `信号处理在本实现里不存在;要"外部打断时清理",用 trap ... EXIT(它支持),或让命令自己处理超时后退出`
+	default:
+		return `改用 trap ... EXIT(唯一能覆盖"结束时做某事"的信号),或把动作显式写在命令之间`
+	}
 }
 
 // rejectProcessSubstitution 在**解析之后、运行之前**挡住 `<(cmd)` / `>(cmd)`。

@@ -117,6 +117,10 @@ check "svc 不存在 → 非零"    "1"     "$(wb -c 'svc status wb-no-such-serv
 check "错误是三行式"         "3"     "$(wb -c 'definitely-not-a-command-xyz' 2>&1 >/dev/null | wc -l | tr -d ' ')"
 check "stderr 无 exit status 噪音" "0" "$(wb -c 'ls | grep zzz' 2>&1 >/dev/null | grep -c 'exit status')"
 check "printf -v 被拦下"     "1"     "$(wb -c "printf -v x '%s' a" >/dev/null 2>&1; echo $?)"
+check "trap DEBUG 被拦下"    "1"     "$(wb -c "trap 'true' DEBUG" >/dev/null 2>&1; echo $?)"
+check "trap INT 被拦下"      "1"     "$(wb -c "trap '' INT" >/dev/null 2>&1; echo $?)"
+check "trap EXIT 照常工作"   "bye"   "$(wb -c "trap 'echo bye' EXIT; echo hi" | tail -1)"
+check "callback 含 DEBUG 不误拦" "ok" "$(wb -c "trap 'echo DEBUG-hit' EXIT; echo ok" | head -1)"
 check "进程替换被拦下"       "2"     "$(wb -c 'diff <(echo a) <(echo a)' >/dev/null 2>&1; echo $?)"
 
 echo "-- 生命周期:--stop 之后必须能立刻继续用"

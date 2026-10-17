@@ -305,7 +305,7 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 | `pwsh` 只有三种形式被接管 | `-c` / `-Command` / 脚本文件;其余形式报错并指路到原生 pwsh(不静默回落) |
 | `read -d <分隔符>` | **支持**(2026-10-17)。这是**我们自己给 mvdan/sh 打的补丁**,不是上游功能 —— 见 `third_party/mvdan-sh/WINBASH-PATCH.md` 与 `go.mod` 的 `replace`。上游 v3.14.1 缺它,而缺的行为是**报 `invalid option` 但外层退出码 0、变量留空**,属于静默错值。现在 `IFS=$'\n' read -d "" -ra fd < f`、`while IFS= read -r -d '' x`(配 `find -print0`)都与真 bash 一致 |
 | `mapfile -n <行数>` | **支持**(同上,本地补丁)。`0` = 不限(与 bash 一致)。这让 pure-bash-bible 的 `head`/`tail`/`lines` 三个函数真正可用。补丁前它们是「空数组 + exit 0」,而且**光看输出分不清"文件真的空"还是"选项没被支持"** |
-| `trap DEBUG` / `trap RETURN` | **不支持**:stderr 报 `invalid signal specification`,但**外层退出码仍是 0、hook 静默不执行**。这是**当前已知的最后一处静默缺口**,尚未处理(需要 hook 每条命令执行,要重入 interp.Runner)。属受限功能:AI 脚本里罕见,但你若依赖它,现有行为会骗人 |
+| `trap <信号>` 只支持 `ERR` / `EXIT` | mvdan/sh 只实现这两个;其余信号(INT / TERM / USR1 / HUP / DEBUG / RETURN …)的上游行为是**stderr 报 `invalid signal specification`、退出码却是 0、hook 一个字节都没生效**。2026-10-17 起 `callGuard` 提前拦成响亮失败:`exit 1` + 三行式(点名信号 + 给替代写法)。`trap '' INT`(想忽略 Ctrl+C)这类"以为信号被屏蔽了"的写法受害最深,现在会明确报错。**边界精确**:只拦出现在**信号位置**的名字,`trap 'echo DEBUG' EXIT` 里作为 callback 文本的不误拦。`trap` 无参数(列出)不拦 —— 它只是少个查询功能,不产生错值。回归:`internal/shell/trapguard_test.go`(21 条子用例,含变异验证) |
 | `printf '%(%Y)T'`(strftime) | **不支持**:报 `invalid format char: (`,**退出码 1** —— 是响亮的,不是静默。要格式化时间请用 `date`(③ 层,如 `date -u -d @0 '+%Y-%m-%d'`) |
 | `pwsh -c "$env:X"` | 双引号里的 `$env` 会被 bash 先展开成空 —— **与真 bash 一致**,要写单引号 |
 | `pwsh` 的列名按字母序 | 真实 PowerShell 会按对象属性定义顺序排版;我们排序是为了让两次运行的列序一致 |
