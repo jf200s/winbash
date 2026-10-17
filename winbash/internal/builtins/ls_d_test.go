@@ -121,6 +121,66 @@ func TestLsDashDKeepsArgumentTextVerbatim(t *testing.T) {
 	}
 }
 
+// ★ **反斜杠**形态必须原样保留 —— 这才是 winbash glob 真实产出的形态。
+//
+// 这条是补上的一个**假绿洞**(2026-10-18 由一次独立审查发现,主代理亲手复验):
+//
+// winbash 的 glob 用反斜杠分隔,`ls -d */` 的**参数实际是 `dirA\`**(见 README
+// 「glob 给 `.\x`」那条)。但本文件原先只喂过 `dirA/`(POSIX 斜杠),于是:
+//
+//	name: strings.TrimSuffix(p, "\\")   ← 这个变异**全绿通过**
+//
+// 而它一旦混进代码,真实场景 `ls -d */` 就会退化成裸名字 —— 正是 ls.go 注释里
+// 拼命要防的那件事。测试没钉住自己最强调的不变量,是"看着绿但抓不住"的典型。
+//
+// 用 `${d%[/\\]}` 那类写法的使用者也会依赖这个行为:尾部反斜杠在,才知道是不是目录。
+func TestLsDashDKeepsTrailingBackslashFromGlob(t *testing.T) {
+	dir := lsFixture(t)
+
+	out, errw, code := lsIn(t, dir, "-d", `dirA\`)
+	if code != 0 {
+		t.Fatalf(`-d "dirA\\": exit=%d errw=%q`, code, errw)
+	}
+	if got := strings.TrimSpace(out); got != `dirA\` {
+		t.Fatalf(`ls -d "dirA\\" 应当原样输出 %q,得到 %q ——`+
+			`这是 winbash glob 的真实产出形态(echo */ 给 "dirA\\");`+
+			`若这里被去掉反斜杠,真实场景 ls -d */ 就会丢掉"这是目录"的线索`,
+			`dirA\`, got)
+	}
+
+	// 成对:POSIX 斜杠也要保留(两种都要,别为了让一种过而清掉另一种)。
+	out, _, code = lsIn(t, dir, "-d", "dirA/")
+	if code != 0 {
+		t.Fatalf("-d dirA/: exit=%d", code)
+	}
+	if got := strings.TrimSpace(out); got != "dirA/" {
+		t.Fatalf("ls -d dirA/ 应当保留正斜杠,得到 %q", got)
+	}
+}
+
+// ★ 多参数时的排序结果要**逐项**核对,不能只数个数。
+//
+// 只断言 `len(got) == 3` 的话,「排序后把同一个名字吐两次」这种错法照样绿
+// (`dirA dirA dirB` 也是 3 个)。这里整切片比较,零成本闭合。
+func TestLsDashDMultiArgOrderExact(t *testing.T) {
+	dir := lsFixture(t)
+
+	out, _, code := lsIn(t, dir, "-d", "dirB", "dirA", "dirB")
+	if code != 0 {
+		t.Fatalf("exit=%d", code)
+	}
+	got := strings.Fields(out)
+	want := []string{"dirA", "dirB", "dirB"}
+	if len(got) != len(want) {
+		t.Fatalf("条目数不对:得到 %q,期望 %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("顺序/内容不对:得到 %q,期望 %q(排序 + 重复参数保留)", got, want)
+		}
+	}
+}
+
 // ★ `-d` 的参数要**按名字排序**,且重复参数要**都留着**。
 //
 // 实测:
@@ -266,6 +326,11 @@ func TestLsDashDAcceptsCombinedFlags(t *testing.T) {
 	}
 	if strings.TrimSpace(outD) != strings.TrimSpace(outDA) {
 		t.Fatalf("-da 应当与 -d 同输出(实测真 bash 都只给 \".\"),得到 %q vs %q", outDA, outD)
+	}
+	// 而且**那个共同值必须是 "."**。少了这一句,`outD == outDA` 只证明了"a 能被解析",
+	// 对 -d 的语义零区分度 —— 两个都是错的(比如都列出目录内容)也照样相等。
+	if got := strings.TrimSpace(outD); got != "." {
+		t.Fatalf("ls -d 无参数应当给 %q,得到 %q", ".", got)
 	}
 
 	// -dl 与 -ld 同输出(组合顺序无关)。

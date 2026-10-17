@@ -77,6 +77,28 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 		paths = []string{"."}
 	}
 
+	// 空字符串参数要**响亮拒绝**,不能静默当成当前目录。
+	//
+	// 根因:ResolvePath 把 `""` 当 cwd(`internal/builtins/fsutil.go` 里
+	// `if p == "" { return cwd, nil }`)—— 那个分支是为 `cd` 服务的(`cd ""` 不改目录),
+	// 但 ls 沿用它就变成静默做错事。实测(2026-10-18)修之前:
+	//
+	//	ls ""     → rc=0,列出**当前目录的全部内容**
+	//	ls -d ""  → rc=0,输出一个空行
+	//	真 bash   → rc=2,`ls: cannot access '': No such file or directory`
+	//
+	// `ls ""` 那条尤其坏:调用方(典型是 AI)拿到的是一份看起来正常的目录列表,
+	// 会以为列的是它传的那个目录。这类"静默给出错值"正是项目底线要防的形态。
+	// 不去改 ResolvePath —— 它的空串语义对 cd 是对的,这里只收窄 ls 自己的口径。
+	for _, p := range paths {
+		if p == "" {
+			fmt.Fprintln(errw, errs.Errorf("ls",
+				"路径参数是空字符串",
+				"空字符串不是当前目录;要列当前目录就写 `ls .` 或干脆不带参数"))
+			return errs.ExitUsage
+		}
+	}
+
 	// `-d`:每个参数**只列它自己**,不展开目录。所以整批参数一起处理、
 	// 一起排序、一次输出 —— 而不是像目录展开那样逐路径分组。
 	//
@@ -151,7 +173,17 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 			}
 			// 单个文件也要按长格式对齐 —— 此时"最大宽度"就是它自己,等价于不补齐。
 			// 传一个条目,复用同一套测量逻辑,免得两处格式串分叉。
-			it := lsItem{name: filepath.Base(abs), info: info}
+			//
+			// **名字用参数原文 `p`,不用 filepath.Base**。这条一度只在 `-d` 分支做对,
+			// 普通分支给的是 Base,于是同一个二进制里出现两种口径(实测 2026-10-18):
+			//
+			//	ls -d /abs/real.txt  → /abs/real.txt   ✓
+			//	ls    /abs/real.txt  → real.txt        ✗(真 bash 给 /abs/real.txt)
+			//	ls    ./real.txt     → real.txt        ✗(真 bash 给 ./real.txt)
+			//
+			// 真 GNU 对**所有**操作数都输出参数原文。同一份 ls 里两种策略本身也是维护
+			// 风险 —— 下一个人很容易"统一"成错的那一边。
+			it := lsItem{name: p, info: info}
 			var widths lsWidths
 			if long {
 				it.links = linkCount(abs)
