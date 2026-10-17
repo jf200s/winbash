@@ -80,20 +80,65 @@ func ownerIDs() (uid, gid int) {
 //
 // 失败一律返回 1:真 bash 对「拿不到链接数」的条目同样显示 1,而 0 在 `ls -l` 里是
 // 个误导性信号(看起来像坏了,其实只是没问到)。
+// linkCount 取硬链接数(一次 open)。
+//
+// 保留这个薄封装是为了别处(以及测试)能单独问链接数;`ls` 自己走 fileFacts,
+// 那样一次 open 能同时拿到链接数、是否可执行,不必为同一文件开两遍。
 func linkCount(path string) int {
+	links, _ := fileFacts(path, false)
+	return links
+}
+
+// fileFacts 一次 open 同时取**硬链接数**与**文件头**,判断是否可执行形态。
+//
+// 为什么要合并:两个信息都需要 open 一次文件 —— 链接数要 GetFileInformationByHandle,
+// 「可执行」要读前两字节看是不是 MZ / `#!`。分开写就是同一目录里每个文件 open 两遍,
+// 而 `ls -l` 本来就已是本层最重的路径(见 lsItem 注释里那段性能取舍)。
+//
+// 返回值在 open 失败时退化为 (1, false):链接数 1 是"看起来普通"的保守值,
+// 而 exec=false 会让权限位少一个 x —— 两个都是"不会静默说错话"的方向。
+func fileFacts(path string, isDir bool) (links int, exec bool) {
+	links = 1
+
+	// 目录不需要读文件头(天然带 x,且读目录内容做不了)。
+	if isDir {
+		f, err := os.Open(path)
+		if err != nil {
+			return 1, true
+		}
+		defer f.Close()
+		var d syscall.ByHandleFileInformation
+		if err := syscall.GetFileInformationByHandle(syscall.Handle(f.Fd()), &d); err != nil {
+			return 1, true
+		}
+		return int(d.NumberOfLinks), true
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
-		return 1
+		return 1, false
 	}
-	// Fd() 会把文件从 runtime poller 摘到阻塞模式。这里只问一次属性就关,
+	// Fd() 会把文件从 runtime poller 摘到阻塞模式。这里只问一次属性、读两字节就关,
 	// 不存在并发读,摘走没有副作用。
 	defer f.Close()
 
 	var d syscall.ByHandleFileInformation
-	if err := syscall.GetFileInformationByHandle(syscall.Handle(f.Fd()), &d); err != nil {
-		return 1
+	if err := syscall.GetFileInformationByHandle(syscall.Handle(f.Fd()), &d); err == nil {
+		links = int(d.NumberOfLinks)
 	}
-	return int(d.NumberOfLinks)
+
+	// 读前两字节仅为判定文件头(MZ / `#!`)。读不到(空文件、权限)就按"不可执行"。
+	//
+	// 用 ReadAt 而不是 Read:不移动文件偏移,免得与上面的 ByHandle 调用在
+	// 同一 handle 上互相影响(虽然当前实现不读内容,以后若有人在这加读取就容易踩)。
+	var head [2]byte
+	if n, _ := f.ReadAt(head[:], 0); n == 2 {
+		exec = looksExecutable(path, false, head[:])
+	} else {
+		// 短读(空文件/1 字节)时仍可能靠扩展名可执行(`.exe` 那条)。
+		exec = looksExecutable(path, false, nil)
+	}
+	return links, exec
 }
 
 // loadOwner 一次性把账户名、uid、gid 全算好,由 sync.Once 保证只跑一次。

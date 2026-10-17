@@ -136,7 +136,7 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 			}
 			it := lsItem{name: p, info: info}
 			if long {
-				it.links = linkCount(abs)
+				it.links, it.exec = fileFacts(abs, info.IsDir())
 			}
 			items = append(items, it)
 		}
@@ -186,7 +186,7 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 			it := lsItem{name: p, info: info}
 			var widths lsWidths
 			if long {
-				it.links = linkCount(abs)
+				it.links, it.exec = fileFacts(abs, info.IsDir())
 				widths = lsMeasure([]lsItem{it}, human)
 			}
 			writeLsEntry(out, it.name, it, long, human, widths)
@@ -212,7 +212,7 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 				if fi, ierr := os.Stat(filepath.Join(abs, n)); ierr == nil {
 					it := lsItem{name: n, info: fi}
 					if long {
-						it.links = linkCount(filepath.Join(abs, n))
+						it.links, it.exec = fileFacts(filepath.Join(abs, n), fi.IsDir())
 					}
 					items = append(items, it)
 				}
@@ -236,11 +236,14 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 				code = errs.ExitError
 				continue
 			}
-			// 链接数在这里**预取一次**,不要在输出/测量阶段各问一次。
+			// 链接数与"可执行形态"在这里**一次 open 全取回来**,不要在输出/测量
+			// 阶段各问一次(那会把每个文件的 open/close 做多遍)。
+			links, exec := fileFacts(filepath.Join(abs, e.Name()), fi.IsDir())
 			items = append(items, lsItem{
 				name:  e.Name(),
 				info:  fi,
-				links: linkCount(filepath.Join(abs, e.Name())),
+				links: links,
+				exec:  exec,
 			})
 		}
 		sort.Slice(items, func(i, j int) bool { return items[i].name < items[j].name })
@@ -285,6 +288,11 @@ type lsItem struct {
 	name  string
 	info  os.FileInfo // 短格式时为 nil,writeLsEntry 不会碰它
 	links int         // 长格式时预取的硬链接数;短格式为 0,不会被用到
+	// exec 表示这个文件是**可执行形态**(MZ / `#!` 头,或 `.exe` 扩展名),
+	// 由 fileFacts 在同一次 open 里判定。权限串里的 x 位由它决定,见 msysMode。
+	//
+	// 目录不看这个字段(目录天然带 x)。
+	exec bool
 }
 
 // lsWidths 是长格式各**数值列**的宽度,用来右对齐。
@@ -320,11 +328,30 @@ func lsMeasure(items []lsItem, human bool) lsWidths {
 		if n := len(strconv.Itoa(it.links)); n > w.links {
 			w.links = n
 		}
-		if n := len(output.FormatBytes(it.info.Size(), human)); n > w.size {
+		if n := len(output.FormatBytes(lsDisplaySize(it), human)); n > w.size {
 			w.size = n
 		}
 	}
 	return w
+}
+
+// lsDisplaySize 是 size 列**显示**用的值。
+//
+// 目录恒给 0:真 bash 对目录的 size 恒为 0(实测 withfiles 目录 4096 vs 0、
+// /c/Windows 28672 vs 0、`..` 65536 vs 0)。Windows 上 info.Size() 给的是目录
+// 索引的字节数,那不是 bash 语义里的"目录大小"。
+//
+// **只影响显示与列宽**,不影响 `total` 行 —— 那行仍按真实 info.Size() 累加,
+// 而 winbash 的 total 与真 bash 已对齐(实测两边都是 `total 85`)。
+// 这两处必须分开:一起改会把已经对齐的 total 弄坏。
+func lsDisplaySize(it lsItem) int64 {
+	if it.info != nil && it.info.IsDir() {
+		return 0
+	}
+	if it.info == nil {
+		return 0
+	}
+	return it.info.Size()
 }
 
 // writeLsEntry 输出一个条目。
@@ -351,11 +378,14 @@ func writeLsEntry(w io.Writer, name string, it lsItem, long, human bool, widths 
 	// 第 4 列是**属组**(数字)。uid 只在内部由 ownerIDs 算出来,用不上。
 	_, gid := ownerIDs()
 	fmt.Fprintf(w, "%s %*d %s %*d %*s %s %s\n",
-		it.info.Mode().String(),
+		// 权限位走 msysMode 而不是 info.Mode().String():后者在 Windows 上只反映
+		// 「只读」一个属性,给 -rw-rw-rw- / drwxrwxrwx,与真 bash 差得远(见 lsmode.go)。
+		msysMode(it.info, it.exec),
 		widths.links, it.links,
 		ownerName(),
 		widths.group, gid,
-		widths.size, output.FormatBytes(it.info.Size(), human),
+		// 大小走 lsDisplaySize(目录给 0),与 lsMeasure 同源,免得列宽与内容分叉。
+		widths.size, output.FormatBytes(lsDisplaySize(it), human),
 		lsTime(it.info.ModTime()),
 		name,
 	)
