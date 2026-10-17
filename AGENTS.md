@@ -92,9 +92,9 @@ git worktree add .worktrees/<slug> -b <类型>/<slug>
 - **写子代理并发上限 2–3**（同一仓库、同一套测试二进制，CPU 会顶满）；**只读子代理 4–6** 无压力。
 - 本机无 `make`、无 `rg`；Go 项目用 `go test` / `go build`；**唯一直接依赖** `mvdan.cc/sh/v3`，`GOPROXY` 必须是 `https://goproxy.cn,direct`。
 
-## 6. 派子代理的环境约束（本机踩实的 8 条，绕法都验证过）
+## 6. 派子代理的环境约束（本机踩实的 9 条，绕法都验证过）
 
-子代理链路与 shell 链路是两套东西，这 8 条每条都当场卡过一次，**别再试第二遍**：
+子代理链路与 shell 链路是两套东西，这 9 条每条都当场卡过一次，**别再试第二遍**：
 
 | # | 约束 | 绕法（已验证） |
 |---|---|---|
@@ -106,8 +106,9 @@ git worktree add .worktrees/<slug> -b <类型>/<slug>
 | 6 | **同一时刻只有一个 background `task`**：不带 `write_paths` 就认领整个 workspace，`tools` 只读白名单**不能**解除这个写槽 | 要么显式传 `write_paths` 抢这个槽，要么用 `fleet`（≥2 任务）走 `read_only` |
 | 7 | 写锁是**会话级**的，且会匹配**命令文本里出现的路径**（`git -C .worktrees/x …` 被挡）；`job_output` / `read_subagent_result` / 连 `Start-Sleep` 同样被挡 | **没有自解手段**，只能等子代理自己跑完；新轮次通常会重新评估锁 |
 | 8 | `fleet` 要求 `tasks` **≥2** | 拆两个只读任务，或改用 `task` |
+| 9 | **带 `write_paths` 的子代理没有 shell**：宿主按 SPEC §3.12 把 `pwsh`/`bash` 整个从它的工具注册表移除（`explicit write_paths sub-agents cannot execute unscoped MCP writers`），`go build`/`go test`/`git commit` 一律做不了；换 `read_only_task` 也只放行纯读命令，且 cwd 钉在仓库根（无 go.mod） | **写任务只让它写代码**：prompt 里写明"你跑不了命令、也提交不了，不要尝试绕过、不要谎报验证结果"，把验证与提交全部留给主代理。它通常会诚实报回"未验证"并给出存疑清单——这正是要的（2026-10-17 实战：三片写任务都靠这条走通，其中一片还纠正了 spec 里的三个真 bug） |
 
-结论：**派发前先想清楚三件事** —— 传不传 `profile`、传不传 `effort`、写任务有没有 `write_paths`。这三件凑齐，400 与 blocked 基本都能避开。
+结论：**派发前先想清楚三件事** —— 传不传 `profile`、传不传 `effort`、写任务有没有 `write_paths`。这三件凑齐，400 与 blocked 基本都能避开。第 9 条决定了分工：**子代理写、主代理验**。
 
 ## 7. 沿用不改的项目底线（新任务同样受约束）
 
