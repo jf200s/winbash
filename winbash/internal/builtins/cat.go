@@ -62,7 +62,7 @@ func Cat(ctx context.Context, cwd string, argv []string, in io.Reader, out, errw
 			// 与 bash 一致:打不开这个就跳过,继续处理后面的,只把退出码置非零。
 			// 直接 return 会让 `cat a b` 在 a 缺失时连 b 都读不到。
 			fmt.Fprintln(errw, errs.Errorf("cat",
-				userPathProblem("cannot open", name, err, abs),
+				userPathProblem("", name, err, abs),
 				"确认文件存在,或用 winbash -c 'ls 目录' 查看"))
 			code = errs.ExitError
 			continue
@@ -71,11 +71,12 @@ func Cat(ctx context.Context, cwd string, argv []string, in io.Reader, out, errw
 		// 目录必须在这里拦住:**Windows 上 os.Open 一个目录是成功的**,失败要到
 		// 第一次 Read 才发生,而且报的是 `Incorrect function.` —— 实测原先它一路
 		// 掉进下面那个"写输出时出错"的分支,归因完全错了(实际是读不出来)。
-		// 真 bash 对 `cat 某目录` 给的是 `Is a directory`。
+		// 真 bash 对 `cat 某目录` 给的是裸格式 `adir: Is a directory`
+		// (实测 2026-10-18:`cat: adir: Is a directory`)。
 		if fi, serr := f.Stat(); serr == nil && fi.IsDir() {
 			f.Close()
 			fmt.Fprintln(errw, errs.Errorf("cat",
-				fmt.Sprintf("cannot read '%s': Is a directory", name),
+				fmt.Sprintf("%s: Is a directory", name),
 				"要看目录内容用 ls;要递归就用 find"))
 			code = errs.ExitError
 			continue
@@ -107,18 +108,27 @@ func (e *catCopyError) Error() string { return e.err.Error() }
 func (e *catCopyError) Unwrap() error { return e.err }
 
 // catCopyProblem 生成 copyCat 失败时的"问题"行。
+//
+// 三种情况的措辞口径不同,都对着真 Git Bash 实测过(2026-10-18):
+//
+//	读一个文件失败   → `adir: Is a directory`        (裸格式,与 GNU cat 一致)
+//	读 stdin 失败    → 保留显式说明(`standard input`),真 bash 在那里给的是 `-`
+//	写侧失败         → 保留显式说明
+//
+// 写侧与 stdin 两条**没有**照搬 GNU:真 bash 里 `cat 大文件 | head` 是被 SIGPIPE
+// 直接杀掉(rc=0、stderr 空),`cat f > /bad/x` 则由 **shell 层**拦截、cat 根本没
+// 启动。winbash 不会因 SIGPIPE 被杀(它自己管着输出),所以那个错误必须自己报 ——
+// 报出来比照抄一个"什么都没有"更有用。
 func catCopyProblem(subject string, err error) string {
 	var ce *catCopyError
 	if errors.As(err, &ce) && ce.op == "write" {
 		// 写侧失败没有文件名可言:对象是管道/终端,不是被读的那个文件。
 		return "cannot write output: " + posixErrText(ce.err, "")
 	}
-	verb := "cannot read"
 	if subject == "(standard input)" {
-		verb = "cannot read standard input:"
-		return fmt.Sprintf("%s %s", verb, posixErrText(err, ""))
+		return "cannot read standard input: " + posixErrText(err, "")
 	}
-	return userPathProblem(verb, subject, err, "")
+	return userPathProblem("", subject, err, "")
 }
 
 // catCopyRemedy 给出对应的下一步。

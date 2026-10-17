@@ -100,7 +100,7 @@ func Grep(ctx context.Context, cwd string, argv []string, in io.Reader, out, err
 			info, serr := os.Stat(abs)
 			if serr != nil {
 				fmt.Fprintln(errw, errs.Errorf("grep",
-					userPathProblem("cannot access", f, serr, abs),
+					userPathProblem("", f, serr, abs),
 					"先确认路径存在,或用 winbash -c 'ls 目录' 看有哪些名字"))
 				code = errs.ExitError
 				continue
@@ -108,9 +108,10 @@ func Grep(ctx context.Context, cwd string, argv []string, in io.Reader, out, err
 
 			if info.IsDir() {
 				if !opts.recursive {
-					// bash 在这里只留一句 "Is a directory",使用者不知道下一步。
-					// 明确说出该加什么开关,是 ① 层「不翻车」的一部分。
-					report(fmt.Errorf("%s 是目录", f), "递归搜索目录请加 -r: grep -r PATTERN "+f)
+					// 措辞与真 bash 一致(实测 `grep x adir` → `grep: adir: Is a directory`),
+					// 但多给一步指路:bash 在这里只留一句 "Is a directory",使用者
+					// 不知道下一步。明确说出该加什么开关,是 ① 层「不翻车」的一部分。
+					report(fmt.Errorf("%s: Is a directory", f), "递归搜索目录请加 -r: grep -r PATTERN "+f)
 					continue
 				}
 				anyMatch = grepTree(abs, f, re, opts, out, errw, report) || anyMatch

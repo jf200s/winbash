@@ -60,18 +60,37 @@ const (
 	errnoDirectory    = syscall.Errno(267)
 )
 
-// userPathProblem 生成 "cannot access 'x': No such file or directory" 式的措辞。
+// userPathProblem 生成路径错误的"问题"行。
 //
-// verb 是动作(`cannot access` / `cannot open` / `cannot read`);
-// userPath 必须是**用户写的那串**(不是 ResolvePath 之后的绝对路径);
+// 两种格式,**按命令选**,不是随意的风格问题 —— 真 GNU coreutils 内部就不统一
+// (2026-10-18 实测真 Git Bash):
+//
+//	ls nope     → ls: cannot access 'nope': No such file or directory
+//	cat nope    → cat: nope: No such file or directory
+//	grep x nope → grep: nope: No such file or directory
+//	wc nope     → wc: nope: No such file or directory
+//	head nope   → head: cannot open 'nope' for reading: No such file or directory
+//	sed nope    → sed: can't read nope: No such file or directory
+//
+// 也就是说 `cannot access` 是 **ls 的**措辞,而 cat / grep / wc 给的是裸的
+// `<路径>: <原因>`。所以:
+//
+//	verb == "cannot access" → `cannot access 'x': ...`   (ls)
+//	verb == ""              → `x: ...`                    (cat / grep)
+//
+// verb 是动作;userPath 必须是**用户写的那串**(不是 ResolvePath 之后的绝对路径);
 // absPath 只用于内部判断(区分 `Not a directory`),绝不进输出。
 //
 // 一条重要取舍:描述里**不带** `winbash:` 或命令名前缀。调用方本来就用
 // errs.Errorf 包了三行式(`winbash: ls / 问题: … / 怎么办: …`),这里再带一次
 // 就成了 `问题: ls: cannot access …`,与真 bash 的 `ls: cannot access …` 差一层。
-// 实测真 bash 的措辞就是「命令名 + cannot access + 路径 + 原因」,而三行式已经在
-// 第一行给了命令名,所以这里只出后半段。
+// 实测真 bash 的措辞就是「命令名 + 空格 + 后半段」,而三行式已经在第一行给了
+// 命令名,所以这里只出后半段。
 func userPathProblem(verb, userPath string, err error, absPath string) string {
+	if verb == "" {
+		// cat / grep 的裸格式:与真 coreutils 一致(它们不用 cannot access)。
+		return fmt.Sprintf("%s: %s", userPath, posixErrText(err, absPath))
+	}
 	return fmt.Sprintf("%s '%s': %s", verb, userPath, posixErrText(err, absPath))
 }
 
