@@ -1207,11 +1207,19 @@ func (r *Runner) open(ctx context.Context, path string, flags int, mode os.FileM
 	}
 
 	f, err := r.openHandler(r.handlerCtx(ctx, handlerKindOpen, todoPos), path, flags, mode)
-	// TODO: support wrapped PathError returned from openHandler.
-	switch err.(type) {
-	case nil:
+	// winbash patch: 上游这里用**类型断言**只认裸的 *os.PathError,于是 handler 没法
+	// 自定义文案 —— 返回自己的类型会掉进下面的 default 分支变成 fatal,改变控制流
+	// (从"这条命令失败、脚本继续"变成"整个脚本终止")。上游自己的 TODO 已经点名了
+	// 这件事:"support wrapped PathError returned from openHandler"。
+	//
+	// 改成 errors.As 后,handler 可以返回一个 Error() 自定义、Unwrap() 到
+	// *os.PathError 的包装类型:既能给 POSIX 措辞、不泄漏 Win32 API 名与绝对路径,
+	// 又完全保留"非 fatal"的原语义。见 WINBASH-PATCH.md §3。
+	var pathErr *os.PathError
+	switch {
+	case err == nil:
 		return f, nil
-	case *os.PathError:
+	case errors.As(err, &pathErr):
 		if print {
 			r.errf("%v\n", err)
 		}

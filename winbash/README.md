@@ -241,8 +241,28 @@ winbash 不会因 SIGPIPE 被杀(它自己管着输出端),因此仍显式报 `c
 修之前是 `GetFileAttributesEx C:\Users\...\nope.txt: The system cannot find the file
 specified.` —— 三个问题都直接影响「AI 能不能自己修」:**泄漏 Win32 API 名**(`GetFileAttributesEx`
 / `CreateFile`)、**把用户写的相对路径换成绝对路径**、**用 Win32 长句而不是 POSIX 措辞**。
-措辞在 `internal/builtins/oserr.go`,六类错误(`No such file or directory` / `Not a directory` /
-`Permission denied` / `Is a directory` / 非法字符 / 未知 errno 的 `I/O error (Win32 error N)`)。
+措辞在 `internal/builtins/oserr.go`,七类错误(`No such file or directory` / `Not a directory` /
+`Permission denied` / `Is a directory` / 非法字符 / `EISDIR` / 未知 errno 的 `I/O error (Win32 error N)`)。
+
+**重定向与 `source` 走的是另一条路,也已对齐**(2026-10-18)。它们的失败由 mvdan/sh 的
+`OpenHandler` 产生,不经过上面那些命令内建的措辞层,原先原样端出 Go 的错误:
+
+```
+echo x > /bad/y    修前: open C:\Program Files\Git\bad\y: The system cannot find the path specified.
+                   修后: /bad/y: No such file or directory
+                   真 bash: line 1: /bad/y: No such file or directory
+source nope.sh     修后: source: nope.sh: No such file or directory
+echo x > adir      修后: adir: Is a directory
+echo x > /c/Windows/System32/drivers/etc/__nope
+                   修后: /c/Windows/.../__nope: Permission denied
+```
+
+覆盖 `>` / `>>` / `<` / `2>` 与 `source`。**这需要给 mvdan/sh 打一个补丁**(把
+`switch err.(type)` 换成 `errors.As`,即上游自己的 TODO),见
+`third_party/mvdan-sh/WINBASH-PATCH.md` §3 —— 否则 handler 无法自定义文案而不改变
+"重定向失败只让那条命令失败、脚本继续"这个语义。回归在
+`internal/shell/openerr_test.go`,其中 `TestRedirectFailureDoesNotAbortScript`
+盯的是**控制流**而不是字符串。
 
 两处细节值得知道:
 - **`Not a directory` 与 `No such file or directory` 在 Windows 上是同一个 errno(3)**,
@@ -362,6 +382,9 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 | `command -v find` / `type find` | 这两个是 mvdan/sh 的内建,按进程 PATH 回答(给 System32 那个)。准确答案用 `which find`。**`command -v` 已被 guard 接管**:①/② 层内建与只在 Git Bash `usr\bin` 里的工具都答得对,**多名字也行**(`command -v ls cat`;`TestCommandVHandlesMultipleNames`)。一条残余缺口:**混合写法**会放行给 mvdan/sh —— 例如 `command -v ls git` 里 `ls` 仍被漏报(`git` 在进程 PATH 里、mvdan 自己答得对,而 `CallHandler` 只能返回一条命令,没法逐名字替换)。要逐个判存在就分开写:`command -v ls && command -v git`。`type -p` / `type -t` 与 `type find` 同待遇:**未接管**,按进程 PATH 回答 |
 | 显式写 `Git\bin\bash.exe` 时参数里的双引号 | 那个 47 KB 的 exe **不是 MSYS 程序**,是 Git for Windows 的原生 launcher(导入表只有 `KERNEL32`/`msvcrt`/`SHELL32`,没有 `msys-2.0.dll`)。它把命令行**转发**给 `usr\bin\bash.exe`,这一跳用 MSVC 规则重拼,参数里的 `"` 到真 bash 手里已经变成 `\` —— **不是我们的转义问题**:对原生目标用标准 MSVC 规则是对的,坏在第二跳不受我们控制。按 PATH 找 `bash`(`which bash` 给的就是 `usr\bin\bash.exe`)完全正常,只有显式写全路径到 `bin\` 才会撞上 |
 | `set -u` / `${v:?}` | 退出码 `1`(bash 的 `-c` 给 `127`),错误文本不带 `bash: line N:` 前缀——都非零、都点名变量 |
+| `cd` 的失败措辞 | 走 mvdan/sh 的内建实现,与真 bash 有两处不同(2026-10-18 实测):给的是 `cd: no such file or directory: "C:\Program Files\Git\x"`(**绝对路径** + 小写),真 bash 是 `cd: /x: No such file or directory`;`cd` 到一个文件时它说 `no such file or directory`,真 bash 说 `Not a directory`。退出码都是 `1`、都不静默,只是措辞与 bash 不齐。要判「目录在不在」用 `test -d` 而不是解析 `cd` 的报错 |
+| `source 某目录` / `cat < 某目录` 仍漏 Win32 | 这两条**不是** open 失败:Windows 上 `os.Open` 一个目录会**成功**(`O_RDONLY`),失败要到第一次读才发生,给的是 `Incorrect function.`。`source` 走 `p.Parse` 的报错分支(`source: read C:\...: Incorrect function.`)、`cat` 读 stdin 走自己的措辞(`cannot read standard input: I/O error (Win32 error 1)`)。真 bash 分别是 `source: /tmp: is a directory` 与 `cat: -: Is a directory`。要修得在 read 侧加一层(范围比「open 措辞」大),所以本轮未做 |
+| 脚本报错里的文件名 | `./script` 执行出错时,mvdan/sh 用**绝对路径**当脚本名(`C:/Users/.../script: line 1: …`),真 bash 用你写的那个(`./script: line 1: …`)。只影响报错前缀,不影响退出码 |
 | `${#关联数组[@]}` | mvdan/sh 的缺口:恒返回 `1`(键列表 `${!m[@]}` 与取值都是对的) |
 | `IFS` 给**多字符** | mvdan/sh 把整个串当分隔符,真 bash 只取**第一个字符**(`IFS=BC` 等价 `IFS=B`)。**静默**差异,光看输出看不出对错 —— 要按多字符分,请用 `IFS=,` 这类单字符,或先 `tr` 转换 |
 | **管道段不是真子 shell** | **静默差异**(两边都 `exit 0`、都不报错,只有输出不同):`cmd \| <右侧>` 右侧对变量的赋值会**泄漏到外层**,而真 bash 里右侧是独立进程、赋值随进程消失。实测三种形态都泄漏:`printf "a\nb" \| while read -r _; do n=$((n+1)); done` 之后 `n=2`(真 bash 得 `n=0`);`echo x \| f` 里函数内的赋值;`echo x \| { export PX=1; }` 的 `export`。**根因是上游架构限制,不是本项目的 bug** —— mvdan/sh 的 README 明说 `Go does not support forking its own process, so subshells use a goroutine instead`,管道每段是一个 goroutine 而非进程,变量绑定因此共享作用域。**这一条的方向对 AI 干活有利**(`n=2` 才是直觉预期),要防的是它无声变掉;`oilspec_gaps_test.go` 的 `TestPipelineSegmentsAreNotRealSubshells` 同时钉住三件事:泄漏的三种形态、显式 `( )` / `$( )` / `{ }` 与 bash 一致的隔离(防止有人"修"泄漏时把对的也改坏)、以及推荐替代写法 `while ... done < file`(`TestRedirectWhileDoesNotLeak`) |
