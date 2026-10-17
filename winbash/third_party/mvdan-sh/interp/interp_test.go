@@ -264,7 +264,7 @@ var runTests = []runTest{
 	{"printf", "usage: printf format [arguments]\nexit status 2 #JUSTERR"},
 	{"break", "break is only useful in a loop\n #JUSTERR"},
 	{"continue", "continue is only useful in a loop\n #JUSTERR"},
-	{"cd a b", "usage: cd [dir]\nexit status 2 #JUSTERR"},
+	{"cd a b", "cd: too many arguments\nexit status 2 #JUSTERR"},
 	{"shift a", "usage: shift [n]\nexit status 2 #JUSTERR"},
 	{
 		"shouldnotexist",
@@ -1148,7 +1148,7 @@ var runTests = []runTest{
 	},
 	{
 		`cd ''`,
-		"cd: empty directory path\nexit status 1 #JUSTERR",
+		"cd: null directory\nexit status 1 #JUSTERR",
 	},
 	{
 		`HOME=/foo; echo $HOME`,
@@ -1156,7 +1156,7 @@ var runTests = []runTest{
 	},
 	{
 		"cd noexist",
-		"cd: no such file or directory: \"noexist\"\nexit status 1 #JUSTERR",
+		"cd: noexist: No such file or directory\nexit status 1 #JUSTERR",
 	},
 	{
 		"mkdir -p a/b && cd a && cd b && cd ../..",
@@ -1164,7 +1164,7 @@ var runTests = []runTest{
 	},
 	{
 		">a && cd a",
-		"cd: no such file or directory: \"a\"\nexit status 1 #JUSTERR",
+		"cd: a: Not a directory\nexit status 1 #JUSTERR",
 	},
 	{
 		`[[ $PWD == "$(pwd)" ]]`,
@@ -1234,7 +1234,7 @@ var runTests = []runTest{
 	{"pushd", "pushd: no other directory\nexit status 1 #JUSTERR"},
 	{"pushd -n", ""},
 	{"pushd foo bar", "pushd: too many arguments\nexit status 2 #JUSTERR"},
-	{"pushd does-not-exist; set -- $(dirs); echo $#", "pushd: no such file or directory: \"does-not-exist\"\n1\n #IGNORE"},
+	{"pushd does-not-exist; set -- $(dirs); echo $#", "pushd: does-not-exist: No such file or directory\n1\n #IGNORE"},
 	{"mkdir a; pushd a >/dev/null; set -- $(dirs); echo $#", "2\n"},
 	{"mkdir a; set -- $(pushd a); echo $#", "2\n"},
 	{
@@ -1255,7 +1255,7 @@ var runTests = []runTest{
 	},
 	{
 		"mkdir a; pushd a >/dev/null; pushd >/dev/null; rm -r a; pushd",
-		"pushd: no such file or directory: ABS_PATH_A\nexit status 1 #JUSTERR",
+		"pushd: ABS_PATH_A: No such file or directory\nexit status 1 #JUSTERR",
 	},
 	{
 		`old=$(dirs); mkdir a; pushd -n a >/dev/null; set -- $(dirs); [[ $1 == "$old" ]]`,
@@ -1280,7 +1280,7 @@ var runTests = []runTest{
 	},
 	{
 		"mkdir a; pushd a >/dev/null; pushd >/dev/null; rm -r a; popd",
-		"popd: no such file or directory: ABS_PATH_A\nexit status 1 #JUSTERR",
+		"popd: ABS_PATH_A: No such file or directory\nexit status 1 #JUSTERR",
 	},
 
 	// binary cmd
@@ -1558,7 +1558,7 @@ var runTests = []runTest{
 	// redirects
 	{
 		"echo foo >&5",
-		"unhandled >& arg: \"5\"\nexit status 1 #JUSTERR",
+		"5: Bad file descriptor\nexit status 1 #JUSTERR",
 	},
 	{
 		"echo foo 5>a",
@@ -4197,23 +4197,23 @@ var runTestsUnix = []runTest{
 	// Note that these will succeed if we're root.
 	{
 		`mkdir a; chmod 0000 a; cd a`,
-		"cd: permission denied: \"a\"\nexit status 1 #JUSTERR",
+		"cd: a: Permission denied\nexit status 1 #JUSTERR",
 	},
 	{
 		`mkdir a; chmod 0222 a; cd a`,
-		"cd: permission denied: \"a\"\nexit status 1 #JUSTERR",
+		"cd: a: Permission denied\nexit status 1 #JUSTERR",
 	},
 	{
 		`mkdir a; chmod 0444 a; cd a`,
-		"cd: permission denied: \"a\"\nexit status 1 #JUSTERR",
+		"cd: a: Permission denied\nexit status 1 #JUSTERR",
 	},
 	{
 		`mkdir a; chmod 0010 a; cd a`,
-		"cd: permission denied: \"a\"\nexit status 1 #JUSTERR",
+		"cd: a: Permission denied\nexit status 1 #JUSTERR",
 	},
 	{
 		`mkdir a; chmod 0001 a; cd a`,
-		"cd: permission denied: \"a\"\nexit status 1 #JUSTERR",
+		"cd: a: Permission denied\nexit status 1 #JUSTERR",
 	},
 	{
 		`unset UID`,
@@ -4670,7 +4670,11 @@ func TestRunnerRun(t *testing.T) {
 
 			// Some builtins like "pushd" can show absolute paths as part of error messages.
 			// Allow a very simple search-and-replace for the equivalent to "$PWD/a".
-			want := strings.ReplaceAll(c.want, "ABS_PATH_A", fmt.Sprintf("%q", filepath.Join(tdir, "a")))
+			//
+			// winbash patch:`%q` 换成了裸字符串 —— 措辞改成 `pushd: <路径>: <原因>`
+			// 之后路径不再带引号(真 bash 就是这样)。`ABS_PATH_A` 只有 pushd/popd
+			// 那两条用例在用,而它们正是这次改过的,所以直接改这里的定义最省事。
+			want := strings.ReplaceAll(c.want, "ABS_PATH_A", filepath.Join(tdir, "a"))
 
 			if i := strings.Index(want, " #"); i >= 0 {
 				want = want[:i]

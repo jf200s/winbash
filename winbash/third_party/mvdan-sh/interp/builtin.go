@@ -330,10 +330,27 @@ func (r *Runner) builtin(ctx context.Context, pos syntax.Pos, name string, args 
 			// ref: https://www.man7.org/linux/man-pages/man1/cd.1p.html#OPERANDS
 			if path == "-" {
 				path = r.envGet("OLDPWD")
+				// winbash patch:`cd -` 但 OLDPWD 没设置时单独报错。
+				//
+				// 上游会让空串流进 changeDir,于是报成 `cd: null directory` ——
+				// 把「你还没 cd 过」说成「你给了个空目录」,指向完全不同的修法。
+				// 真 bash 给 `cd: OLDPWD not set`、退出码 1(实测 2026-10-18)。
+				//
+				// 注意不能靠「path == ""」在 changeDir 里区分:用户显式 `cd ""`
+				// 也是空串,而那种情况真 bash 确实说 null directory。两者只能在
+				// 这里分开 —— 这是唯一还知道「用户写的是 `-`」的地方。
+				if path == "" {
+					return failf(1, "cd: OLDPWD not set\n")
+				}
 				r.outf("%s\n", path)
 			}
 		default:
-			return failf(2, "usage: cd [dir]\n")
+			// winbash patch:措辞对齐真 bash,实测 `cd a b` 给
+			// `cd: too many arguments`、退出码 2。
+			//
+			// 上游这里是 `usage: cd [dir]` —— 退出码相同(2),但真 bash 从来不说
+			// usage,它直说问题。三行式风格里我们也没有 usage 这一层。
+			return failf(2, "cd: too many arguments\n")
 		}
 		exit.code = r.changeDir(ctx, "cd", path)
 	case "wait":
@@ -1146,17 +1163,40 @@ func (r *Runner) readLine(ctx context.Context, raw bool, delim byte) ([]byte, er
 
 func (r *Runner) changeDir(ctx context.Context, cmd, path string) uint8 {
 	if path == "" {
-		r.errf("%s: empty directory path\n", cmd)
+		// winbash patch:措辞对齐真 bash。实测 `cd ""` 给
+		// `cd: null directory`、退出码 1(不是"空串 = cd ."那样的静默成功)。
+		r.errf("%s: null directory\n", cmd)
 		return 1
 	}
 	apath := r.absPath(path)
 	info, err := r.stat(ctx, apath)
-	if err != nil || !info.IsDir() {
-		r.errf("%s: no such file or directory: %q\n", cmd, path)
+	if err != nil {
+		// winbash patch:上游把「stat 失败」与「不是目录」合并成一个分支,
+		// 于是两者都报 `no such file or directory: %q`。真 bash 分得很清
+		// (实测 2026-10-18):
+		//
+		//	cd /no-such-dir              → cd: /no-such-dir: No such file or directory
+		//	cd /c/Windows/win.ini        → cd: /c/Windows/win.ini: Not a directory
+		//	cd /c/Windows/System32/config → cd: …: Permission denied
+		//
+		// 三处差别都要补:① err 被直接丢掉、没做分类;② `%q` 多给了引号
+		// (真 bash 的路径不带引号);③ 消息首字母是小写。
+		msg := "No such file or directory"
+		// 用 os.ErrPermission 而非 fs.ErrPermission:本文件没导入 io/fs,
+		// 而两者是同一个值,不必为这一处加 import。
+		if errors.Is(err, os.ErrPermission) {
+			msg = "Permission denied"
+		}
+		r.errf("%s: %s: %s\n", cmd, path, msg)
+		return 1
+	}
+	if !info.IsDir() {
+		// stat 成功但不是目录 —— 与「不存在」分开报,真 bash 给 Not a directory。
+		r.errf("%s: %s: Not a directory\n", cmd, path)
 		return 1
 	}
 	if r.access(ctx, apath, AccessExec) != nil {
-		r.errf("%s: permission denied: %q\n", cmd, path)
+		r.errf("%s: %s: Permission denied\n", cmd, path)
 		return 1
 	}
 	r.Dir = apath

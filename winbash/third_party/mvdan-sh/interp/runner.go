@@ -1082,7 +1082,16 @@ func (r *Runner) redir(ctx context.Context, rd *syntax.Redirect) (io.Closer, err
 		case "-":
 			*orig = io.Discard // closing the output writer
 		default:
-			return nil, fmt.Errorf("unhandled %v arg: %q", rd.Op, arg)
+			// winbash patch:措辞对齐真 bash,实测 `echo x >& 99` 给
+			// `99: Bad file descriptor`、退出码 1。
+			//
+			// 上游这里是 `unhandled %v arg: %q` —— 露出 `>&` 这个**内部 token 名**
+			// 与一对引号,使用者既看不懂也搜不到。改成一件事:点名那个坏掉的编号。
+			//
+			// 注意真 bash 对**非数字**的 `>&bad` 是**静默**的(走 `&>bad` 语义,
+			// 创建文件、退出码 0)。那条静默我们不模仿 —— 按项目底线
+			// 「不静默做错事」,这里统一响亮报错更好。差异已记进 README。
+			return nil, fmt.Errorf("%s: Bad file descriptor", arg)
 		}
 		return nil, nil
 	case syntax.RdrIn, syntax.RdrOut, syntax.AppOut,
@@ -1093,7 +1102,8 @@ func (r *Runner) redir(ctx context.Context, rd *syntax.Redirect) (io.Closer, err
 		case "-":
 			r.stdin = nil // closing the input file
 		default:
-			return nil, fmt.Errorf("unhandled %v arg: %q", rd.Op, arg)
+			// 同上:`echo x <& 99` → 真 bash 给 `99: Bad file descriptor`。
+			return nil, fmt.Errorf("%s: Bad file descriptor", arg)
 		}
 		return nil, nil
 	default:
