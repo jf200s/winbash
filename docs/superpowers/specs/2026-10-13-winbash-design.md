@@ -85,10 +85,14 @@ mvdan/sh syntax 解析  →  mvdan/sh interp 执行
 `svc list` 的**语法**由我们定义,干活的是常驻 pwsh(`Get-Service | ConvertTo-Json`)。
 开发快,覆盖面一开始就等于整个 PowerShell,而输出格式仍在我们手里。
 
-### 与 pwshx 的关系
+### 与 pwshx 的关系(该目录已移除)
 
-`D:\work\中文 目录\pwshx` 已完成"常驻 pwsh + 命名管道 + JSON 协议"并跑通 15 项测试。
-winbash 的 ② 层**复用它的 daemon 脚本与协议**,不重写。pwshx 作为独立工具保留。
+`pwshx` 是这条线的前身验证产物:已完成"常驻 pwsh + 命名管道 + JSON 协议"并跑通 15 项测试。
+winbash 的 ② 层**复用了它的 daemon 脚本与协议**,不重写 —— 机制今天落在
+`internal/pwsh/session.ps1` 与 `internal/pwsh/pwsh.go` 里,不需要回看 pwshx。
+
+原文写的"pwshx 作为独立工具保留"**已作废**:2026-10-17 确认它的价值已被 ② 层完全吸收、
+单独保留没有意义,整个目录已从仓库删除(需要时从 git 历史取回)。
 
 ## 5. 命令分层
 
