@@ -28,13 +28,18 @@ const maxMessageBytes = 64 << 20
 //
 //	1 一次性 stdin:Request.Stdin []byte 走 JSON base64,受 64MiB 帧上限约束。
 //	2 流式 stdin:请求头之后跟**裸字节流**,不再缓存到内存(理由见 StdinMode)。
+//	3 Request.Fresh:一条命令可以要求跑在**一次性会话**里(理由见 Fresh 字段)。
 //
 // 1 → 2 必须**两端同时**升级:如果 client 切到流式、daemon 还是 1,那么 daemon
 // 只解请求头就去执行,根本不读后面那串字节 —— 于是 stdin 静默丢失,而脚本照样
 // exit 0。这正是本次要消灭的 bug 形态,所以在 CheckProto 处直接响亮拒绝。
 //
+// 2 → 3 同理必须同时升级:旧 daemon 不认识 fresh 字段,会认 JSON 里多出来的键
+// 就忽略 —— 于是 `--fresh` 静默变成「复用会话」,调用方以为隔离了、其实没有。
+// 这种「看起来生效、实际没生效」正是本项目所有版本检查要防的形态。
+//
 // 改动协议时把它 +1,并在两端的检查处同步更新说明。
-const ProtoVersion = 2
+const ProtoVersion = 3
 
 // StdinMode 的取值:一次请求的 stdin 走什么形态。
 const (
@@ -99,6 +104,19 @@ type Request struct {
 	// 执行阶段没有读预算;而 stdin 现在是持续读连接的 —— 没有这一条,一条
 	// 「只连、不发、不关」的流式请求能把串行的 handle 永久占住,后续命令全部饿死。
 	TimeoutMS int `json:"timeout_ms,omitempty"`
+
+	// Fresh 要求这次执行跑在**一次性会话**里:daemon 为它新建一个 shell.Session,
+	// 跑完就 Close,长驻会话一格都不动。
+	//
+	// 为什么需要它:winbash 的会话是**跨命令持久**的(变量、函数、set -e、trap、
+	// cwd 都在),这是它相对 `bash -c` 的特性;但对「每条命令彼此独立」的调用方,
+	// 上一条留下的 `set -e` 或变量会静默影响下一条 —— 最容易出怪问题的地方。
+	// 默认保持持久(不破坏既有行为),要隔离就显式声明。
+	//
+	// 隔离是**双向**的:之前的命令影响不到它,它设的东西也不留给后面的命令。
+	// 代价:② 层的常驻 pwsh 引擎挂在 Session 上,所以 fresh 请求一旦用到 ② 层,
+	// 要重新拉起一次(约 350ms);只用 ①/③ 层没有额外开销。
+	Fresh bool `json:"fresh,omitempty"`
 }
 
 // Response 是 daemon 返回给客户端的一条结果。
