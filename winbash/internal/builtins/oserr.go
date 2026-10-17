@@ -117,6 +117,16 @@ func posixErrText(err error, absPath string) string {
 	if errors.Is(err, fs.ErrPermission) {
 		return "Permission denied"
 	}
+	// 目标是目录(往目录上写)。Go 在 Windows 上把它映射成 syscall.EISDIR,
+	// 实测 errno=536870954、Error() 给**小写** "is a directory";而真 bash 给
+	// `Is a directory`(大写 I)。所以不能直接用 errno.Error()。
+	//
+	// 注意这类错误**不是** fs.ErrNotExist 也不是 fs.ErrPermission,
+	// 不加这条会掉到下面的兜底给 `I/O error (Win32 error 536870954)` ——
+	// 把一句人话变成没人看得懂的数字。
+	if errors.Is(err, syscall.EISDIR) {
+		return "Is a directory"
+	}
 
 	// ③ Win32 errno 细表。
 	var errno syscall.Errno
@@ -145,6 +155,58 @@ func posixErrText(err error, absPath string) string {
 	}
 	return msg
 }
+
+// ShellPathError 把 shell 层一次 open 失败包成**可直接打印**的措辞。
+//
+// 为什么需要它:重定向(`> /bad/x`、`< /bad/x`)与 `source` 的失败由 mvdan/sh
+// 的 OpenHandler 产生,不走上面那些命令内建的措辞层。原先原样端出 Go 的错误:
+//
+//	open C:\Program Files\Git\nonexistent-dir\x: The system cannot find the path specified.
+//
+// 三处都不对(与 dba69c7 修过的那批同源):泄漏 Win32 API 名 `open`、把用户写的
+// `/nonexistent-dir/x` 换成绝对路径、用 Win32 长句而不是 POSIX 措辞。
+//
+// 目标格式对着真 Git Bash 实测(2026-10-18):
+//
+//	> /nonexistent-dir/x   真 bash: line 1: /nonexistent-dir/x: No such file or directory
+//	> adir                 真 bash: line 1: adir: Is a directory
+//	> /c/Windows/.../__nope 真 bash: line 1: /c/Windows/.../__nope: Permission denied
+//	source nope.sh         真 bash: line 1: nope.sh: No such file or directory
+//
+// 我们少 `line N:`(mvdan/sh 的 errf 不带行号,且三行式风格本来也不加),其余逐字对齐。
+//
+// userPath 必须是 **OpenHandler 收到的那个 path** —— 它是 `r.literal(rd.Word)`,
+// 也就是用户写的(展开后的)路径,不是 ResolveShellPath 之后的 Windows 绝对路径。
+// absPath 传转换后的,只用于区分 `Not a directory`,绝不进输出。
+//
+// 返回的是**包装类型**而不是裸 *os.PathError:Go 的 PathError.Error() 是
+// `Op + " " + Path + ": " + Err`,三个字段都会出现在输出里,无法自定义成 `x: 原因`
+// 这个形态(Op 置空会留下一个前导空格)。包装类型让 Error() 完全可控,同时
+// Unwrap() 到 *os.PathError 保住 mvdan/sh 的"非 fatal"判定 —— 那需要上游那个
+// errors.As 补丁(见 third_party/mvdan-sh/WINBASH-PATCH.md §3)。
+func ShellPathError(userPath string, err error, absPath string) error {
+	return &shellPathError{
+		msg:   userPathProblem("", userPath, err, absPath),
+		inner: &os.PathError{Op: "open", Path: absPath, Err: err},
+	}
+}
+
+// shellPathError 让 Error() 自定义、Unwrap() 回到 *os.PathError。
+//
+// 两者缺一不可:
+//   - 没有自定义 Error(),输出就带 `open <绝对路径>:` 前缀(Win32 泄漏);
+//   - 没有 Unwrap 到 *os.PathError,mvdan/sh 的 r.open 会当成 handler 的 fatal
+//     错误,把"这条命令失败"升级成"整个脚本终止" —— 那是行为改变,不只是文案。
+type shellPathError struct {
+	msg   string
+	inner *os.PathError
+}
+
+func (e *shellPathError) Error() string { return e.msg }
+
+// Unwrap 返回内层 PathError。注意它**同时**让 errors.Is(err, fs.ErrNotExist)
+// 这类判定沿链生效 —— 与原生 *os.PathError 的语义一致,不会削弱调用方能力。
+func (e *shellPathError) Unwrap() error { return e.inner }
 
 // lastColon 找最后一个 `: ` 的位置(用于剥掉 `open <path>:` 前缀)。
 func lastColon(s string) int {

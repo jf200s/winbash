@@ -2,7 +2,7 @@
 
 **来源**：`mvdan.cc/sh/v3 v3.14.1`（未经修改的上游源码，复制自 Go module cache）
 **为何进库**：`go.mod` 里有一条 `replace mvdan.cc/sh/v3 => ./third_party/mvdan-sh`。
-**补丁范围**：两个内建选项，共约 30 行，全部集中在 `interp/builtin.go`（外加 `interp/runner.go` 一处调用点）。
+**补丁范围**：三个补丁 —— 两个内建选项（`interp/builtin.go`，外加 `interp/runner.go` 一处调用点）、一处错误分类修正（`interp/runner.go`，见 §3）。共约 45 行。
 
 ---
 
@@ -59,6 +59,56 @@ tail2() { mapfile -tn 0 line < "$2"; printf '%s\n' "${line[@]: -$1}"; }
 lines() { mapfile -tn 0 l < "$1"; printf '%s\n' "${#l[@]}"; }
 ```
 
+### 3. `open` 错误按 `errors.As` 分类（而非类型断言）
+
+`interp/runner.go` 的 `(*Runner).open`。上游原文：
+
+```go
+// TODO: support wrapped PathError returned from openHandler.
+switch err.(type) {
+case nil:           return f, nil
+case *os.PathError: if print { r.errf("%v\n", err) }   // 非 fatal
+default:            r.exit.fatal(err)                   // fatal:终止整个脚本
+}
+```
+
+**为什么这是个问题**：类型断言只认**裸的** `*os.PathError`。handler 想自定义错误文案，
+就得返回自己的类型 —— 那就掉进 `default`，被当成"handler 的 fatal 错误"，**整个脚本
+被终止**。于是只有两条路：要么让 Win32 细节漏给使用者，要么改变控制流语义。
+
+而 Win32 细节确实不能漏。修之前 `echo x > /bad/y` 给的是：
+
+```
+open C:\Program Files\Git\bad\y: The system cannot find the path specified.
+```
+
+三处都不对：泄漏 Win32 API 名 `open`、把用户写的 `/bad/y` 换成绝对路径、Win32 长句而
+不是 POSIX 措辞（真 bash 给 `line 1: /bad/y: No such file or directory`）。
+重定向（`>` / `>>` / `<` / `2>`）与 `source` 都走这条，全都一样漏。
+
+**改法**（就是上游那个 TODO）：
+
+```go
+var pathErr *os.PathError
+switch {
+case err == nil:               return f, nil
+case errors.As(err, &pathErr): if print { r.errf("%v\n", err) }
+default:                       r.exit.fatal(err)
+}
+```
+
+这样 handler 可以返回一个 `Error()` 自定义、`Unwrap()` 回到 `*os.PathError` 的包装类型：
+文案完全可控，同时**保住"非 fatal"的原语义**。winbash 侧的实现在
+`internal/builtins/oserr.go` 的 `ShellPathError`（`shellPathError` 类型），
+`OpenHandler` 在 `internal/shell/shell.go`。
+
+**关键**:`Unwrap` 不能省。它同时让 `errors.Is(err, fs.ErrNotExist)` 这类判定沿链成立 ——
+否则只有文案看得过去、错误类别判定全失效。
+
+**回归**:`internal/shell/openerr_test.go`。其中
+`TestRedirectFailureDoesNotAbortScript` 专门盯**控制流**（不是字符串）——把补丁退回
+类型断言，这条会红并指出根因。
+
 ## 验证
 
 18 条用例与真 Git Bash 逐条对照，**全部一致**（含反向回归：未带 `-d`/`-n` 的 `read`/`mapfile`、以及原有的 `mapfile -d ""` 都不受影响）。语料回归在
@@ -71,9 +121,11 @@ lines() { mapfile -tn 0 l < "$1"; printf '%s\n' "${#l[@]}"; }
 
 1. 把新版本源码覆盖进本目录（保留本文件）：
    `go mod download mvdan.cc/sh/v3@vX.Y.Z`，然后从 module cache 复制；
-2. 重新打这两处补丁 —— 上游很可能已经支持，那就**先检查**：
-   `grep -n 'case "-d"' third_party/mvdan-sh/interp/builtin.go`（`read` 段）与
-   `grep -n '"-n"' third_party/mvdan-sh/interp/builtin.go`（`mapfile` 段）；
+2. 重新打这几处补丁 —— 上游很可能已经支持，那就**先检查**：
+   `grep -n 'case "-d"' third_party/mvdan-sh/interp/builtin.go`（`read` 段）、
+   `grep -n '"-n"' third_party/mvdan-sh/interp/builtin.go`（`mapfile` 段）、
+   `grep -n 'errors.As(err, &pathErr)' third_party/mvdan-sh/interp/runner.go`（§3；
+   若新版已经不再用 `switch err.(type)` 而改用 `errors.As`，这一处就不用打了）；
 3. 如果上游已实现且行为一致，**删掉本补丁与 `replace` 行**，回到正常依赖；
 4. 跑 `go test ./... -count=1` 与 `smoke-gitbash.sh`，两者都必须绿。
 
