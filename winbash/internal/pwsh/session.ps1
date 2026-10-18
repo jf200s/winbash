@@ -55,7 +55,22 @@ while ($true) {
         $__wb_cwdOk = $true
         if ($__wb_req.PSObject.Properties.Match('cwd').Count -gt 0 -and $__wb_req.cwd) {
             try {
-                Set-Location -LiteralPath ([string]$__wb_req.cwd) -ErrorAction Stop
+                # 必须先经 Get-Item 解析成真实路径,不能直接 Set-Location。
+                #
+                # 原因(实测):Set-Location 会把路径里的 `~` 当 home 展开,连
+                # -LiteralPath 都挡不住。而 Windows 的 8.3 短名恰好含 `~` ——
+                # daemon 的 cwd 常常落在 `C:\Users\TESTUS~1\AppData\Local\Temp`
+                # 这种形态上,于是 Set-Location 报
+                #   "An object at the specified path C:\Users\TESTUS~1 does not exist."
+                # 而同一路径 Test-Path 明明为 True。这不是措辞问题,是 cmdlet 的行为。
+                #
+                # 为什么用 Get-Item 而不是 Resolve-Path / Convert-Path:后两个对短名
+                # 原样返回(实测),只有 Get-Item 的 FullName 给长名。顺带它也把
+                # 尾部分隔符与 `.`/`..` 规范化掉。
+                # -ErrorAction Stop 保证路径不存在时**响亮失败**,而不是静默留在
+                # 引擎原来的目录里 —— 那正是本次要消灭的形态。
+                $__wb_real = (Get-Item -LiteralPath ([string]$__wb_req.cwd) -ErrorAction Stop).FullName
+                Set-Location -LiteralPath $__wb_real -ErrorAction Stop
             } catch {
                 $__wb_cwdOk = $false
                 $__wb_errors += "cannot change directory to '$($__wb_req.cwd)': $($_.Exception.Message)"

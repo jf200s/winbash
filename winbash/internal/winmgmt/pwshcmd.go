@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -43,6 +44,24 @@ func WithEnv(ctx context.Context, env []string) context.Context {
 func envFrom(ctx context.Context) []string {
 	env, _ := ctx.Value(envKey{}).([]string)
 	return env
+}
+
+// dirKey 是 ① 层当前工作目录的 context 键。
+//
+// 与 env 一模一样的理由:引擎是常驻进程,它继承的 cwd 是**启动那一刻**的,
+// 而会话的 `cd` 发生在那之后。不同步,`cd /tmp; pwsh -c 'New-Item x'`
+// 就会静默把文件写进 daemon 的 cwd —— 又一个"看起来对"的坑。
+type dirKey struct{}
+
+// WithDir 把 ① 层当前的工作目录附到 ctx 上。
+func WithDir(ctx context.Context, dir string) context.Context {
+	return context.WithValue(ctx, dirKey{}, dir)
+}
+
+// dirFrom 取出 WithDir 附上的目录;没有就返回空串(表示"不干预")。
+func dirFrom(ctx context.Context) string {
+	dir, _ := ctx.Value(dirKey{}).(string)
+	return dir
 }
 
 const pwshUsage = "用法: pwsh -c '<脚本>' | pwsh -Command '<脚本>' | pwsh <脚本文件.ps1>"
@@ -111,11 +130,19 @@ func Pwsh(ctx context.Context, conn *pwsh.Conn, argv []string, jsonOut bool, out
 	}
 
 	if file != "" {
-		b, err := os.ReadFile(file)
+		// 相对路径按**会话**的 cwd 解析,不按进程 cwd:引擎的 cwd 是 daemon 启动时
+		// 继承的,而 `cd /tmp; pwsh rel.ps1` 里的 rel.ps1 指的是 /tmp 里的那一个。
+		// 不解析就会报「读不到脚本文件 rel.ps1」—— 明明文件就在那儿。
+		path := file
+		if dir := dirFrom(ctx); dir != "" && !filepath.IsAbs(path) {
+			path = filepath.Join(dir, path)
+		}
+		b, err := os.ReadFile(path)
 		if err != nil {
 			// 最常见的误用是"把一段脚本当位置参数给了"。所以报错里直接点出 -Command,
 			// 而不是丢一句"系统找不到指定的文件"让人自己去想。
-			fmt.Fprintln(errw, errs.Errorf("pwsh", "读不到脚本文件 "+file+" : "+err.Error(),
+			// 报出来的是解析后的**绝对**路径:使用者要判断的是"它去哪个目录找了"。
+			fmt.Fprintln(errw, errs.Errorf("pwsh", "读不到脚本文件 "+path+" : "+err.Error(),
 				"要执行一段脚本文本请用 pwsh -Command '<脚本>'"))
 			return errs.ExitError
 		}
@@ -128,8 +155,19 @@ func Pwsh(ctx context.Context, conn *pwsh.Conn, argv []string, jsonOut bool, out
 		return errs.ExitUsage
 	}
 
-	// 环境前导必须在脚本之前:脚本里可能立刻就读 $env:。
-	raw, err := conn.Run(ctx, envPrelude(envFrom(ctx))+script)
+	// cwd 与环境都靠 ctx 传(WithDir / WithEnv),由这里转成一次引擎调用。
+	//
+	// 为什么 cwd 必须**每条**命令都同步:引擎的 cwd 会漂 —— 上一条脚本自己
+	// Set-Location、或者会话这边的 `cd` 变了,都只影响那一条,引擎不会自己跟上来。
+	// 不每条同步,`cd /tmp; pwsh -c 'New-Item x'` 就会静默把文件写进 daemon 的 cwd(实测如此)。
+	//
+	// 为什么不在这里拼一句 `Set-Location ...;` 而是走协议字段:session.ps1 早就
+	// 实现了 cwd(错误措辞也更准),拼文本等于重写一遍;更要紧的是任何文本前导都会让
+	// 「脚本以 param(...) 开头」失效 —— 那种脚本只允许 param 是第一条语句。
+	//
+	// 环境前导仍走文本,而且必须在脚本之前:脚本里可能立刻就读 $env:。
+	// (这也是上面那条 param 限制至今仍在的原因,见 README 的已知差异。)
+	raw, err := conn.RunIn(ctx, dirFrom(ctx), envPrelude(envFrom(ctx))+script)
 	if err != nil {
 		fmt.Fprintln(errw, errs.Errorf("pwsh", stripEnginePrefix(err.Error()),
 			"这段脚本在常驻 pwsh 里失败了;要看原生的报错可以用 pwsh 的全路径调它"))
