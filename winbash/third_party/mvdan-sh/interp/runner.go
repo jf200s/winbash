@@ -279,16 +279,64 @@ func (r *Runner) handlerCtx(ctx context.Context, kind handlerKind, pos syntax.Po
 	return context.WithValue(ctx, handlerCtxKey{}, hc)
 }
 
+// errClosedFD 是「写到显式关闭的 fd」的哨兵错误。
+//
+// **必须与其它写错误区分开** —— 这一条是实测出来的(2026-10-18),踩过一次:
+//
+//	echo foo >&-            真 bash: rc=1 + `echo: write error: Bad file descriptor`
+//	echo foo | false | true 真 bash: **完全静默**、rc=0
+//
+// 两者对 Write 来说都返回 error,但语义完全不同:前者是使用者明确关掉了 fd,
+// 必须响亮;后者是管道读端先走(broken pipe),bash 按 SIGPIPE 语义**静默**处理。
+// 若不区分,`echo foo | false | true` 会多出一行
+// `echo: write error: write |1: The pipe is being closed.` —— 那是把一个正常的
+// 管道场景变成噪音,上游 interp 的 4 条用例就是因此变红的(实测踩到)。
+//
+// 所以 out/outf 只对这个哨兵记账,其余写错误回到上游原行为:吞掉。
+var errClosedFD = errors.New("Bad file descriptor")
+
+// closedWriter stands in for a closed output file descriptor, as created by
+// `>&-`. Like a real closed fd, every write fails with the reason bash
+// reports: "Bad file descriptor".
+//
+// winbash patch:上游把 `>&-` 实现成 io.Discard,于是写"成功"、rc=0、无报错 ——
+// 静默做错事。真 bash 是 `echo x >&-` → rc=1、`echo: write error: Bad file
+// descriptor`;错误沿 out/outf 的记账(r.writeErr)在 builtin 出口变成退出码。
+type closedWriter struct{}
+
+func (closedWriter) Write([]byte) (int, error) {
+	return 0, errClosedFD
+}
+
+// out writes s to the current stdout. A write failure **to a closed fd** is
+// recorded on the runner (only the first one) and all further writes are
+// skipped, so that `echo a b c >&-` reports a single write error like bash
+// does, not one per output part. The recorded error is turned into an exit
+// status and a `<cmd>: write error: <reason>` line by [Runner.builtin].
+//
+// 其它写错误(管道 broken pipe 之类)**不记账**,原因见 errClosedFD 的注释。
 func (r *Runner) out(s string) {
-	io.WriteString(r.stdout, s)
+	if r.writeErr != nil {
+		return // 首错即停:同一命令只报一次,不再继续写
+	}
+	if _, err := io.WriteString(r.stdout, s); err != nil {
+		if errors.Is(err, errClosedFD) {
+			r.writeErr = err
+		}
+		// 其余写错误吞掉,与上游原行为一致(见 errClosedFD)。
+	}
 }
 
 func (r *Runner) outf(format string, a ...any) {
-	fmt.Fprintf(r.stdout, format, a...)
+	r.out(fmt.Sprintf(format, a...))
 }
 
+// errf reports a shell error on stderr. Unlike out/outf it never records a
+// write error: an error report that cannot be printed (stderr closed via
+// `2>&-`) must not recurse, must not panic, and must not overwrite the exit
+// status being reported — `echo x >&- 2>&-` still exits 1 in bash.
 func (r *Runner) errf(format string, a ...any) {
-	fmt.Fprintf(r.stderr, format, a...)
+	fmt.Fprintf(r.stderr, format, a...) // 写失败只能吞掉:不能崩、不能递归
 }
 
 func (r *Runner) stop(ctx context.Context) bool {
@@ -1080,7 +1128,10 @@ func (r *Runner) redir(ctx context.Context, rd *syntax.Redirect) (io.Closer, err
 		case "2":
 			*orig = r.stderr
 		case "-":
-			*orig = io.Discard // closing the output writer
+			// winbash patch:关闭输出 fd。上游这里用 io.Discard,写"成功"、rc=0、
+			// 无报错 —— 静默做错事。真 bash 之后每次写都失败:`echo x >&-` →
+			// rc=1、`echo: write error: Bad file descriptor`。
+			*orig = closedWriter{}
 		default:
 			// winbash patch:措辞对齐真 bash,实测 `echo x >& 99` 给
 			// `99: Bad file descriptor`、退出码 1。

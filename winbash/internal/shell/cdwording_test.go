@@ -172,14 +172,32 @@ func TestFdRedirectLegalFormsStillWork(t *testing.T) {
 // 真 bash:写到一个已关闭的 fd 会炸 —— `echo: write error: Bad file descriptor`、rc=1。
 // winbash:mvdan/sh 把 `>&-` 实现成 `*orig = io.Discard`,于是写"成功"、rc=0、无报错。
 //
-// 这是**既存差异**,不是本轮引入的(`-` 分支我没动)。所以这条只钉"不崩、脚本继续",
-// 不去断言 rc 的具体值 —— 断言 rc=0 会把错误行为固化下来。
-// 差异本身记进 README 已知差异表,比让测试替它背书合适。
+// 这条差异**已修**(见 TestCloseStdoutReportsWriteError):`>&-` 现在换成一个
+// 总是报 `Bad file descriptor` 的 writer,写错误沿 out/outf 记账变成 rc=1 与
+// 真 bash 的措辞。上面这段历史注释与这条「只钉不崩」的用例**保留** —— 它钉的
+// 「关掉 stdout 后脚本继续」在真 bash 里也成立,与 rc 无关,是独立的底线。
+// rc 的断言由紧随其后的新用例负责。
 func TestCloseStdoutDoesNotCrash(t *testing.T) {
 	dir := t.TempDir()
 	out, _, _ := runIn(t, dir, `echo x >&-; echo "after"`)
 	if !strings.Contains(out, "after") {
 		t.Errorf("关掉 stdout 后脚本应当继续(真 bash 也继续),得到 stdout=%q", out)
+	}
+}
+
+// ★ 上一条差异已修:写关闭的 stdout 必须失败,rc=1、措辞与真 bash 逐字相同。
+//
+// 修之前这里会红(winbash 给 rc=0、无报错),那正是「静默做错事」的形态;
+// 断言 rc=1 不是固化错误行为,而是把**已修**的行为钉在正确的一侧。
+func TestCloseStdoutReportsWriteError(t *testing.T) {
+	dir := t.TempDir()
+	_, errText, exit := runIn(t, dir, `echo x >&-`)
+	if exit != 1 {
+		t.Errorf("echo x >&- 退出码 %d,期望 1(真 bash:写关闭的 fd 失败)", exit)
+	}
+	want := "echo: write error: Bad file descriptor"
+	if strings.TrimSpace(errText) != want {
+		t.Errorf("措辞应当逐字是 %q,得到 %q", want, errText)
 	}
 }
 

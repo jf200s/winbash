@@ -104,6 +104,14 @@ type Runner struct {
 	stdout io.Writer
 	stderr io.Writer
 
+	// writeErr records the first write error seen by out/outf during the
+	// current builtin, such as writing to a closed stdout (`echo x >&-`).
+	// Only the first error is kept and further writes are skipped, so a
+	// multi-part write like `echo a b c >&-` reports one error, like bash.
+	// It is consumed and cleared by [Runner.builtin]; errf never records
+	// here, so a failing error report cannot pollute the exit status.
+	writeErr error
+
 	ecfg *expand.Config
 	ectx context.Context // just so that Runner.Subshell can use it again
 
