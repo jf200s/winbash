@@ -746,3 +746,185 @@ func min(ds []time.Duration) time.Duration {
 	sort.Slice(s, func(i, j int) bool { return s[i] < s[j] })
 	return s[0].Round(time.Millisecond)
 }
+
+// sameDirLine 判断输出里的某一行是否指向 dir 这个目录。
+//
+// 只比文件身份、不比字符串:t.TempDir() 可能给 8.3 短名,而 PowerShell 经
+// Get-Item 解析后给长名 —— 同一个目录、两个字符串,EqualFold 会假红(这个坑上一轮
+// 踩过)。stat 失败一律当作"不是这一行":同一个 stdout 里还混着被测脚本自己的输出。
+func sameDirLine(t *testing.T, dir, line string) bool {
+	t.Helper()
+	di, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat %q: %v", dir, err)
+	}
+	fi, err := os.Stat(line)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(fi, di)
+}
+
+// TestPwshFollowsSessionCwdAcrossProcesses 钉住「② 层的 pwsh 跟随**会话**的 cwd」。
+//
+// 这条事实在 internal/winmgmt/pwshcmd_test.go(TestPwshFollowsSessionDir)已经钉过,
+// 但那个坑长在 client / daemon / 常驻引擎的边界上:会话的 cwd 是 client 发过来的,
+// 引擎是 daemon 里的一个常驻进程 —— 包内测试证不到这一路上它有没有被带上。
+// 所以这里走真进程,并把两件事放进**同一条** -c 脚本:
+//
+//	cd <dir>; pwsh -c '(Get-Location).Path'; pwsh marker.ps1
+//
+// 必须同一条脚本才构成「先 cd、再 pwsh」这个序列;拆成两次调用的话 cd 与 pwsh 之间
+// 还要跨一次进程,测的就不是同一个东西了。
+//
+// 修前会红,而且两处一起红:
+//   - 目录那行会是 **daemon 启动时的 cwd**(引擎继承了它,会话的 cd 没同步过去);
+//   - `pwsh marker.ps1` 会报「读不到脚本文件」—— 相对路径按 daemon 的 cwd 解析了,
+//     而文件明明就在 <dir> 里。
+func TestPwshFollowsSessionCwdAcrossProcesses(t *testing.T) {
+	if findPwsh(t) == "" {
+		t.Skip("本机没有 pwsh,② 层跑不了")
+	}
+	exe := buildWinbash(t)
+	endpoint := benchEndpoint(t)
+	// 这里用 stopAndWait 而不是裸 --stop:daemon 关停时要杀掉常驻的 pwsh,这期间它
+	// 仍攥着 winbash.exe,而 buildWinbash 把 exe 建在 t.TempDir() 里 —— Windows
+	// 不允许删正在运行的 exe,清理会以「Access is denied」失败(代码其实全对)。
+	t.Cleanup(func() { stopAndWait(t, exe, endpoint) })
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "marker.ps1"),
+		[]byte("Write-Output \"from-session-cwd\"\r\n"), 0o644); err != nil {
+		t.Fatalf("写 marker.ps1: %v", err)
+	}
+
+	out, code := runWinbash(t, exe, endpoint, "-c",
+		"cd "+shellPathArg(dir)+"; pwsh -c '(Get-Location).Path'; pwsh marker.ps1")
+	if code != 0 {
+		t.Fatalf("rc=%d out=%q(cd %s 之后 pwsh 就失败了)", code, out, dir)
+	}
+
+	var sawDir, sawMarker bool
+	for _, ln := range strings.Split(strings.TrimRight(out, "\r\n"), "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" {
+			continue
+		}
+		if ln == "from-session-cwd" {
+			sawMarker = true
+			continue
+		}
+		if sameDirLine(t, dir, ln) {
+			sawDir = true
+		}
+	}
+	if !sawDir {
+		t.Errorf("没有一行指向会话的 cwd %q:引擎的 cwd 是 daemon 启动时继承的那个,"+
+			"会话的 cd 没同步过去(修前的症状)。out=%q", dir, out)
+	}
+	if !sawMarker {
+		t.Errorf("输出里没有 from-session-cwd:相对路径的脚本没按会话的 cwd 解析。"+
+			"out=%q", out)
+	}
+}
+
+// TestEndpointSurvivesStopAndRestart 钉住「--stop 之后这个 endpoint 还能用」。
+//
+// 修之前的现场:自定义 --endpoint 的端口文件被收紧了 ACL,daemon --stop 时删不掉
+// 自己建的那个文件(ACL 里没有 DELETE)。--stop 仍报 rc=0,文件却留了下来、指向一个
+// 已经不存在的地址 —— 此后每次调用都是「连接被拒」,重试也不会好:这个 endpoint
+// 就此**永久不可用**。
+//
+// 所以判据必须落在「文件真的不在了」上,不能只看 --stop 的退出码:把删除错误吞掉的
+// 实现同样报 rc=0,而修前那个 bug 正是这样被漏掉的。紧跟着的第二次调用钉的是另一半:
+// 即使文件因故残留,下一个调用也要能自愈(重建 daemon)。
+//
+// 注意:这里**故意不复现**「ACL 让人删不掉文件」。端口文件建在 t.TempDir() 下
+// (%TEMP% 里),父目录的 FILE_DELETE_CHILD 会顶掉文件自身 ACL 的缺失 —— 构造不出来。
+// ACL 与「残留文件自愈」两块已由 internal/daemon/state_test.go 与
+// internal/client/client_test.go 的单元测试钉住,这条只负责跨进程能看见的那一半。
+func TestEndpointSurvivesStopAndRestart(t *testing.T) {
+	if findPwsh(t) == "" {
+		t.Skip("本机没有 pwsh,② 层跑不了")
+	}
+	exe := buildWinbash(t)
+	endpoint := benchEndpoint(t)
+	t.Cleanup(func() { runWinbash(t, exe, endpoint, "--stop") })
+
+	if out, code := runWinbash(t, exe, endpoint, "-c", "echo boot"); code != 0 {
+		t.Fatalf("首次调用失败 rc=%d out=%q", code, out)
+	}
+	if out, code := runWinbash(t, exe, endpoint, "--stop"); code != 0 {
+		t.Fatalf("--stop 失败 rc=%d out=%q", code, out)
+	}
+
+	// --stop 在回 OK **之前**就关监听、删端口文件(见 daemon.stopAccepting),所以
+	// 这里不需要轮询:拿到 rc=0 时该做的清理已经做完了。延迟出现才算失败的话,
+	// 这条断言反而抓不到"删不掉"那个缺陷。
+	if _, err := os.Stat(endpoint); !os.IsNotExist(err) {
+		t.Fatalf("--stop 之后端口文件 %s 仍然存在(stat err=%v)。这个文件是 daemon 自己"+
+			"建的,它必须能删掉 —— 删不掉就那个 endpoint 从此永久不可用,"+
+			"之后每次调用只会得到一句「连接被拒」", endpoint, err)
+	}
+
+	out, code := runWinbash(t, exe, endpoint, "-c", "echo recovery")
+	if code != 0 {
+		t.Fatalf("--stop 之后同一个 endpoint 再也起不来了 rc=%d out=%q", code, out)
+	}
+	if !strings.Contains(out, "recovery") {
+		t.Errorf("恢复后的调用输出里没有 recovery: %q", out)
+	}
+}
+
+// TestPwshScriptWithParamBlockAcrossProcesses 钉住「以 param(...) 开头的脚本能跑」。
+//
+// 机理在 internal/winmgmt/pwshcmd_test.go 里写清了:PowerShell 要求 `param(...)` 是
+// scriptblock 的**第一条**语句,而老实现把环境同步拼成脚本文本的**前导**,于是报
+//
+//	The term 'param' is not recognized as a name of a cmdlet...
+//
+// 它为什么还需要一条跨进程的覆盖:那段前导要真的**非空**才出现,而环境是
+// client → daemon → 会话 → 常驻引擎一路传下去的 —— 包内测试得自己造 WithEnv,
+// 真实调用里则取决于 ① 层的 export 有没有被同步过去。所以这里先 export 一个探针
+// 变量:让"前导非空"这件事由**这条测试自己**保证,而不是碰巧依赖 daemon 继承了什么。
+func TestPwshScriptWithParamBlockAcrossProcesses(t *testing.T) {
+	if findPwsh(t) == "" {
+		t.Skip("本机没有 pwsh,② 层跑不了")
+	}
+	exe := buildWinbash(t)
+	endpoint := benchEndpoint(t)
+	t.Cleanup(func() { stopAndWait(t, exe, endpoint) })
+
+	dir := t.TempDir()
+	// 行尾用 \r\n:这是 Windows 原生工具写出来的形状,不至于让这条测试因为
+	// 「另一个平台的换行」而红。
+	body := "param($Name = \"default\")\r\nWrite-Output \"hello-$Name\"\r\n"
+	if err := os.WriteFile(filepath.Join(dir, "param.ps1"), []byte(body), 0o644); err != nil {
+		t.Fatalf("写 param.ps1: %v", err)
+	}
+
+	// 相对文件名是刻意的:顺带复用「按会话 cwd 解析脚本路径」,让两个缺陷在同一处汇合。
+	out, code := runWinbash(t, exe, endpoint, "-c",
+		"export WINBASH_PARAM_PROBE=1; cd "+shellPathArg(dir)+"; pwsh param.ps1")
+	if code != 0 {
+		t.Fatalf("rc=%d out=%q(带 param 块的脚本跑不了:环境又回到脚本前导了?)", code, out)
+	}
+	for _, ln := range strings.Split(strings.TrimRight(out, "\r\n"), "\n") {
+		if strings.TrimSpace(ln) == "hello-default" {
+			return
+		}
+	}
+	t.Fatalf("输出里没有一行恰为 hello-default: %q(param 的默认值没生效)", out)
+}
+
+// shellPathArg 把一个 Windows 路径变成可以安全写进 `-c` 脚本的实参。
+//
+// 两个选择都不是随手写的:
+//   - **正斜杠**:t.TempDir() 在 Windows 上给反斜杠形式,而这段脚本由 ① 层按 bash
+//     风格解析,`\t`、`\n` 之类会被当成转义序列(本机路径里真的出现过 `\t`)。
+//     filepath.ToSlash 之后没有这个歧义,而 POSIX 风格的路径 winbash 与 pwsh 都认。
+//   - **单引号**:本机用户名带空格("Test User"),t.TempDir() 落在 C:\Users\Test User\… 下。
+//     bash 风格的单引号里不做任何展开,空格、`$`、反引号都原样传进去。
+func shellPathArg(path string) string {
+	return "'" + filepath.ToSlash(path) + "'"
+}
