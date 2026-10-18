@@ -104,6 +104,16 @@ type Runner struct {
 	stdout io.Writer
 	stderr io.Writer
 
+	// fdTable 是 fd 3+ 的文件描述符表,winbash 补丁引入(见 fdtable.go)。
+	// fd 0/1/2 不在表里:它们就是上面的 stdin/stdout/stderr 三个槽 ——
+	// winbash 的 StdIO 重设机制直接换这三个槽,复制一份进表就与它脱同步。
+	fdTable map[int]fdEntry
+
+	// cmdFdRedir 记录当前语句的重定向里出现过的最小 fd 3+(0 = 无)。
+	// 子进程继承不了 fd 3+(os/exec 的 ExtraFiles 在 Windows 不支持),
+	// 外部命令带 `cmd 3>log` 这类重定向时要响亮报错,见 [Runner.exec]。
+	cmdFdRedir int
+
 	// writeErr records the first write error seen by out/outf during the
 	// current builtin, such as writing to a closed stdout (`echo x >&-`).
 	// Only the first error is kept and further writes are skipped, so a
@@ -628,6 +638,10 @@ func StdIO(in io.Reader, out, err io.Writer) RunnerOption {
 		if _err != nil {
 			return _err
 		}
+		// winbash patch:换槽前记下旧值。fd 表里引用着旧值的条目要失效,
+		// 否则 `exec 3<&0` 之后 winbash 的 closeStdin 把 stdin 管道换成
+		// /dev/null,下次 `cat <&3` 就是 use-after-close(`file already closed`)。
+		oldIn, oldOut, oldErr := r.stdin, r.stdout, r.stderr
 		r.stdin = stdin
 		if out == nil {
 			out = io.Discard
@@ -637,6 +651,7 @@ func StdIO(in io.Reader, out, err io.Writer) RunnerOption {
 			err = io.Discard
 		}
 		r.stderr = err
+		r.invalidateStdioFds(oldIn, oldOut, oldErr)
 		return nil
 	}
 }
@@ -885,6 +900,10 @@ func (r *Runner) Reset() {
 		// Clean it as we will later do a string prefix match.
 		r.tempDir = filepath.Clean(r.tempDir)
 	}
+	// winbash patch:fd 表里可能有打开的文件(`exec 4>f`)。下面的
+	// `*r = Runner{}` 整体重建会把 map 静默丢掉而不 Close —— 常驻 daemon
+	// 的 Session 每 Reset 一次就漏一个 *os.File。先归还全部引用。
+	r.closeAllFds()
 	// reset the internal state
 	*r = Runner{
 		Env:            r.Env,
@@ -1090,11 +1109,14 @@ func (r *Runner) subshell(background bool) *Runner {
 		stdin:          r.stdin,
 		stdout:         r.stdout,
 		stderr:         r.stderr,
-		filename:       r.filename,
-		opts:           r.opts,
-		usedNew:        r.usedNew,
-		exit:           r.exit,
-		lastExit:       r.lastExit,
+		// winbash patch:fd 表必须拷贝(共享 map 在管道段并发时是 data race),
+		// 底层资源共享并各记一份引用 —— 与 fork 语义一致。见 fdtable.go。
+		fdTable:  cloneFdTable(r.fdTable),
+		filename: r.filename,
+		opts:     r.opts,
+		usedNew:  r.usedNew,
+		exit:     r.exit,
+		lastExit: r.lastExit,
 
 		origStdout: r.origStdout, // used for process substitutions
 	}

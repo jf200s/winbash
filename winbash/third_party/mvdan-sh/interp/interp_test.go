@@ -1561,8 +1561,11 @@ var runTests = []runTest{
 		"5: Bad file descriptor\nexit status 1 #JUSTERR",
 	},
 	{
+		// winbash patch:fd 表落地后 `5>a` 不再报 `unsupported redirect fd: 5`。
+		// 真 bash 实测:`echo foo 5>a` 输出 foo、静默创建 a、rc=0 —— fd 5 在
+		// 命令内创建、命令结束关闭,echo 不碰它。期望值随之改成真 bash 行为。
 		"echo foo 5>a",
-		"unsupported redirect fd: 5\nexit status 1 #IGNORE",
+		"foo\n",
 	},
 	{
 		"echo foo >|a",
