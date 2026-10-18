@@ -153,6 +153,17 @@ func Stop(endpoint string) error {
 	if !resp.OK {
 		return fmt.Errorf("client: daemon 拒绝停止: %s", strings.Join(resp.Errors, "; "))
 	}
+	// daemon 已停,但端口文件未必跟着走:删它要 FILE_DELETE_CHILD / DELETE 权限,
+	// 权限没给全时连 daemon 自己都删不掉自己写的文件(那正是「自定义 --endpoint
+	// 永久不可用」缺陷的起点,见 daemon.removeIfOwned 与 restrictEndpointFile)。
+	//
+	// 这行提示只能由**这里**来说:后台 daemon 是 spawn 起来的,它的 stderr 在
+	// daemonEnv / 命令行那一步就没接,它自己那句警告没人看得到;使用者眼前这个
+	// 终端是唯一还能说话的地方。不改 --stop 的成败 —— 停是停成了,只是留了个尾巴。
+	if info, rerr := readEndpoint(endpoint); rerr == nil {
+		fmt.Fprintf(os.Stderr, "winbash: 警告: 端口文件 %s 还在(daemon 已停,但文件没删掉,"+
+			"仍指向 %s),下次调用会自动重建 daemon\n", endpoint, info.addr)
+	}
 	return nil
 }
 
@@ -220,7 +231,8 @@ func oneShot(endpoint string, req ipc.Request, mustExist bool, timeout, idle tim
 	// 剩下这类才是"半路上掉了":连接被重置、daemon 刚被杀。这种请求**极可能没送达**,
 	// 重试一次是「从偶发竞态里恢复」和「不在真故障上打转」之间的中点。
 	forgetStaleEndpoint(endpoint, info.addr)
-	info2, aerr := ensureDaemon(endpoint, idle)
+	// 同样要带 deadAddr:删不掉的残留文件会让 ensureDaemon 把死地址再交回来。
+	info2, aerr := ensureDaemonExcept(endpoint, info.addr, idle)
 	if aerr != nil {
 		return ipc.Response{}, xerr
 	}
@@ -281,8 +293,14 @@ func dial(endpoint, addr string, mustExist bool, idle time.Duration) (net.Conn, 
 		return nil, fmt.Errorf("client: daemon 没在运行(端口文件 %s 指向的地址连不上)", endpoint)
 	}
 	// 端口文件指向的 daemon 已经不在了。清掉陈旧端口再拉一次。
+	//
+	// 这里必须把 addr 当 deadAddr 传下去:端口文件有可能删不掉(ACL 里缺 DELETE
+	// 的残留文件),那样 forgetStaleEndpoint 是白删的,而 ensureDaemon 若照旧
+	// "读到了就信任",拿回来的还是刚才连不上的同一个地址 —— 两条命令之间
+	// 一步也没前进。带 deadAddr 进去,它才会真的重新 spawn 一个 daemon,
+	// 由新 daemon 的 WriteFile 覆盖写那份残留文件。
 	forgetStaleEndpoint(endpoint, addr)
-	info, aerr := ensureDaemon(endpoint, idle)
+	info, aerr := ensureDaemonExcept(endpoint, addr, idle)
 	if aerr != nil {
 		return nil, aerr
 	}
@@ -304,7 +322,18 @@ func forgetStaleEndpoint(endpoint, addr string) {
 	}
 	first := strings.TrimSpace(strings.SplitN(strings.TrimSpace(string(b)), "\n", 2)[0])
 	if first == addr {
-		_ = os.Remove(endpoint)
+		// 删不掉必须**说出来**:这个文件指着已经连不上的地址,留着它就会让
+		// 下一次调用先撞一次失败。原先 `_ = os.Remove(...)` 把它彻底吞掉,
+		// 使用者只看到"连接失败",无从知道是哪个文件在挡路。
+		// 恢复路径本身不会因为这次失败而失效(ensureDaemonExcept 会重新 spawn、
+		// 由新 daemon 覆盖写这个文件),但静默是另一回事 —— 本项目不静默做错事。
+		// NotExist 不算失败:目的(文件不在了)已经达到。
+		if err := os.Remove(endpoint); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "winbash: 警告: 删不掉陈旧端口文件 %s(%v);"+
+				"它会继续指向连不上的 %s,恢复要靠新建的 daemon 覆盖写它"+
+				"(必要时手动删除,或 `icacls %s /grant:r <用户>:(R,W,D)`)\n",
+				endpoint, err, addr, endpoint)
+		}
 	}
 }
 
@@ -364,6 +393,32 @@ func dialAddr(endpoint string, mustExist bool, idle time.Duration) (endpointInfo
 	return info, nil
 }
 
+// trustEndpoint 判断「刚从端口文件读到的这一对地址/token 值不值得信任」。
+//
+// 抽成纯函数是为了能测(照同一个文件里 serveArgs 的先例):这里的两条分支正是
+// 「删不掉的端口文件让 endpoint 永久不可用」那个缺陷的正中间 ——
+// 只要照旧无条件信任,ensureDaemon 就会把刚刚连不上的**同一个**地址原样交回去,
+// 重试多少次都在原地打转(实测:`--stop` 之后文件残留,之后每条命令都是"连接失败",
+// 而且永远如此)。
+//
+// 两种不信任:
+//   - err != nil:压根没读到(文件不存在 / 空文件),没什么可信任的;
+//   - addr == deadAddr:这正是刚刚连不上的那个地址。**文件还在不等于 daemon 还在**,
+//     残留的端口文件恰恰是这次故障的形态,所以这里必须换一个 daemon,
+//     而不是再信它一次。
+//
+// deadAddr 为空表示「没有已知的坏地址」(首次启动、或 --stop/--status 这类管理操作),
+// 这时读到什么都算可信。
+func trustEndpoint(info endpointInfo, err error, deadAddr string) bool {
+	if err != nil {
+		return false
+	}
+	if deadAddr != "" && info.addr == deadAddr {
+		return false
+	}
+	return true
+}
+
 // ensureDaemon 返回端口文件内容;daemon 不在就先把它拉起来。
 //
 // idle 会原样转给新起的 daemon。**这件事必须做到**:不转发的话,使用者写的
@@ -371,43 +426,86 @@ func dialAddr(endpoint string, mustExist bool, idle time.Duration) (endpointInfo
 // 属于"文档承诺了、实现没转发",而这类落差最伤信任(实测:不转发时等 6s 后
 // daemon 仍在、端口文件仍在)。
 func ensureDaemon(endpoint string, idle time.Duration) (endpointInfo, error) {
-	if info, err := readEndpoint(endpoint); err == nil {
+	return ensureDaemonExcept(endpoint, "", idle)
+}
+
+// ensureDaemonExcept 同 ensureDaemon,但**不信任**端口文件里指向 deadAddr 的那份内容。
+//
+// 为什么需要它(缺陷现场):端口文件可能因为权限不足而删不掉 —— restrictEndpointFile
+// 曾经只授 (R,W)、没有 D,于是 daemon 退出时删不掉自己写的文件。那种残留文件永远
+// 指着同一个已经没人监听的地址,而 ensureDaemon 每轮都"读到了就信任",于是
+// 「连不上 → 删文件(失败) → 又信任同一个死地址 → 连不上」永不收敛。
+//
+// 带 deadAddr 进来之后,每一处「读到了就信任」都过 trustEndpoint 这一关;
+// 一旦那次读到的仍是死地址,就走到 spawnDaemon:新 daemon 的 os.WriteFile 会
+// 覆盖写同一个文件(ACL 里 W 仍在),于是残留文件被改写成新地址,自愈。
+func ensureDaemonExcept(endpoint, deadAddr string, idle time.Duration) (endpointInfo, error) {
+	if info, err := readEndpoint(endpoint); trustEndpoint(info, err, deadAddr) {
 		return info, nil
 	}
 
-	// 从这里往下是「没有 daemon,要拉起一个」——必须跨进程互斥。
+	// 从这里往下是「没有可用的 daemon,要拉起一个」——必须跨进程互斥。
 	//
 	// 不互斥会怎样(实测):8 个 client 同时首次调用,每个都读到「没有 daemon」,
 	// 于是各 spawn 一个。daemon 用 127.0.0.1:0 取随机端口,所以**它们全都绑定成功**,
 	// 不存在"后来者失败退出"这种天然去重 —— 结果 8 个 --serve 进程同时活着,
 	// 端口文件只指向最后写入的那一个,其余 7 个是孤儿:--status 看不到、--stop 停不掉,
 	// 各自还抱着一个 Session(用到 ② 层的还各抱一个 pwsh)白占内存,要等 30 分钟空闲才退。
-	release, alreadyUp, err := acquireStartLock(endpoint)
-	if err != nil {
-		return endpointInfo{}, err
-	}
-	if alreadyUp {
-		// 等锁的那段时间里,持锁者已经把 daemon 起来了。
-		return readEndpoint(endpoint)
-	}
-	defer release()
-
-	// 抢到锁之后要**再读一次**:上一个持锁者可能刚好在放锁之前写好了端口文件。
-	// 少了这一次,我们就会在一个已经健康的 daemon 旁边再起一个 —— 正是要消灭的那件事。
-	if info, err := readEndpoint(endpoint); err == nil {
-		return info, nil
-	}
-	if err := spawnDaemon(endpoint, idle); err != nil {
-		return endpointInfo{}, fmt.Errorf("client: 启动 daemon 失败: %w", err)
-	}
+	//
+	// 为什么是个循环:alreadyUp 那条路上读到的端口文件**也可能**正指着 deadAddr
+	// (持锁者同样删不掉那个残留文件,甚至持锁者就是修复前的老版本)。那种时候
+	// 信任它就是原样回到缺陷里,所以不返回、重抢锁,直到我们自己拿到锁去 spawn。
 	deadline := time.Now().Add(startupBudget)
-	for time.Now().Before(deadline) {
-		if info, err := readEndpoint(endpoint); err == nil {
+	for {
+		release, alreadyUp, err := acquireStartLock(endpoint)
+		if err != nil {
+			return endpointInfo{}, err
+		}
+		if alreadyUp {
+			// 等锁的那段时间里,持锁者已经把 daemon 起来了 —— 但**只有当它起来的是
+			// 个新的**才算数(见 trustEndpoint)。
+			if info, rerr := readEndpoint(endpoint); trustEndpoint(info, rerr, deadAddr) {
+				return info, nil
+			}
+			// 仍是那个死地址。不信任它,但也不能在没有锁的情况下 spawn
+			// (那正是上面 8 个 daemon 的来路),所以退回去重抢。alreadyUp 时
+			// release 是 nil,这里不会漏掉一把锁。
+			//
+			// 必须 sleep + 走总预算:acquireStartLock 在「文件存在」时会立刻返回
+			// alreadyUp,不 sleep 就是纯忙等,而它自己的超时又被这个分支绕过了。
+			if time.Now().After(deadline) {
+				return endpointInfo{}, fmt.Errorf(
+					"client: daemon 在 %s 内没有起来:端口文件 %s 仍指向连不上的 %s。"+
+						"若确实没有别的 winbash 在跑,删掉这个端口文件再试", startupBudget, endpoint, deadAddr)
+			}
+			time.Sleep(pollInterval)
+			continue
+		}
+
+		// 抢到锁之后要**再读一次**:上一个持锁者可能刚好在放锁之前写好了端口文件。
+		// 少了这一次,我们就会在一个已经健康的 daemon 旁边再起一个 —— 正是要消灭的那件事。
+		// 但同样是「读到了就信任」,所以照样要过 trustEndpoint:残留的死地址不算数。
+		if info, rerr := readEndpoint(endpoint); trustEndpoint(info, rerr, deadAddr) {
+			release()
 			return info, nil
 		}
-		time.Sleep(pollInterval)
+		if serr := spawnDaemon(endpoint, idle); serr != nil {
+			release()
+			return endpointInfo{}, fmt.Errorf("client: 启动 daemon 失败: %w", serr)
+		}
+		// 新 daemon 的 os.WriteFile 会**覆盖写**那个删不掉的残留文件(ACL 里的 W 还在),
+		// 所以下面等的不是"文件出现",而是"文件里出现一个不是 deadAddr 的地址"。
+		spawnDeadline := time.Now().Add(startupBudget)
+		for time.Now().Before(spawnDeadline) {
+			if info, rerr := readEndpoint(endpoint); trustEndpoint(info, rerr, deadAddr) {
+				release()
+				return info, nil
+			}
+			time.Sleep(pollInterval)
+		}
+		release()
+		return endpointInfo{}, fmt.Errorf("client: daemon 在 %s 内没有起来", startupBudget)
 	}
-	return endpointInfo{}, fmt.Errorf("client: daemon 在 %s 内没有起来", startupBudget)
 }
 
 // startLockPath 是与端点配套的启动锁文件路径。

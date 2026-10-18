@@ -1,6 +1,7 @@
 package client
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -105,6 +106,41 @@ func TestForgetStaleEndpointOnlyRemovesItsOwnAddress(t *testing.T) {
 
 	t.Run("文件不存在也不能炸", func(t *testing.T) {
 		forgetStaleEndpoint(filepath.Join(t.TempDir(), "nope.port"), "127.0.0.1:1")
+	})
+}
+
+// trustEndpoint 是「删不掉的端口文件让 endpoint 永久不可用」那条缺陷的判据本身,
+// 所以四个分支都必须钉住。为什么值得单独测:它在生产里只表现为"连不上之后再连一次
+// 还是连不上",没有任何日志会把"你又信任了那个死地址"说出来 —— 回归了也没人看得见。
+func TestTrustEndpoint(t *testing.T) {
+	const dead = "127.0.0.1:62615"
+
+	t.Run("读不到就不信任", func(t *testing.T) {
+		// 文件不存在 / 空文件走的都是这一条。
+		if trustEndpoint(endpointInfo{}, errors.New("没有这个文件"), "") {
+			t.Fatal("err != nil 时不该信任")
+		}
+	})
+
+	t.Run("仍是那个死地址就不信任", func(t *testing.T) {
+		// 这正是缺陷现场:文件还在、地址还是刚才连不上的那个。
+		if trustEndpoint(endpointInfo{addr: dead, token: "t"}, nil, dead) {
+			t.Fatalf("addr == deadAddr 时不该信任 —— 否则会一直信任同一个死地址,永不恢复")
+		}
+	})
+
+	t.Run("换成新地址就信任", func(t *testing.T) {
+		// 新 daemon 覆盖写过了:地址变了,这就是"修好了"的样子。
+		if !trustEndpoint(endpointInfo{addr: "127.0.0.1:62616", token: "t"}, nil, dead) {
+			t.Fatal("addr != deadAddr 时应当信任")
+		}
+	})
+
+	t.Run("没有已知坏地址时读到就信任", func(t *testing.T) {
+		// deadAddr == "" 是首次启动与管理操作的形态:没有"坏地址"可比,不拦。
+		if !trustEndpoint(endpointInfo{addr: dead, token: "t"}, nil, "") {
+			t.Fatal("deadAddr 为空时应当信任")
+		}
 	})
 }
 
