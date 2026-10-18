@@ -2,7 +2,7 @@
 
 **来源**：`mvdan.cc/sh/v3 v3.14.1`（未经修改的上游源码，复制自 Go module cache）
 **为何进库**：`go.mod` 里有一条 `replace mvdan.cc/sh/v3 => ./third_party/mvdan-sh`。
-**补丁范围**：四个补丁 —— 两个内建选项（`interp/builtin.go`，外加 `interp/runner.go` 一处调用点）、一处错误分类修正（`interp/runner.go`，见 §3）、一处措辞对齐（`interp/builtin.go` + `interp/runner.go`，见 §4）。共约 85 行。
+**补丁范围**：**六块补丁** —— ① 两个内建选项（`interp/builtin.go`，外加 `interp/runner.go` 一处调用点，见 §1/§2）；② 一处错误分类修正（`interp/runner.go`，见 §3）；③ `cd` 与 `>&`/`<&` 的措辞对齐（`interp/builtin.go` + `interp/runner.go`，见 §4）；④ `>&-` 的写错误记账（`interp/runner.go` + `interp/builtin.go` + `interp/api.go`，见 §4 末）；⑤ fd 表（新增 `interp/fdtable.go` 整文件 + `interp/runner.go`/`interp/api.go`，见 §5）。正文按 §1–§5 **五节**归档（③④ 同在 §4，因为 `runner.go`/`fdtable.go` 里的注释都写「见 §4」）。**量级是数百行**，不是“约 85 行”—— 仅 `interp/fdtable.go` 一个文件就是数百行；这里刻意不写精确行数，免得又过时。
 
 ---
 
@@ -155,7 +155,25 @@ default:                       r.exit.fatal(err)
   所以本轮只对齐措辞、不动路径。
 - `exec 3>&1` 这类 fd 3+ 的功能缺失**已修**（2026-10，见 §5 fd 表），不是措辞问题。
 
-**回归**:`internal/shell/cdwording_test.go`（7 条 / 18 子用例）。7 处变异全部抓到。
+**回归**:`internal/shell/cdwording_test.go`（8 个 Test / 18 子用例）。7 处变异全部抓到。
+
+**`>&-`（关闭 fd）的写错误记账 —— 归在本节**（同属 `>&` 家族；`interp/runner.go` 与 `interp/fdtable.go` 里「见 §4」的注释指的就是这块，别把它漏在升级清单外）
+
+**位置**：`interp/runner.go` 的 `errClosedFD` 哨兵与 `closedWriter`（自称 winbash patch，替换上游的 `io.Discard`）、`out`/`outf` 的记账改造（**首错即停**）；`interp/builtin.go` 的 builtin 入口清零 `r.writeErr`、defer 出口结算；`interp/api.go` 的 `writeErr` 字段。
+
+| 写法 | 修前 → 修后（= 真 bash） |
+|---|---|
+| `echo x >&-` | 修前上游用 `io.Discard` 吞掉写入、rc=0、无报错（静默做错事）→ 修后 `echo: write error: Bad file descriptor`、rc=1 |
+| `echo a b c >&-` | **首错即停**：同一命令只报一次（不是 a/b/c 各报一条），像 bash |
+| `echo foo \| false \| true` | broken pipe 仍**静默**、rc=0（修前修后都不变，与真 bash 的 SIGPIPE 语义一致） |
+| `echo x >&- 2>&-` | rc 仍 1（`errf` 不记账：报错写不出去也不污染退出码） |
+
+**两条设计要点**（踩过坑才有的，升级时别丢）：
+
+1. **哨兵 `errClosedFD` 必须与其它写错误区分开**。`echo foo >&-` 要**响亮**（rc=1 + write error），而 `echo foo | false | true` 的 broken pipe 必须**静默**（真 bash 按 SIGPIPE 语义处理）。两者对 `Write` 都返回 error，但语义完全不同；不区分就把正常管道变成噪音 —— 上游 interp 的 4 条用例就是因此变红过的（实测踩到）。所以 `out`/`outf` **只对哨兵记账**，其余写错误回到上游原行为：吞掉。
+2. **`errf` 不记账**。错误报告自己写不出去（stderr 也被 `2>&-` 关了）时不能记账 —— 否则 `echo x >&- 2>&-` 的退出码会被污染，而真 bash 那时 rc 仍是 1。
+
+**回归**：`internal/shell/writeerr_test.go`（8 个 Test，含 `TestBrokenPipeIsSilentUnlikeClosedFd` 专盯上面第 1 条的区分）。
 
 ### 5. fd 表：fd 3+ 在进程内可用
 
@@ -230,7 +248,7 @@ winbash 的 `switchWriter` 每次 Run 换 buffer，`exec 3>&1` 的 fd 3 写入
 - `>&bad`（非数字）仍报 `bad: Bad file descriptor`（真 bash 静默走 `&>bad`
   语义），同 §4 的取舍：宁可响亮。
 
-**回归**：`internal/shell/fdtable_test.go`（8 个 Test / 约 30 子用例），含变异
+**回归**：`internal/shell/fdtable_test.go`（9 个 Test / 约 30 子用例），含变异
 探针 `TestFdTableSubshellIsolation`（把 `subshell` 的 fd 表 clone 换成共享
 map，它必须变红）。上游测试同步改 **1 处**期望值：`interp/interp_test.go` 的
 `echo foo 5>a`，从 `unsupported redirect fd: 5` 改成真 bash 行为 `foo\n`
@@ -239,8 +257,8 @@ map，它必须变红）。上游测试同步改 **1 处**期望值：`interp/in
 
 ## 验证
 
-18 条用例与真 Git Bash 逐条对照，**全部一致**（含反向回归：未带 `-d`/`-n` 的 `read`/`mapfile`、以及原有的 `mapfile -d ""` 都不受影响）。语料回归在
-`internal/shell/pbb_corpus_test.go` 的 `read -d` / `mapfile -n` 小节，期望值由
+18 条用例与真 Git Bash 逐条对照，**全部一致** —— 但要说清口径：这 18 条是当时的手测清单，**脚本不在仓库里**（见本轮工作记录），别把它当可核实的回归数引用。含反向回归：未带 `-d`/`-n` 的 `read`/`mapfile` 行为不变（上游 `interp/interp_test.go` 里有用例兜着）。可核实的语料回归在
+`internal/shell/pbb_corpus_test.go` 的 `read -d`（4 条）/ `mapfile -n`（5 条）小节，期望值由
 `go test ./internal/shell/ -update-pbb-corpus` 从**真 Git Bash** 生成，不手写。
 
 §4 的措辞补丁另有 **13 条** cd / 重定向用例与真 Git Bash 逐条对照（`cmd/winbash/e2e` 之外
@@ -264,6 +282,7 @@ fd 表修掉。§5 的 fd 表行为在 `internal/shell/fdtable_test.go` 里与�
    若新版自己就分开了 `err != nil` 与 `!info.IsDir()`、且措辞与真 bash 一致，
    这一处就不用打了）、
    `grep -n 'Bad file descriptor' third_party/mvdan-sh/interp/runner.go`（§4 的 `>&`/`<&`）、
+   `grep -n 'errClosedFD' third_party/mvdan-sh/interp/runner.go`（§4 的 `>&-` 写错误记账；连带查 `grep -n 'writeErr' third_party/mvdan-sh/interp/builtin.go`（入口清零/出口结算）与 `third_party/mvdan-sh/interp/api.go`（字段））、
    `ls third_party/mvdan-sh/interp/fdtable.go`（§5 的 fd 表，整文件都是本补丁，
    新版若自带 fd 3+ 支持就把文件与 `Runner.fdTable` 相关字段一起删）；
 3. 如果上游已实现且行为一致，**删掉本补丁与 `replace` 行**，回到正常依赖；

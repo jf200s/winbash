@@ -71,7 +71,7 @@ var pbbCases = []pbbCase{
 
 	// ---- STRINGS:长度与截断 ----
 	{"取前 N / 去前 N", "STRINGS / (前缀修剪)", `s="abcdef"; printf '%s|%s\n' "${s:0:3}" "${s:3}"`, ""},
-	{"printf 重复字符", "OTHERS / (printf 技巧)", `printf '=%.0s' 1 2 3 4 5; echo`, "mvdan/sh 的内建 printf 不认 `%.0s`(报 invalid format char),而且**退出码仍是 0** —— 这是这批语料里唯一「打了 stderr 但退出码不非零」的一条,值得单独盯着"},
+	{"printf 重复字符", "OTHERS / (printf 技巧)", `printf '=%.0s' 1 2 3 4 5; echo`, "mvdan/sh 的内建 printf 不认 `%.0s`(`.0` 是**精度**、不是宽度),报 invalid format char、**退出码 1**;真 bash 是 rc=0、无 stderr(它把 `printf '=%.0s' 1 2 3` 这类零精度写法当合法技巧用)。方向是**我们更严格、我们报错**,不是静默漏数据"},
 
 	// ---- FILE PATHS ----
 	{"去掉目录名", "FILE PATHS / Get the directory name of a file path", `p="/etc/x/y.conf"; printf '%s\n' "${p%/*}"`, ""},

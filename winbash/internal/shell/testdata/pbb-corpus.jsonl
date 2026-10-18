@@ -19,7 +19,7 @@
 {"name":"默认值空值","out":["[fallback][set][]"],"exit":0,"source":"STRINGS / (参数扩展默认值)"}
 {"name":"赋值默认值","out":["[filled][filled]"],"exit":0,"source":"STRINGS / (参数扩展:=)"}
 {"name":"取前 N / 去前 N","out":["abc|def"],"exit":0,"source":"STRINGS / (前缀修剪)"}
-{"name":"printf 重复字符","out":["====="],"exit":0,"known":"mvdan/sh 的内建 printf 不认 `%.0s`(报 invalid format char),而且**退出码仍是 0** —— 这是这批语料里唯一「打了 stderr 但退出码不非零」的一条,值得单独盯着","source":"OTHERS / (printf 技巧)"}
+{"name": "printf 重复字符", "out": ["====="], "exit": 0, "known": "mvdan/sh 的内建 printf 不认 `%.0s`(`.0` 是**精度**、不是宽度),报 invalid format char、**退出码 1**;真 bash 是 rc=0、无 stderr(它把 `printf '=%.0s' 1 2 3` 这类零精度写法当合法技巧用)。方向是**我们更严格、我们报错**,不是静默漏数据", "source": "OTHERS / (printf 技巧)"}
 {"name":"去掉目录名","out":["/etc/x"],"exit":0,"source":"FILE PATHS / Get the directory name of a file path"}
 {"name":"取文件名","out":["y.conf"],"exit":0,"source":"FILE PATHS / Get the basename of a file path"}
 {"name":"取扩展名","out":["gz"],"exit":0,"source":"FILE PATHS / Get the extension of a file"}
