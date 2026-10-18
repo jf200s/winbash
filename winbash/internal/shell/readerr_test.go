@@ -132,8 +132,9 @@ func TestInputRedirectFromDirectoryIsRejected(t *testing.T) {
 //
 // 这条是项目底线的直接体现。修之前:
 //
-//	read    → 只有 rc=1,一个字节的提示都没有
-//	mapfile → 只有 rc=1,一个字节的提示都没有
+//	read    → 只有 rc=1,一个字节的提示都没有(**完全静默**)
+//	mapfile → 有报错但很难看:`mapfile: unable to read, read <绝对路径>: Incorrect function.`
+//	          (Win32 长句 + 绝对路径;修前记录见 internal/builtins/dirread.go 与本文件头)
 //
 // 而 `read` 静默尤其糟:AI 写 `while read x; do ...; done < 文件` 时,
 // 若那条重定向落到了目录上,循环体一次都不执行、退出码 1、**没有任何线索**,
