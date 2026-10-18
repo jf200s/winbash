@@ -6,6 +6,15 @@ import (
 	"strings"
 )
 
+// devNullWindows 是 `/dev/null` 在 Windows 上的对应设备名。
+//
+// 值**必须**与 third_party/mvdan-sh/interp/handler.go:404 里的
+// `path = "NUL"` 完全一致 —— 重定向那条路(`cat < /dev/null`、`> /dev/null`)
+// 走的是那个默认 handler,两条路要是映射到不同的名字,同一个 `/dev/null`
+// 就会指向两个不同的东西。不要改成 `\\.\NUL`:那也能 open,但与默认 handler
+// 的选择不一致,徒增一条分叉。
+const devNullWindows = "NUL"
+
 // ResolvePath 把用户写下的路径解析成 Windows 原生形式。
 //
 // 接受四种写法:
@@ -23,6 +32,25 @@ import (
 func ResolvePath(cwd, p string) (string, error) {
 	if p == "" {
 		return cwd, nil
+	}
+	// `/dev/null` 特判必须在挂载点之前:msysMountFor 的 `/` 兜底会把它解析成
+	// `<Git 安装根>\dev\null`(不存在),于是 `cat /dev/null` 报
+	// `No such file or directory` —— 真 bash 给的是 rc=0、无输出。
+	//
+	// **为什么在 ResolvePath 拦,而不是只在 cat 里拦**:这里是 ① 层所有文件路径的
+	// 唯一入口 —— cat(cat.go)、grep(grep.go)、ls(ls.go 两处)、cd 的
+	// normalizeCdPath(internal/shell/shell.go)都过它。只拦 cat 的话,
+	// `grep x /dev/null`、`ls /dev/null` 照旧报「找不到文件」。而 head / wc
+	// **不在** ① 层(registry.go 只注册 ls/cat/grep/egrep/fgrep/which),它们走
+	// ③ 层外部程序自己 open —— 所以这个修点的影响面正好覆盖全部 ① 层读路径,
+	// 不会外溢到别的实现。
+	//
+	// **已知边界**(本轮不修,README 的已知差异表里也记着):`[ -e /dev/null ]`
+	// 走的是 StatHandler(internal/shell/shell.go),mvdan/sh 的 r.stat 会先把路径
+	// 拼成 `<dir>\dev\null` 再交给 handler,原始写法在那一步就丢了 ——
+	// ResolvePath 照不到它,那条测试语句仍然认为 `/dev/null` 不存在。
+	if p == "/dev/null" {
+		return devNullWindows, nil
 	}
 	// 盘符形式(`/c/...`)比挂载点更具体,先判 —— 否则 `/c/Windows` 会被 `/` 挂载点
 	// 抢走,变成 `C:\Program Files\Git\c\Windows`(实测 `cd /c/Windows` 就栽在这里)。
