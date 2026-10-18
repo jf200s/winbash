@@ -22,8 +22,10 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -468,4 +470,223 @@ func TestRestrictEndpointFileNoOpsWithoutUsername(t *testing.T) {
 	if buf.Len() != 0 {
 		t.Fatalf("USERNAME 为空时应当直接返回、不调用 icacls,却输出: %q", buf.String())
 	}
+}
+
+// ★ restrictEndpointFile 必须授出 DELETE(D),否则 daemon 连自己写的端口文件都删不掉。
+//
+// 这是「自定义 --endpoint 永久不可用」那条缺陷的源头:只授 (R,W) 时,`--stop`
+// 之后文件残留、永远指着已经没人监听的地址,之后每条命令都"连接失败"且永不恢复
+// (实测:(R,W) 时 rm 报 Permission denied,改成 (R,W,D) 立刻能删)。
+//
+// **判据必须是 icacls 的文本,不能用"os.Remove 成功"** —— 在 %TEMP% 下父目录带着
+// FILE_DELETE_CHILD,即使文件的 ACL 里没有 D 也删得掉(实测过),那种断言永远绿,
+// 测不出这条缺陷。这条测试宁可依赖一个外部命令的输出,也不要一个测不出东西的绿灯。
+func TestRestrictEndpointFileGrantsDelete(t *testing.T) {
+	user := os.Getenv("USERNAME")
+	if user == "" {
+		t.Skip("本机没有 USERNAME,无从构造授权参数")
+	}
+	if _, err := exec.LookPath("icacls"); err != nil {
+		t.Skip("本机没有 icacls: " + err.Error())
+	}
+
+	ep := filepath.Join(t.TempDir(), "wb.port")
+	if err := os.WriteFile(ep, []byte("127.0.0.1:1\ntok\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 回归时(只授 R,W)这个文件在 t.TempDir 的清理阶段可能删不掉,那行
+	// "TempDir cleanup" 噪音会盖住真正的断言信息。先尽力把 D 补回来再删。
+	defer func() {
+		_, _ = icaclsRun(ep, "/grant:r", user+":(R,W,D)")
+		_ = os.Remove(ep)
+	}()
+
+	restrictEndpointFile(ep)
+
+	out, err := icaclsRun(ep)
+	if err != nil {
+		t.Fatalf("icacls %s 失败: %v: %s", ep, err, out)
+	}
+	if !aclGrantsDelete(out) {
+		t.Fatalf("端口文件的 ACL 里没有 DELETE(D) —— daemon 退出时删不掉自己的文件,"+
+			"该 endpoint 会永久不可用。icacls 输出:\n%s", out)
+	}
+}
+
+// aclGrantsDelete 判断 icacls 的输出里有没有**一项**同时授了 R、W、D。
+//
+// 不钉字面量 "(R,W,D)":icacls 打印权限项的顺序不由我们决定(可能写成 (D,R,W)),
+// 那样会因为一个无关的排版差异假红。判据仍然只有 icacls 的文本这一条路 ——
+// 换成"os.Remove 成功"在 %TEMP% 下永远绿(父目录的 FILE_DELETE_CHILD 顶着)。
+func aclGrantsDelete(out string) bool {
+	for {
+		i := strings.IndexByte(out, '(')
+		if i < 0 {
+			return false
+		}
+		out = out[i+1:]
+		j := strings.IndexByte(out, ')')
+		if j < 0 {
+			return false
+		}
+		perms := out[:j]
+		out = out[j+1:]
+
+		has := make(map[string]bool, 4)
+		for _, p := range strings.Split(perms, ",") {
+			has[strings.TrimSpace(p)] = true
+		}
+		if has["R"] && has["W"] && has["D"] {
+			return true
+		}
+	}
+}
+
+// ★ 删除端口文件失败时 removeIfOwned 必须**告警**。
+//
+// 这条分支是缺陷现场的另一半:文件删不掉时,原先 `_ = os.Remove(...)` 把错误吞掉,
+// `--stop` 看起来成功、使用者手上却留着一个指向死地址的文件,下一个调用只得到
+// 一句"连接失败",根本不知道该去删哪个文件。本项目不静默做错事 —— 这里要的是
+// 一行点名路径与原因的警告。
+//
+// 怎么构造"可读但删不掉":自己开一个句柄,共享模式**不含 FILE_SHARE_DELETE**。
+// 这也是真实世界里最常见的形态 —— 某个程序正开着这个文件。
+//
+// 为什么不用 icacls deny (D):实测 deny (D) 之后连 os.ReadFile 都会 Access denied,
+// 于是 removeIfOwned 走的是「读不到就不删」那条分支,根本到不了删除失败这里。
+// 那种构造测到的是另一件事(见 TestRemoveIfOwnedReportsUnreadableEndpoint)。
+func TestRemoveIfOwnedReportsDeleteFailure(t *testing.T) {
+	dir := t.TempDir()
+	ep := filepath.Join(dir, "wb.port")
+	addr := "127.0.0.1:60001"
+	if err := os.WriteFile(ep, []byte(addr+"\ntok\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	h := holdWithoutDeleteSharing(t, ep)
+	defer func() { _ = syscall.CloseHandle(h) }()
+
+	// 前提一:占着的时候仍然读得到(否则测的是别的分支)。
+	if _, rerr := os.ReadFile(ep); rerr != nil {
+		t.Fatalf("前提不成立:句柄占用时应仍可读,却得到 %v", rerr)
+	}
+	// 前提二:现在真的删不掉。若删得掉,后面测的根本不是失败分支。
+	if rerr := os.Remove(ep); rerr == nil {
+		t.Fatal("前提不成立:句柄占用时文件仍能删除,断言会失去意义")
+	}
+
+	warn := captureStderr(t, func() { removeIfOwned(ep, addr) })
+
+	// (a) 文件必须还在 —— 删除本来就该失败。
+	if _, serr := os.Stat(ep); serr != nil {
+		t.Fatalf("文件应当还在(删除本就失败),stat err = %v", serr)
+	}
+	// (b) 必须有一行警告,并点名路径 —— 只说"删不掉"而不说哪个文件等于没说。
+	if !strings.Contains(warn, "删不掉端口文件") || !strings.Contains(warn, ep) {
+		t.Fatalf("删除失败却静默(或没点名文件)—— 使用者只看到后来的\"连接失败\",无从查起:"+
+			"stderr=%q", warn)
+	}
+}
+
+// TestRemoveIfOwnedReportsUnreadableEndpoint 钉住"读不到也不能无声"。
+//
+// 实测:给端口文件 deny (D) 之后 os.ReadFile 会 Access denied。这时
+// removeIfOwned 无法判断文件是不是自己的,于是不删 —— 这一步是对的,
+// 但静默 return 会让「端口文件读不到」这种真故障完全无声。
+func TestRemoveIfOwnedReportsUnreadableEndpoint(t *testing.T) {
+	user := os.Getenv("USERNAME")
+	if user == "" {
+		t.Skip("本机没有 USERNAME,无从构造 deny 参数")
+	}
+	if _, err := exec.LookPath("icacls"); err != nil {
+		t.Skip("本机没有 icacls: " + err.Error())
+	}
+
+	dir := t.TempDir()
+	ep := filepath.Join(dir, "wb.port")
+	if err := os.WriteFile(ep, []byte("127.0.0.1:60001\ntok\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// 残留的 deny 会让我们连自己建的临时目录都删不掉,所以清理顺序是"先撤再删"。
+	defer func() {
+		_, _ = icaclsRun(ep, "/remove:d", user)
+		_ = os.Remove(ep)
+	}()
+	if out, derr := icaclsRun(ep, "/deny", user+":(D)"); derr != nil {
+		t.Fatalf("icacls /deny (D) 失败: %v: %s", derr, out)
+	}
+	// 前提:此时确实读不到。若还能读,这条测试就没在测它想测的分支。
+	if _, rerr := os.ReadFile(ep); rerr == nil {
+		t.Skip("本机 deny (D) 之后仍能读取,构造不出这个分支(不影响其它测试)")
+	}
+
+	warn := captureStderr(t, func() { removeIfOwned(ep, "127.0.0.1:60001") })
+
+	if !strings.Contains(warn, "读不到端口文件") || !strings.Contains(warn, ep) {
+		t.Fatalf("读不到端口文件却无声 —— 使用者只会看到后续的\"连接失败\":stderr=%q", warn)
+	}
+}
+
+// TestRemoveIfOwnedStaysSilentWhenMissing 钉住"文件本来就不在"不算故障。
+//
+// 这是正常路径:client 侧的 forgetStaleEndpoint 可能已经清掉了,或者这次
+// --stop 恰好和上一轮清理撞在一起。这时说话只会变成噪音,而噪音会训练使用者
+// 忽略警告 —— 那条真正要紧的警告也就废了。
+func TestRemoveIfOwnedStaysSilentWhenMissing(t *testing.T) {
+	ep := filepath.Join(t.TempDir(), "never-existed.port")
+
+	warn := captureStderr(t, func() { removeIfOwned(ep, "127.0.0.1:60001") })
+
+	if warn != "" {
+		t.Fatalf("文件不存在不该警告(它是正常路径),却写了: stderr=%q", warn)
+	}
+}
+
+// holdWithoutDeleteSharing 打开 path,**不**共享 FILE_SHARE_DELETE。
+//
+// 效果:文件仍可读,但任何删除都会拿到 sharing violation。用它构造"可读但删不掉"
+// 比改 ACL 稳 —— ACL 的 deny (D) 会连带把读也拒掉(实测),那就测错分支了。
+func holdWithoutDeleteSharing(t *testing.T, path string) syscall.Handle {
+	t.Helper()
+	p, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := syscall.CreateFile(p, syscall.GENERIC_READ,
+		syscall.FILE_SHARE_READ|syscall.FILE_SHARE_WRITE, nil,
+		syscall.OPEN_EXISTING, syscall.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		t.Fatalf("独占打开 %s 失败: %v", path, err)
+	}
+	return h
+}
+
+// captureStderr 收集 fn 执行期间写到 os.Stderr 的全部内容。
+//
+// 手法与 TestRestrictEndpointFileWarnsWhenIcaclsFails 一致(临时替换 os.Stderr,
+// 不给生产签名加参数)。这里抽出来是因为现在有三条测试都要看警告。
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	old := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	defer func() { os.Stderr = old }()
+
+	fn()
+
+	os.Stderr = old
+	_ = w.Close()
+	var buf bytes.Buffer
+	_, _ = io.Copy(&buf, r)
+	_ = r.Close()
+	return buf.String()
+}
+
+// icaclsRun 跑一条 icacls 命令并返回它的合并输出。
+func icaclsRun(args ...string) (string, error) {
+	out, err := exec.Command("icacls", args...).CombinedOutput()
+	return string(out), err
 }

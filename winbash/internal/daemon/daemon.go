@@ -1006,8 +1006,16 @@ func restrictEndpointFile(endpoint string) {
 		return
 	}
 	// /inheritance:r 去掉从父目录继承来的 ACE(沙箱组的权限正是这么来的),
-	// /grant:r 只给当前用户读写。
-	cmd := exec.Command("icacls", endpoint, "/inheritance:r", "/grant:r", user+":(R,W)")
+	// /grant:r 只给当前用户读写删。
+	//
+	// **为什么 D(DELETE)不能少**:这个端口文件是 daemon 自己建的,而收权限之后
+	// 能删它的就只有 ACL 里带 D 的那个人。只给 (R,W) 时,`--stop` 之后 daemon 连
+	// 自己写的文件都删不掉,残留文件继续把该 endpoint 指向一个已经不存在的地址 ——
+	// 之后每次调用都"连不上、删不掉、又信任同一个死地址",该 endpoint 永久不可用
+	// (实测:`icacls f /grant:r user:(R,W)` 后 rm 报 Permission denied,
+	// 改成 `(R,W,D)` 立刻能删)。加 D 不会把文件暴露给别的账户,只是把
+	// "删掉自己留下的东西"这个能力还给当前用户。
+	cmd := exec.Command("icacls", endpoint, "/inheritance:r", "/grant:r", user+":(R,W,D)")
 	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true, CreationFlags: createNoWindow}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		fmt.Fprintf(os.Stderr, "winbash: 警告: 收紧端口文件权限失败(%v): %s\n",
@@ -1029,11 +1037,39 @@ func shellQuote(s string) string {
 func removeIfOwned(endpoint, mine string) {
 	b, err := os.ReadFile(endpoint)
 	if err != nil {
+		// 读不到就判断不了"这是不是自己的",于是不敢删 —— 这一步是对的,但不能**无声**。
+		//
+		// NotExist 是正常情形(别人已经清掉了,要的就是这个结果),不必说话。
+		// 其余情形(ACL 被改坏、文件被别的进程以不共享读的方式占着)意味着这个
+		// endpoint 从此可能指向一个死地址,而使用者只会在下次调用时看到一句
+		// "连接失败" —— 那时已经无从知道该去看哪个文件了。
+		//
+		// 这不是假想:实测给端口文件 deny (D) 之后,连 os.ReadFile 都会 Access denied。
+		if !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "winbash: 警告: 读不到端口文件 %s(%v);"+
+				"无法判断它是否属于本 daemon,因此没有删除 —— 若之后的调用连不上,"+
+				"请手动检查或删除它\n", endpoint, err)
+		}
 		return
 	}
 	// 端口文件是两行(地址 + token),只比第一行。
 	first := strings.TrimSpace(strings.SplitN(strings.TrimSpace(string(b)), "\n", 2)[0])
 	if first == mine {
-		_ = os.Remove(endpoint)
+		// 删除失败必须**报出来**,不能 `_ = os.Remove(...)`。
+		//
+		// 理由:这个文件是我们自己建的,删不掉意味着这个 endpoint 从此指向一个
+		// 已经不存在的地址 —— 正是「自定义 --endpoint 永久不可用」那个缺陷的起点。
+		// 吞掉错误时,`--stop` 看起来成功、使用者手上却留着一个毒化的端口文件,
+		// 下一个调用只会得到一句"连接失败",无从知道该去删哪个文件。
+		// 本项目「不静默做错事」的底线在这里就体现为这一行警告:
+		// `--serve` 前台运行时它直接落在使用者的终端上。
+		//
+		// NotExist 不算失败:别人(或另一个 daemon)已经清掉了,目的本来就达到了。
+		if err := os.Remove(endpoint); err != nil && !os.IsNotExist(err) {
+			fmt.Fprintf(os.Stderr, "winbash: 警告: 删不掉端口文件 %s(%v);"+
+				"它仍然指向本 daemon 已不在的地址,之后的调用可能连不上 —— "+
+				"请手动删除它(必要时先 `icacls %s /grant:r <用户>:(R,W,D)`)\n",
+				endpoint, err, endpoint)
+		}
 	}
 }
