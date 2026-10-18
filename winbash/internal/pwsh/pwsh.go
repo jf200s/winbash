@@ -61,6 +61,9 @@ type request struct {
 	Op     string `json:"op"`
 	Script string `json:"script,omitempty"`
 	Cwd    string `json:"cwd,omitempty"`
+	// Env 是 KEY=VALUE 列表,由 session.ps1 在脚本**之外**设进引擎进程。
+	// 为什么必须是协议字段而不是脚本前导:见 RunInEnv 的注释。
+	Env []string `json:"env,omitempty"`
 }
 
 type meta struct {
@@ -163,7 +166,24 @@ func (c *Conn) Run(ctx context.Context, script string) (string, error) {
 //
 // cwd 为空表示不干预(沿用引擎当前目录)。
 func (c *Conn) RunIn(ctx context.Context, cwd, script string) (string, error) {
-	resp, err := c.call(ctx, request{Op: "run", Script: script, Cwd: cwd})
+	return c.RunInEnv(ctx, cwd, nil, script)
+}
+
+// RunInEnv 同 RunIn,但先把 env(KEY=VALUE 列表)同步进引擎,再执行脚本。
+//
+// 为什么要有它(而不是调用方在脚本前面拼一串 SetEnvironmentVariable):与 RunIn
+// 对 cwd 的理由对偶 —— 引擎是常驻进程,它的环境是**启动那一刻**继承的,而会话里的
+// `export` 发生在那之后。不同步,`export X=1; pwsh -c '$env:X'` 会静默给出空值。
+//
+// 而拼文本同步另有一个致命代价:PowerShell 要求 `param(...)` 是 scriptblock 的
+// **第一条**语句。任何前缀都会让以 param 开头的脚本报
+// "The term 'param' is not recognized as a name of a cmdlet..."(实测),
+// 而同一个文件用原生 `pwsh -File x.ps1` 完全正常。所以环境必须在脚本**之外**设,
+// 也就只能走协议字段。
+//
+// env 为空表示不干预(沿用引擎已继承的环境)。
+func (c *Conn) RunInEnv(ctx context.Context, cwd string, env []string, script string) (string, error) {
+	resp, err := c.call(ctx, request{Op: "run", Script: script, Cwd: cwd, Env: env})
 	if err != nil {
 		return "", err
 	}

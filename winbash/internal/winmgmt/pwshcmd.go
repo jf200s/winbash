@@ -161,13 +161,12 @@ func Pwsh(ctx context.Context, conn *pwsh.Conn, argv []string, jsonOut bool, out
 	// Set-Location、或者会话这边的 `cd` 变了,都只影响那一条,引擎不会自己跟上来。
 	// 不每条同步,`cd /tmp; pwsh -c 'New-Item x'` 就会静默把文件写进 daemon 的 cwd(实测如此)。
 	//
-	// 为什么不在这里拼一句 `Set-Location ...;` 而是走协议字段:session.ps1 早就
-	// 实现了 cwd(错误措辞也更准),拼文本等于重写一遍;更要紧的是任何文本前导都会让
-	// 「脚本以 param(...) 开头」失效 —— 那种脚本只允许 param 是第一条语句。
-	//
-	// 环境前导仍走文本,而且必须在脚本之前:脚本里可能立刻就读 $env:。
-	// (这也是上面那条 param 限制至今仍在的原因,见 README 的已知差异。)
-	raw, err := conn.RunIn(ctx, dirFrom(ctx), envPrelude(envFrom(ctx))+script)
+	// 为什么两者都走**协议字段**而不是在脚本前面拼一句 Set-Location / SetEnvironmentVariable:
+	// session.ps1 早就实现了这两件事(错误措辞也更准),拼文本等于重写一遍;更要紧的是
+	// PowerShell 要求 `param(...)` 是 scriptblock 的**第一条**语句,任何文本前导都会让
+	// 以 param 开头的脚本报 "The term 'param' is not recognized as a name of a cmdlet..."
+	// (实测)。环境过去就是拼文本的,所以带参脚本一直跑不了 —— 现在它也进了协议。
+	raw, err := conn.RunInEnv(ctx, dirFrom(ctx), filterEnv(envFrom(ctx)), script)
 	if err != nil {
 		fmt.Fprintln(errw, errs.Errorf("pwsh", stripEnginePrefix(err.Error()),
 			"这段脚本在常驻 pwsh 里失败了;要看原生的报错可以用 pwsh 的全路径调它"))
@@ -212,20 +211,22 @@ func unsupportedHint() string {
 		"winbash 只接管 -c / -Command / 脚本文件"
 }
 
-// envPrelude 把 ① 层当前的环境变量写进常驻引擎。
+// filterEnv 把 ① 层当前的环境变量过滤成可以设进常驻引擎的那一份(仍是 KEY=VALUE 列表)。
 //
-// 为什么需要:引擎是在第一次用到 ② 层时启动的,继承的是**那一刻**的环境;
+// 为什么需要同步:引擎是在第一次用到 ② 层时启动的,继承的是**那一刻**的环境;
 // 而 ① 层的 export 发生在那之后。不显式同步,`export X=1; pwsh -c '$env:X'`
 // 会静默给出空值 —— 透明覆盖最不能有的就是这种"看起来对"。
 //
-// 为什么用 [Environment]::SetEnvironmentVariable 而不是 `$env:NAME = ...`:
-// Windows 的环境变量名不限于合法标识符(可以带括号、连字符),走 .NET API
-// 就不会因为名字里的字符而解析失败。
-func envPrelude(env []string) string {
+// 为什么返回列表而不是拼成一段脚本前导(这里返回的东西会进 request.Env):
+// PowerShell 要求 `param(...)` 是 scriptblock 的**第一条**语句,任何文本前导都会让
+// `pwsh x.ps1`(x.ps1 以 param 开头)报 "The term 'param' is not recognized as a
+// name of a cmdlet..."(实测)。所以环境只能在脚本之外设 —— 真正动手设它的是
+// session.ps1,连同那里写的 .NET API 理由(Windows 环境变量名不限合法标识符)。
+func filterEnv(env []string) []string {
 	if len(env) == 0 {
-		return ""
+		return nil
 	}
-	var b strings.Builder
+	out := make([]string, 0, len(env))
 	for _, kv := range env {
 		i := strings.IndexByte(kv, '=')
 		// i <= 0 同时挡掉两种:空名,以及 Windows 上 `=C:` 这类内部项
@@ -233,13 +234,9 @@ func envPrelude(env []string) string {
 		if i <= 0 {
 			continue
 		}
-		b.WriteString("[Environment]::SetEnvironmentVariable(")
-		b.WriteString(psQuote(kv[:i]))
-		b.WriteByte(',')
-		b.WriteString(psQuote(kv[i+1:]))
-		b.WriteString(");")
+		out = append(out, kv)
 	}
-	return b.String()
+	return out
 }
 
 // renderAny 渲染"形状不定"的输出。
