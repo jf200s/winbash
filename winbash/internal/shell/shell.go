@@ -183,6 +183,17 @@ func NewSession() *Session {
 			dir := dirOf(ctx)
 			fixed := builtins.ResolveShellPath(dir, path)
 			if fixed == path {
+				// `/dev/null` 特判(mvdan/sh 的 r.stat 先把路径拼成 `<dir>\dev\null`
+				// 才交给 handler,原始写法在那一步就丢了)。**事实优先**:真的存在
+				// 这个路径就采信它 —— 用户在 cwd 建了 `dev/null` 就该按事实处理,
+				// 与 RestoreSyntheticMount 的既有约定一致。不存在才当 NUL,
+				// 返回手工构造的字符设备 FileInfo(不是 os.Stat("NUL") 的结果,
+				// 否则 -f/-c 恰好全反,见 devnull.go)。
+				if _, err := os.Lstat(path); err != nil {
+					if info, ok := devNullSynthetic(dir, path); ok {
+						return info, nil
+					}
+				}
 				// mvdan/sh 的 `r.stat` 会先把路径拼成 `<dir>\tmp` 才交给 handler,
 				// 原始写法在那一步就丢了 —— 拿不回来只能还原(见 RestoreSyntheticMount)。
 				fixed = builtins.RestoreSyntheticMount(dir, path)

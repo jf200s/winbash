@@ -45,10 +45,10 @@ func ResolvePath(cwd, p string) (string, error) {
 	// ③ 层外部程序自己 open —— 所以这个修点的影响面正好覆盖全部 ① 层读路径,
 	// 不会外溢到别的实现。
 	//
-	// **已知边界**(本轮不修,README 的已知差异表里也记着):`[ -e /dev/null ]`
-	// 走的是 StatHandler(internal/shell/shell.go),mvdan/sh 的 r.stat 会先把路径
-	// 拼成 `<dir>\dev\null` 再交给 handler,原始写法在那一步就丢了 ——
-	// ResolvePath 照不到它,那条测试语句仍然认为 `/dev/null` 不存在。
+	// **`[ -e /dev/null ]` 不归本函数管**(它走 StatHandler,压根不来 ResolvePath),
+	// 已另修:internal/shell/shell.go 的 StatHandler 做 `/dev/null` 特判 +
+	// internal/shell/devnull.go 手工构造字符设备 FileInfo。本函数只管 ① 层
+	// open 的路径解析(cat / grep / ls / cd),两条路各管一段,别再合并理解。
 	if p == "/dev/null" {
 		return devNullWindows, nil
 	}
