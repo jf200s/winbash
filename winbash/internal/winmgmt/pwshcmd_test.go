@@ -22,16 +22,65 @@ import (
 //  2. **不接管的形式必须报错**,不静默回落(Global Constraint:不认识的 flag 必须报错退出)。
 //  3. **输出形状**:默认 TSV、--json 总是数组。值保证继续成立(数字就是数字、无 ANSI)。
 //
-// 还有一条不属于"形状"但必须钉住的:bash 侧的 export 必须能被 pwsh 看到。
-// 常驻引擎继承的是**启动那一刻**的环境,而 ① 层的 export 发生在之后 ——
-// 不显式同步的话 `export X=1; pwsh -c '$env:X'` 会静默给出空值。
+// 还有两条不属于"形状"但必须钉住的,它们是同一个问题的两面:常驻引擎继承的是
+// **它启动那一刻**的状态,而 ① 层的变化发生在那之后。
+//
+//   - 环境:bash 侧的 export 必须能被 pwsh 看到,否则 `export X=1; pwsh -c '$env:X'`
+//     静默给出空值。
+//   - cwd:会话的 `cd` 必须被 pwsh 看到,否则 `cd /tmp; pwsh -c 'New-Item x'`
+//     静默把文件写进 daemon 的 cwd。
 
 // runPwshCmd 是这些测试的统一入口:把 argv 交给 Pwsh,收齐它写的两个流。
 func runPwshCmd(t *testing.T, conn *pwsh.Conn, jsonOut bool, args ...string) (stdout, stderr string, exit int) {
 	t.Helper()
+	return runPwshCmdCtx(t, context.Background(), conn, jsonOut, args...)
+}
+
+// runPwshCmdCtx 是带 ctx 的版本:会话的 cwd 和环境都靠 ctx 传(见 WithDir/WithEnv),
+// 所以钉这两件事的测试必须能自己给 ctx。
+func runPwshCmdCtx(t *testing.T, ctx context.Context, conn *pwsh.Conn, jsonOut bool, args ...string) (stdout, stderr string, exit int) {
+	t.Helper()
 	var out, errw strings.Builder
-	exit = Pwsh(context.Background(), conn, args, jsonOut, &out, &errw)
+	exit = Pwsh(ctx, conn, args, jsonOut, &out, &errw)
 	return out.String(), errw.String(), exit
+}
+
+// restoreEngineCwd 在测试结束时把引擎带回**测试进程**的 cwd。
+//
+// 引擎是整个包共享的一个常驻进程,`Set-Location` 会留在里面:不收拾的话,
+// 后面不传 dir 的测试就跑在一个已被 t.TempDir 删掉的目录下 —— 成功与否
+// 取决于测试执行顺序,那是最难查的一类失败。
+func restoreEngineCwd(t *testing.T, conn *pwsh.Conn) {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// 必须走 -c:位置参数在 Pwsh 里是**脚本文件路径**,裸 `$null` 会变成一个
+		// 叫 `$null` 的文件名去 ReadFile(实测报「读不到脚本文件 …\$null」)。
+		if _, errw, exit := runPwshCmdCtx(t, WithDir(context.Background(), wd), conn, false, "-c", "$null"); exit != errs.ExitOK {
+			t.Errorf("收尾时没能把引擎 cwd 带回到 %q: %q", wd, errw)
+		}
+	})
+}
+
+// sameDir 判断两个路径是否指向同一个目录。
+//
+// 不能直接比字符串:`t.TempDir()` 可能给 8.3 短名(`C:\Users\TESTUS~1\…`),
+// 而引擎经 Get-Item 解析后给长名(`C:\Users\Test User\…`) —— 同一个目录、两个字符串。
+// os.SameFile 比的是文件身份,与命名法无关,这才是这条断言真正该问的问题。
+func sameDir(t *testing.T, a, b string) bool {
+	t.Helper()
+	fa, err := os.Stat(a)
+	if err != nil {
+		t.Fatalf("stat %q: %v", a, err)
+	}
+	fb, err := os.Stat(b)
+	if err != nil {
+		t.Fatalf("stat %q: %v", b, err)
+	}
+	return os.SameFile(fa, fb)
 }
 
 // lines 把输出切成非空行,免得每个断言都要跟结尾换行较劲。
@@ -224,6 +273,74 @@ func TestPwshNonTerminatingErrorFails(t *testing.T) {
 	}
 	if strings.TrimSpace(errw) == "" {
 		t.Fatal("失败了却没有错误信息")
+	}
+}
+
+// 会话的 cd 必须被 ② 层的 pwsh 看见。
+//
+// 这里钉的是一个修过的**静默**缺陷:引擎常驻,它的 cwd 是 daemon 启动时继承的
+// 那个,而会话的 `cd` 发生在之后。不同步的话 `cd /tmp; pwsh -c 'New-Item x'`
+// 会把文件写到 daemon 的 cwd —— 命令成功、输出干净,错的东西静静落了地。
+func TestPwshFollowsSessionDir(t *testing.T) {
+	conn := startTestPwsh(t)
+	restoreEngineCwd(t, conn)
+	dir := t.TempDir()
+
+	out, errw, exit := runPwshCmdCtx(t, WithDir(context.Background(), dir), conn, false,
+		"-c", "Get-Location | Select-Object -ExpandProperty Path")
+	if exit != errs.ExitOK {
+		t.Fatalf("exit=%d stderr=%q", exit, errw)
+	}
+	// 单标量是裸值、不套列名(见 renderAny),所以这里就应该是干净的一行路径。
+	got := lines(out)
+	if len(got) != 1 || !sameDir(t, strings.TrimSpace(got[0]), dir) {
+		t.Fatalf("out=%q(想要 %q:引擎没跟随会话的 cwd)", out, dir)
+	}
+}
+
+// 相对路径的脚本文件也必须按**会话**的 cwd 解析。
+//
+// os.ReadFile 解析相对路径用的是**进程** cwd(daemon 的),不是会话的 ——
+// 不先拼绝对路径,`cd /tmp; pwsh probe.ps1` 会报「读不到脚本文件」,
+// 而文件明明就在那儿。
+func TestPwshRelativeScriptFileUsesSessionDir(t *testing.T) {
+	conn := startTestPwsh(t)
+	restoreEngineCwd(t, conn)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "probe.ps1"),
+		[]byte("Write-Output \"from-session-dir\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, errw, exit := runPwshCmdCtx(t, WithDir(context.Background(), dir), conn, false, "probe.ps1")
+	if exit != errs.ExitOK {
+		t.Fatalf("exit=%d stderr=%q(相对路径没按会话 cwd 找)", exit, errw)
+	}
+	if got := lines(out); len(got) != 1 || got[0] != "from-session-dir" {
+		t.Fatalf("out=%q(想要一行 from-session-dir)", out)
+	}
+}
+
+// 目录名里的单引号必须过 psQuote 的转义。
+//
+// 直接拼进脚本的话 `Set-Location -LiteralPath 'C:\a'b'` 会在引号处断开:
+// 轻则解析错误,重则路径被截成 `C:\a` 而**静默成功**。
+func TestPwshSessionDirWithQuoteIsEscaped(t *testing.T) {
+	conn := startTestPwsh(t)
+	restoreEngineCwd(t, conn)
+	dir := filepath.Join(t.TempDir(), "a'b")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	out, errw, exit := runPwshCmdCtx(t, WithDir(context.Background(), dir), conn, false,
+		"-c", "Get-Location | Select-Object -ExpandProperty Path")
+	if exit != errs.ExitOK {
+		t.Fatalf("exit=%d stderr=%q", exit, errw)
+	}
+	got := lines(out)
+	if len(got) != 1 || !sameDir(t, strings.TrimSpace(got[0]), dir) {
+		t.Fatalf("out=%q(想要 %q:带单引号的目录名没被正确转义)", out, dir)
 	}
 }
 

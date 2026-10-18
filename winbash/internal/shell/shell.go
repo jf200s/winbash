@@ -246,6 +246,9 @@ func (s *Session) execHandler(ctx context.Context, args []string) error {
 		// 会静默给出空值(见 winmgmt/pwshcmd.go)。
 		// 复用同一个 envList:③ 层子进程的环境与 ② 层的 $env: 因此保持一致。
 		ctx = winmgmt.WithEnv(ctx, envList(hc.Env, s.searchPath))
+		// 引擎常驻,所以 cwd 也必须每条同步(与 env 同一个理由):它的 cwd 是 daemon
+		// 启动时继承的那个,不会跟着会话的 `cd` 走。
+		ctx = winmgmt.WithDir(ctx, hc.Dir)
 		if code := winmgmt.Registry[args[0]](ctx, conn, args[1:], s.jsonOut, hc.Stdout, hc.Stderr); code != 0 {
 			return interp.ExitStatus(code)
 		}

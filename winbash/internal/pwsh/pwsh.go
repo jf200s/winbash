@@ -150,7 +150,20 @@ func Start() (*Conn, error) {
 // 这是 spec §7 第 1 条要求修掉的坑:PowerShell 的 non-terminating error 默认不改退出码,
 // 上层会以为成功了。
 func (c *Conn) Run(ctx context.Context, script string) (string, error) {
-	resp, err := c.call(ctx, request{Op: "run", Script: script})
+	return c.RunIn(ctx, "", script)
+}
+
+// RunIn 同 Run,但先在引擎里把当前目录切到 cwd。
+//
+// 为什么要有它(而不是调用方在脚本前面拼一句 Set-Location):引擎是常驻进程,
+// 它的 cwd 是**启动那一刻**继承的,会话的 `cd` 发生在那之后。不同步的话
+// `cd /tmp; pwsh -c 'New-Item x'` 会把文件静默写进 daemon 的 cwd。
+// 而切目录这件事 session.ps1 本来就实现好了(它的错误措辞也更准),调用方拼文本
+// 等于重写一遍,还会让「脚本必须以 param(...) 开头」进一步失效。
+//
+// cwd 为空表示不干预(沿用引擎当前目录)。
+func (c *Conn) RunIn(ctx context.Context, cwd, script string) (string, error) {
+	resp, err := c.call(ctx, request{Op: "run", Script: script, Cwd: cwd})
 	if err != nil {
 		return "", err
 	}
