@@ -702,7 +702,22 @@ func (s *Session) runExternal(ctx context.Context, args []string, hc interp.Hand
 			return interp.ExitStatus(errs.ExitNoExec)
 		}
 		// 反斜杠转成正斜杠:MSYS 认 `C:/…`。
-		argv0, leading = envExe, []string{filepath.ToSlash(abs)}
+		//
+		// 脚本参数给**用户写的原串**,不是解析出来的绝对路径:它一路传到 MSYS 的
+		// bash 子进程当 $0,而 bash 运行时报错的前缀用的正是 $0 —— 传绝对路径,
+		// `./script.sh: line 1: foo: command not found` 就变成
+		// `C:/Users/…/script.sh: line 1: …`,真 bash 打的是用户写的那个。
+		// 两条例外,都传 abs:其一,挂载解析(`/tmp/x.sh`、`/c/x/y.sh`)改写过的 ——
+		// 合成挂载与 bash 自己的 MSYS 挂载表可能分叉,原串未必指向同一个文件;
+		// 其二,裸名字(`sed`、PATH 里的脚本)—— 原串要靠子进程自己搜 PATH,而它的
+		// PATH 是我们合成的 searchPath,搜索语义可能与定位时不同,原串未必可定位。
+		// 相对路径(`./x.sh`、`sub/x.sh`)则由子进程 cwd(= hc.Dir,见下 cmd.Dir)
+		// 兜底,一定能找到文件。
+		scriptArg := filepath.ToSlash(abs)
+		if strings.ContainsAny(args[0], `/\`) && builtins.ResolveShellPath(hc.Dir, args[0]) == args[0] {
+			scriptArg = args[0]
+		}
+		argv0, leading = envExe, []string{scriptArg}
 	}
 
 	// stderr 边转发边留尾:已知坑的识别靠它(见下),但输出不能延迟。
