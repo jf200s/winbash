@@ -151,6 +151,25 @@ func (hc HandlerContext) Builtin(ctx context.Context, args []string) error {
 }
 
 func (r *Runner) builtin(ctx context.Context, pos syntax.Pos, name string, args []string) (exit exitStatus) {
+	// winbash patch:写错误记账是**每条 builtin 一条**的 —— 入口清零,出口结算。
+	// 清零不能省:`echo x >&-; echo ok` 里第二句必须是干净的,不能继承第一句的
+	// 失败;递归调用(`command echo x >&-`)则由最内层结算,外层看到空账不重复报。
+	r.writeErr = nil
+	defer func() {
+		err := r.writeErr
+		r.writeErr = nil
+		if err == nil || exit.code != 0 {
+			// 命令自己已经失败的,退出码维持原判,不再改写。
+			return
+		}
+		// 真 bash:`echo x >&-` → rc=1、stderr 一行
+		// `echo: write error: Bad file descriptor`。命令名不带 `bash: line 1: `
+		// 前缀(本 interp 的报错行号形态与真 bash 不同,不硬凑)。
+		exit.code = 1
+		// stderr 若也被关了(`echo x >&- 2>&-`)这行写不出去,errf 会把失败吞掉;
+		// 退出码在上面已经落定,不受影响 —— 与真 bash 一致。
+		r.errf("%s: write error: %s\n", name, err)
+	}()
 	failf := func(code uint8, format string, args ...any) exitStatus {
 		r.errf(format, args...)
 		exit.code = code
