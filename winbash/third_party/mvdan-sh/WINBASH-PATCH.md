@@ -153,10 +153,89 @@ default:                       r.exit.fatal(err)
   **之前**就把 POSIX 路径改写成了 Windows 形式，而 interp 没有 API 能把原串带回来。
   这与 `pwd` 的既定设计一致（`pwd` 刻意给 `D:\...`，以便直接喂给 Windows 工具），
   所以本轮只对齐措辞、不动路径。
-- `exec 3>&1` 仍是 `unsupported redirect fd: 3` —— 那是**功能缺失**（不支持 fd 3），
-  不是措辞问题，属于另一个任务。
+- `exec 3>&1` 这类 fd 3+ 的功能缺失**已修**（2026-10，见 §5 fd 表），不是措辞问题。
 
 **回归**:`internal/shell/cdwording_test.go`（7 条 / 18 子用例）。7 处变异全部抓到。
+
+### 5. fd 表：fd 3+ 在进程内可用
+
+**位置**：新增 `interp/fdtable.go`；`interp/runner.go` 的 `(*Runner).redir`、
+`stmtSync`、管道与子 shell 收尾、`(*Runner).exec`；`interp/api.go` 的
+`Runner.fdTable` / `StdIO` / `Reset` / `subshell`；`internal/shell/shell.go` 的
+`Session.Close`。
+
+**为什么**：上游只支持 fd 0/1/2，其余一律 `unsupported redirect fd: N` ——
+**功能缺失**，不是措辞问题。真 bash 里 `exec 3>&1; echo x >&3` 正常输出 x。
+连带还有几个**静默做错事**的既存 bug：`cmd 3<<EOF` / `cmd 3<<<x` / `cmd 3<file`
+把内容静默接到 stdin、`cmd 3&>file` 连 stdout+stderr 一起改 —— 都是「重定向的
+fd 编号被无视」。一并按目标 fd 修掉。
+
+**修前 → 修后**（全部对着真 Git Bash 实测）：
+
+| 写法 | 修前 | 修后 = 真 bash |
+|---|---|---|
+| `exec 3>&1; echo x >&3` | `unsupported redirect fd: 3`、rc=1 | 输出 x、rc=0 |
+| `echo x 3>&1; echo y >&3` | 同上 | y 不输出，`3: Bad file descriptor`、rc=1（fd 3 不泄漏到后续命令） |
+| `exec 4>f; echo a >&4; echo b >&4` | 同上 | f 内容 `a\nb\n`（同一句柄，偏移累积） |
+| `(exec 3>f; echo x >&3); echo y >&3` | 同上 | 后者 `3: Bad file descriptor`（子 shell 不穿透） |
+| `echo foo 5>a` | `unsupported redirect fd: 5`、rc=1 | 输出 foo、静默创建 a、rc=0 |
+| `cmd 3<<EOF` / `cmd 3<<<x` / `cmd 3<file` | **静默**接到 stdin（静默做错事） | 接到 fd 3 |
+| `cmd 3&>file`（带 N 的 `&>`） | **静默**把 stdout+stderr 一起改 | 只装 fd 3 |
+
+**设计三原则**（详见 `interp/fdtable.go` 文件头注释）：
+
+1. **fd 0/1/2 不进表**，它们就是 `Runner.stdin/stdout/stderr` 三个槽 ——
+   winbash 的 StdIO 重设机制（`closeStdin` 每次 Run 换 stdin）直接换这三个槽，
+   复制一份进表立刻与它脱同步。
+2. **引用计数**的底层资源：被 dup、被子 shell clone、被命令级快照各计一份
+   引用，归零才 Close。否则 `exec 4>f; exec 5>&4; exec 4>&-` 会把 fd 5 脚下
+   的文件提前关掉（use-after-close，比泄漏更糟）。
+3. **clone 是拷贝**（map 与条目都拷、底层资源共享）：与 fork 语义一致（共享
+   文件偏移），而且管道左右两段并发跑，共享 map 就是 data race。
+
+**save/restore 与 keepRedirs**：fd 表与 stdio 槽进**同一个**快照-恢复对
+（`stmtSync`），否则命令级 `cmd 3>&1` 的 fd 3 会泄漏到后续命令。`exec` 的
+`keepRedirs` 分支同时豁免 fd 表的恢复与关闭（`exec 3>&1` / `exec 4>f` 跨命令
+持久），并改还快照份额。
+
+**生命周期**：子 shell / 后台命令 / 管道段 / 命令替换退出即关各自的 fd 表
+（bash 语义：`(exec 3>f)` 不穿透）；`Runner.Reset` 与 `Session.Close` 全清 ——
+`*r = Runner{}` 整体重建只会把 map 静默丢掉而不 Close，常驻 daemon 的
+Session 每 Reset 一次就漏一个 `*os.File`。
+
+**stdin use-after-close 防护**：`StdIO` 换槽时把 fd 表里引用旧槽值的条目失效
+（winbash 的 `closeStdin` 在每次 Run 收尾把 stdin 管道换成 /dev/null）。
+`exec 3<&0` 之后跨 Run 的 `cat <&3` 现在报 `3: Bad file descriptor`，而不是
+拿着已 Close 的 `*os.File` 读出 `file already closed`。槽值没换的不动：
+winbash 的 `switchWriter` 每次 Run 换 buffer，`exec 3>&1` 的 fd 3 写入
+**跟随当次 Run 的 stdout** —— 那正是「fd 是 stdout 的 dup」的正确行为。
+
+**不做（负面清单，与真 bash 的已知边界）**：
+
+- **传 fd 给外部命令**（`cmd 3>log`、`bash -c 'echo x >&3'`）：Windows 的
+  `cmd.ExtraFiles` 不支持，子进程看不到 fd 3+。其中「命令自身带 fd 3+
+  重定向」是唯一会**无声数据丢失**的形态（重定向被丢掉、命令照跑），现在
+  **响亮报错**：`cmd 3>log` → `cmd: fd 3 cannot be passed to external
+  commands`、rc=1。`exec 4>f; cmd`（命令自身不带 fd 3+ 重定向）不拦 ——
+  cmd 不用 fd 4 就没有损失，拦了反而误伤；cmd 真要用 fd 4 时仍会有损，
+  这是残留缺口。
+- `test -t 3`（`interp/test.go` 只查 0/1/2）、`read -u 3`、`{var}>` 动态分配、
+  `/dev/fd/3` 路径。
+- 跨命令 fd 偏移/seek 语义（io.Reader 包装下做不真）。
+- 标准流**反向重开**（`read 1</dev/null`、`exec 1<file`）按近似处理：fd 1/2
+  变成只读（写它报 `Bad file descriptor`，与真 bash 同），但**读** fd 1/2 做不到
+  （我们的 stdio 槽只有写侧），输入内容不挂载；输出重定向落 fd 0（`0>file`）
+  报 `unsupported redirect fd: 0`。
+- dup 是**单向**的：`4>&3` 只复制写端、`4<&3` 只复制读端（真 bash 的 fd 双向）。
+- `>&bad`（非数字）仍报 `bad: Bad file descriptor`（真 bash 静默走 `&>bad`
+  语义），同 §4 的取舍：宁可响亮。
+
+**回归**：`internal/shell/fdtable_test.go`（8 个 Test / 约 30 子用例），含变异
+探针 `TestFdTableSubshellIsolation`（把 `subshell` 的 fd 表 clone 换成共享
+map，它必须变红）。上游测试同步改 **1 处**期望值：`interp/interp_test.go` 的
+`echo foo 5>a`，从 `unsupported redirect fd: 5` 改成真 bash 行为 `foo\n`
+（fd 5 命令内创建、命令结束关闭，echo 不碰它）—— 实现 fd 表后那条是
+**预期内的红**，不是补丁打错了。
 
 ## 验证
 
@@ -165,8 +244,10 @@ default:                       r.exit.fatal(err)
 `go test ./internal/shell/ -update-pbb-corpus` 从**真 Git Bash** 生成，不手写。
 
 §4 的措辞补丁另有 **13 条** cd / 重定向用例与真 Git Bash 逐条对照（`cmd/winbash/e2e` 之外
-的直接实测，脚本见本轮工作记录），修前 6 类不一致、修后措辞全部一致。剩下 2 类差异是
-**已记录的遗留**（Windows 绝对路径形式、不支持 fd 3），见 §4 末。
+的直接实测，脚本见本轮工作记录），修前 6 类不一致、修后措辞全部一致。剩下 1 类差异是
+**已记录的遗留**（Windows 绝对路径形式），见 §4 末；原先的「不支持 fd 3」已由 §5 的
+fd 表修掉。§5 的 fd 表行为在 `internal/shell/fdtable_test.go` 里与真 bash 基准表
+逐条对照（含子 shell 不穿透、fd 不泄漏、偏移累积、use-after-close 防护）。
 
 ## 升级流程
 
@@ -182,12 +263,15 @@ default:                       r.exit.fatal(err)
    `grep -n 'null directory' third_party/mvdan-sh/interp/builtin.go`（§4 的 `cd`；
    若新版自己就分开了 `err != nil` 与 `!info.IsDir()`、且措辞与真 bash 一致，
    这一处就不用打了）、
-   `grep -n 'Bad file descriptor' third_party/mvdan-sh/interp/runner.go`（§4 的 `>&`/`<&`）；
+   `grep -n 'Bad file descriptor' third_party/mvdan-sh/interp/runner.go`（§4 的 `>&`/`<&`）、
+   `ls third_party/mvdan-sh/interp/fdtable.go`（§5 的 fd 表，整文件都是本补丁，
+   新版若自带 fd 3+ 支持就把文件与 `Runner.fdTable` 相关字段一起删）；
 3. 如果上游已实现且行为一致，**删掉本补丁与 `replace` 行**，回到正常依赖；
 4. 跑 `go test ./... -count=1` 与 `smoke-gitbash.sh`，两者都必须绿。
 
-**注意 §4 会打破上游自己的测试**：`interp/interp_test.go` 里 13 处期望值断言的正是被改掉的
-旧措辞。重打补丁时要一并改回（清单见 §4），否则 `go test ./interp/` 会红一片 ——
+**注意 §4/§5 会打破上游自己的测试**：`interp/interp_test.go` 里 13 处期望值断言的正是被改掉的
+旧措辞（§4），另有 1 处 `echo foo 5>a` 断言 `unsupported redirect fd: 5`（§5，已改成真 bash
+行为 `foo\n`）。重打补丁时要一并改回（清单见 §4/§5），否则 `go test ./interp/` 会红一片 ——
 那是**预期内的红**，不是补丁打错了。截至 v3.14.1，`go test ./interp/` 还有 **1 条既存失败**
 （`TestRunnerRun/#377`，`foo=~; test -d $foo` 在 Windows 上被含空格的路径拆词）、
 `go test ./syntax/` 有 1 条既存失败（`TestPrintMultiline`）—— 两者在**未打补丁的上游源码上

@@ -67,6 +67,7 @@ func (r *Runner) fillExpandConfig(ctx context.Context) {
 			r2 := r.subshell(false)
 			r2.stdout = w
 			r2.stmts(ctx, cs.Stmts)
+			r2.closeAllFds()        // winbash patch:命令替换的 subshell 退出即关其 fd 表
 			r2.exit.exiting = false // subshells don't exit the parent shell
 			r.lastExpandExit = r2.exit
 			if r2.exit.fatalExit {
@@ -116,6 +117,7 @@ func (r *Runner) fillExpandConfig(ctx context.Context) {
 			r.bgProcs = append(r.bgProcs, bg)
 			go func() {
 				defer func() {
+					r2.closeAllFds() // winbash patch:进程替换的 subshell 同样收表
 					*bg.exit = r2.exit
 					close(bg.done)
 				}()
@@ -371,6 +373,7 @@ func (r *Runner) stmt(ctx context.Context, st *syntax.Stmt) {
 		r.bgProcs = append(r.bgProcs, bg)
 		go func() {
 			r2.Run(ctx, &st2)
+			r2.closeAllFds()        // winbash patch:后台 subshell 退出即关其 fd 表
 			r2.exit.exiting = false // subshells don't exit the parent shell
 			*bg.exit = r2.exit
 			close(bg.done)
@@ -383,6 +386,14 @@ func (r *Runner) stmt(ctx context.Context, st *syntax.Stmt) {
 
 func (r *Runner) stmtSync(ctx context.Context, st *syntax.Stmt) {
 	oldIn, oldOut, oldErr := r.stdin, r.stdout, r.stderr
+	// winbash patch:fd 表(fd 3+)与 stdio 槽进**同一个**快照-恢复对 ——
+	// 否则命令级 `cmd 3>&1` 的 fd 3 会泄漏到后续命令(bash:只在该命令内有效)。
+	// cmdFdRedir 也按语句计:它只描述「这条命令自己的重定向」。
+	r.cmdFdRedir = 0
+	var oldFds map[int]fdEntry
+	if len(st.Redirs) > 0 {
+		oldFds = r.snapshotFds()
+	}
 	var closers []io.Closer
 	for _, rd := range st.Redirs {
 		cls, err := r.redir(ctx, rd)
@@ -423,8 +434,12 @@ func (r *Runner) stmtSync(ctx context.Context, st *syntax.Stmt) {
 		// The exec builtin made this statement's redirections apply to the
 		// shell itself, so don't undo them and keep their files open.
 		r.keepRedirs = false
+		// winbash patch:fd 表同样豁免 —— `exec 3>&1` / `exec 4>f` 要跨命令
+		// 持久,既不恢复也不关闭;改归还快照里被替换/删除条目的引用。
+		r.keepFds(oldFds)
 	} else if len(st.Redirs) > 0 {
 		r.stdin, r.stdout, r.stderr = oldIn, oldOut, oldErr
+		r.restoreFds(oldFds)
 		for _, cls := range closers {
 			cls.Close()
 		}
@@ -445,6 +460,9 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 	case *syntax.Subshell:
 		r2 := r.subshell(false)
 		r2.stmts(ctx, cm.Stmts)
+		// winbash patch:子 shell 退出,其 fd 表随之关闭(bash 语义:
+		// `(exec 3>f)` 的 fd 3 不穿透到父 shell)。
+		r2.closeAllFds()
 		r2.exit.exiting = false // subshells don't exit the parent shell
 		r.exit = r2.exit
 	case *syntax.CallExpr:
@@ -560,16 +578,22 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 			}
 			oldIn := r.stdin
 			r.stdin = pr
+			// winbash patch:右段直接在父 r 上跑(既存偏差:`exec 3>x | true`
+			// 会泄漏进父 shell)。fd 表至少给右段一份快照-恢复:管道段的
+			// `exec 3>f` 不跟着漏到父 shell,也不跟左段共享 map(data race)。
+			oldFds := r.snapshotFds()
 			var wg sync.WaitGroup
 			wg.Go(func() {
 				r2.stmt(ctx, cm.X)
 				r2.exit.exiting = false // subshells don't exit the parent shell
+				r2.closeAllFds()        // winbash patch:左段退出即关其 fd 表(clone 语义)
 				pw.Close()
 			})
 			r.stmt(ctx, cm.Y)
 			pr.Close()
 			wg.Wait()
 			r.stdin = oldIn
+			r.restoreFds(oldFds)
 			if r.opts[optPipeFail] && !r2.exit.ok() && r.exit.ok() {
 				r.exit = r2.exit
 			}
@@ -1082,28 +1106,42 @@ func (r *Runner) hdocString(rd *syntax.Redirect) string {
 
 func (r *Runner) redir(ctx context.Context, rd *syntax.Redirect) (io.Closer, error) {
 	// Note that Hdoc is nil for an empty here-document.
+	// winbash patch:上游这个分支完全忽略 rd.N,`cmd 3<<EOF` 会把 here-document
+	// **静默**接到 stdin(静默做错事)。现在统一按目标 fd 走:0 接 stdin,
+	// 3+ 装进 fd 表(资源由表条目持有)。
 	if rd.Op == syntax.Hdoc || rd.Op == syntax.DashHdoc {
+		fd, err := r.redirFd(rd, true)
+		if err != nil {
+			return nil, err
+		}
 		pr, err := r.hdocReader(rd)
 		if err != nil {
 			return nil, err
 		}
-		r.stdin = pr
-		return pr, nil
+		if fd == 0 {
+			r.stdin = pr
+			return pr, nil
+		}
+		if fd <= 2 {
+			// 反向重开(`read 1<<EOF` 之类):fd 1/2 变只读,见 closeStdioWriteSide。
+			r.closeStdioWriteSide(fd)
+			return pr, nil
+		}
+		r.fdEntrySet(fd, fdEntry{in: pr, res: newFdRes(pr)})
+		return nil, nil
 	}
 
-	orig := &r.stdout
-	if rd.N != nil {
-		switch rd.N.Value {
-		case "0":
-			// Note that the input redirects below always use stdin (0)
-			// because we don't support anything else right now.
-		case "1":
-			// The default for the output redirects below.
-		case "2":
-			orig = &r.stderr
-		default:
-			return nil, fmt.Errorf("unsupported redirect fd: %v", rd.N.Value)
-		}
+	// winbash patch:上游只支持 0/1/2(其余报 `unsupported redirect fd`),
+	// 且输入重定向一律挂 stdin、`&>` 一律硬设 stdout+stderr。
+	// 现在所有 op 都先定目标 fd:输入缺省 0、输出缺省 1,3+ 走 fd 表。
+	input := false
+	switch rd.Op {
+	case syntax.WordHdoc, syntax.RdrIn, syntax.DplIn:
+		input = true
+	}
+	fd, err := r.redirFd(rd, input)
+	if err != nil {
+		return nil, err
 	}
 	arg := r.literal(rd.Word)
 	switch rd.Op {
@@ -1112,7 +1150,14 @@ func (r *Runner) redir(ctx context.Context, rd *syntax.Redirect) (io.Closer, err
 		if err != nil {
 			return nil, err
 		}
-		r.stdin = pr
+		// winbash patch:同上,上游硬挂 r.stdin(`cmd 3<<<x` 也静默接到 stdin)。
+		if fd == 0 {
+			r.stdin = pr
+		} else if fd <= 2 {
+			r.closeStdioWriteSide(fd) // 反向重开,见 closeStdioWriteSide
+		} else {
+			r.fdEntrySet(fd, fdEntry{in: pr, res: newFdRes(pr)})
+		}
 		// We write to the pipe in a new goroutine,
 		// as pipe writes may block once the buffer gets full.
 		go func() {
@@ -1120,19 +1165,26 @@ func (r *Runner) redir(ctx context.Context, rd *syntax.Redirect) (io.Closer, err
 			io.WriteString(pw, "\n")
 			pw.Close()
 		}()
+		if fd >= 3 {
+			// 资源由 fd 表条目按引用计数关闭,不能再交给 stmtSync 关,
+			// 否则 keepRedirs 的持久 fd 会被命令结束时提前关掉。
+			return nil, nil
+		}
 		return pr, nil
-	case syntax.DplOut:
-		switch arg {
-		case "1":
-			*orig = r.stdout
-		case "2":
-			*orig = r.stderr
-		case "-":
-			// winbash patch:关闭输出 fd。上游这里用 io.Discard,写"成功"、rc=0、
-			// 无报错 —— 静默做错事。真 bash 之后每次写都失败:`echo x >&-` →
-			// rc=1、`echo: write error: Bad file descriptor`。
-			*orig = closedWriter{}
-		default:
+	case syntax.DplOut, syntax.DplIn:
+		// winbash patch:`>&N` / `<&N` 把源 fd 复制到目标 fd(目标缺省输出 1、
+		// 输入 0;3+ 是 fd 表条目)。上游只支持 0/1/2,`exec 3>&1` 报
+		// `unsupported redirect fd: 3`。
+		if arg == "-" {
+			// winbash patch:关闭目标 fd。上游 DplOut 这里用 io.Discard,写"成功"、
+			// rc=0、无报错 —— 静默做错事。真 bash 之后每次写都失败:
+			// `echo x >&-` → rc=1、`echo: write error: Bad file descriptor`(见 §4)。
+			// 目标是 fd 3+ 时即移除表条目(bash 的 close 语义)。
+			r.redirCloseFd(fd, rd.Op == syntax.DplIn)
+			return nil, nil
+		}
+		src, aerr := strconv.Atoi(arg)
+		if aerr != nil || src < 0 {
 			// winbash patch:措辞对齐真 bash,实测 `echo x >& 99` 给
 			// `99: Bad file descriptor`、退出码 1。
 			//
@@ -1144,19 +1196,38 @@ func (r *Runner) redir(ctx context.Context, rd *syntax.Redirect) (io.Closer, err
 			// 「不静默做错事」,这里统一响亮报错更好。差异已记进 README。
 			return nil, fmt.Errorf("%s: Bad file descriptor", arg)
 		}
-		return nil, nil
-	case syntax.RdrIn, syntax.RdrOut, syntax.AppOut,
-		syntax.RdrAll, syntax.AppAll:
-		// done further below
-	case syntax.DplIn:
-		switch arg {
-		case "-":
-			r.stdin = nil // closing the input file
-		default:
+		e, ok := r.fdDup(src)
+		if !ok {
 			// 同上:`echo x <& 99` → 真 bash 给 `99: Bad file descriptor`。
 			return nil, fmt.Errorf("%s: Bad file descriptor", arg)
 		}
-		return nil, nil
+		if rd.Op == syntax.DplOut && e.out == nil {
+			return nil, fmt.Errorf("%s: Bad file descriptor", arg)
+		}
+		if rd.Op == syntax.DplIn && e.in == nil {
+			return nil, fmt.Errorf("%s: Bad file descriptor", arg)
+		}
+		if rd.Op == syntax.DplIn && fd >= 1 && fd <= 2 {
+			// 反向重开(`1<&0` 之类):fd 1/2 变只读,源已校验有效。
+			r.closeStdioWriteSide(fd)
+			return nil, nil
+		}
+		// dup 是单方向的:目标只装被复制的那一个方向。
+		if rd.Op == syntax.DplOut {
+			e.in = nil
+		} else {
+			e.out = nil
+		}
+		if fd >= 3 {
+			// 表条目自带一份资源引用;stdio 槽不持有资源,不能计。
+			e.res.retain()
+		} else {
+			e.res = nil
+		}
+		return nil, r.redirSetFd(fd, e)
+	case syntax.RdrIn, syntax.RdrOut, syntax.AppOut,
+		syntax.RdrAll, syntax.AppAll:
+		// done further below
 	default:
 		return nil, fmt.Errorf("unhandled redirect op: %v", rd.Op)
 	}
@@ -1173,14 +1244,47 @@ func (r *Runner) redir(ctx context.Context, rd *syntax.Redirect) (io.Closer, err
 	}
 	switch rd.Op {
 	case syntax.RdrIn:
+		// winbash patch:上游无条件挂 stdin(连 `3<file` 也一样);现在按目标 fd。
+		if fd >= 3 {
+			r.fdEntrySet(fd, fdEntry{in: f, res: newFdRes(f)})
+			return nil, nil
+		}
+		if fd != 0 {
+			// 反向重开(`read 1</dev/null`):fd 1/2 变只读,写它报
+			// Bad file descriptor;read 仍走 stdin,与真 bash 同。
+			r.closeStdioWriteSide(fd)
+			return f, nil
+		}
 		stdin, err := newStdinFile(f)
 		if err != nil {
 			return nil, err
 		}
 		r.stdin = stdin
 	case syntax.RdrOut, syntax.AppOut:
-		*orig = f
+		if fd >= 3 {
+			r.fdEntrySet(fd, fdEntry{out: f, res: newFdRes(f)})
+			return nil, nil
+		}
+		if fd == 2 {
+			r.stderr = f
+		} else {
+			r.stdout = f
+		}
 	case syntax.RdrAll, syntax.AppAll:
+		// winbash patch:上游硬设 stdout+stderr(连带 N 的形态也设两个);
+		// 现在只在 `&>file`(无 N)时两者都设,N 指定的 fd 只装那一个。
+		if rd.N != nil {
+			if fd >= 3 {
+				r.fdEntrySet(fd, fdEntry{out: f, res: newFdRes(f)})
+				return nil, nil
+			}
+			if fd == 2 {
+				r.stderr = f
+			} else {
+				r.stdout = f
+			}
+			break
+		}
 		r.stdout = f
 		r.stderr = f
 	default:
@@ -1250,6 +1354,15 @@ func (r *Runner) call(ctx context.Context, pos syntax.Pos, args []string) {
 }
 
 func (r *Runner) exec(ctx context.Context, pos syntax.Pos, args []string) {
+	// winbash patch:子进程继承不了 fd 3+(os/exec 的 ExtraFiles 在 Windows 上
+	// 不支持)。`cmd 3>log` 若照跑,重定向会被**静默丢掉** —— 命令"成功"、文件
+	// 没写,是无声数据丢失。宁可响亮失败。注意 `exec 4>f; cmd`(命令自身不带
+	// fd 3+ 重定向)不拦:cmd 不用 fd 4 就没有损失,拦了反而误伤。
+	if fd := r.cmdFdRedir; fd != 0 {
+		r.errf("%s: fd %d cannot be passed to external commands\n", args[0], fd)
+		r.exit.code = 1
+		return
+	}
 	r.exit.fromHandlerError(r.execHandler(r.handlerCtx(ctx, handlerKindExec, pos), args))
 }
 

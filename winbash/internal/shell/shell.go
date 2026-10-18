@@ -882,10 +882,13 @@ func (s *Session) psEngine() (*pwsh.Conn, error) {
 	return conn, nil
 }
 
-// Close 释放会话持有的资源(目前只有 ② 层的 pwsh 引擎)。
+// Close 释放会话持有的资源(② 层的 pwsh 引擎、fd 表里的句柄)。
 //
-// daemon 退出时必须调用:否则每重启一次 daemon 就留下一个常驻 pwsh 进程。
+// daemon 退出时必须调用:否则每重启一次 daemon 就留下一个常驻 pwsh 进程;
+// `exec 4>f` 这类 fd 表条目同理 —— 每个会话漏一个 *os.File。
 func (s *Session) Close() error {
+	// fd 表(fd 3+)里的句柄:见 third_party/mvdan-sh/WINBASH-PATCH.md §5。
+	s.runner.CloseExtraFds()
 	if s.engine == nil {
 		return nil
 	}
