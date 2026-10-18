@@ -176,6 +176,18 @@ BRE 这一条是修过的:**早先默认按整串字面匹配**,于是这几个�
 - 兜底是**原生 pwsh 的全路径**(路径:`where.exe pwsh`);要交互式 shell 就直接用它。
 - bash 的 `export` 对它是可见的(每次调用同步环境)。所以写 `pwsh -c '$env:X'` 要**用单引号**:
   双引号会被 bash 先展开 `$env` —— 这一点与真 bash 完全一致。
+- **它跟随会话的 `cd`**(2026-10-18 修)。引擎是常驻进程,它的 cwd 是**启动那一刻**继承的
+  daemon 目录,而会话的 `cd` 发生在那之后 —— 所以每条 ② 层命令都把会话 cwd 随请求带过去
+  (协议字段 `cwd`,不是拼文本)。修前 `cd /tmp; pwsh -c 'New-Item x'` 会把文件
+  **静默写进 daemon 的 cwd**,`cd /tmp; pwsh rel.ps1` 会报"读不到脚本文件"。
+  相对路径的**脚本文件**也按会话 cwd 解析(修前按进程 cwd,明明在`/tmp`里的文件读不到)。
+
+  这里有一个 Windows 特有的坑,写下来免得下一个人重踩:`Set-Location` 会把路径里的
+  `~` 当 home 展开,**连 `-LiteralPath` 都挡不住**,而 8.3 短名恰好含 `~` ——
+  daemon 的 cwd 常落在 `C:\Users\TESTUS~1\AppData\Local\Temp` 这种形态上,于是它报
+  `An object at the specified path C:\Users\TESTUS~1 does not exist.`,而同一路径
+  `Test-Path` 为真。所以切目录前先 `(Get-Item -LiteralPath ...).FullName` 拿长名;
+  `Resolve-Path` / `Convert-Path` 对短名原样返回,只有 `Get-Item` 给长名(都实测过)。
 
 ### ③ 层:真实工具
 
@@ -447,6 +459,8 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 | `trap <信号>` 只支持 `ERR` / `EXIT` | mvdan/sh 只实现这两个;其余信号(INT / TERM / USR1 / HUP / DEBUG / RETURN …)的上游行为是**stderr 报 `invalid signal specification`、退出码却是 0、hook 一个字节都没生效**。2026-10-17 起 `callGuard` 提前拦成响亮失败:`exit 1` + 三行式(点名信号 + 给替代写法)。`trap '' INT`(想忽略 Ctrl+C)这类"以为信号被屏蔽了"的写法受害最深,现在会明确报错。**边界精确**:只拦出现在**信号位置**的名字,`trap 'echo DEBUG' EXIT` 里作为 callback 文本的不误拦。`trap` 无参数(列出)不拦 —— 它只是少个查询功能,不产生错值。回归:`internal/shell/trapguard_test.go`(30 条子用例 —— 10+8+12,含变异验证) |
 | `printf '%(%Y)T'`(strftime) | **不支持**:报 `invalid format char: (`,**退出码 1** —— 是响亮的,不是静默。要格式化时间请用 `date`(③ 层,如 `date -u -d @0 '+%Y-%m-%d'`) |
 | `pwsh -c "$env:X"` | 双引号里的 `$env` 会被 bash 先展开成空 —— **与真 bash 一致**,要写单引号 |
+| `pwsh 以 param(...) 开头的脚本` | **不支持**(既有欠账,2026-10-18 查明,不是本轮引入)。`pwsh x.ps1` 的脚本内容会被拼上环境前导(`[Environment]::SetEnvironmentVariable(...);`)再交给引擎,而 PowerShell 要求 `param` 是 scriptblock 的**第一条语句**,于是报 `The term 'param' is not recognized…`(rc=1)。原生 `pwsh -File x.ps1` 正常。**响亮失败、不是静默错值**,但带参脚本这条用法在 winbash 里目前是坏的。要跑就显式用原生 pwsh 全路径。彻底修法是把环境同步也搬进协议(像 `cwd` 那样),待做 |
+| 端口文件的 ACL 与 `--stop` 删不掉 | **已修(2026-10-18)**。`restrictEndpointFile` 原先只 grant `(R,W)`,缺 **DELETE** —— 于是 daemon 退出时删不掉自己建的端口文件,残留文件让该 endpoint **永久不可用**:`--stop` 报 rc=0(看起来成功),之后每次调用都是「连接被拒」,而且 `rm` 也删不掉(实测在 D 盘;`%TEMP%` 下父目录的 DELETE_CHILD 顶着,所以不显形)。对照实验坐实缺的就是 D:同一文件 `/grant:r user:(R,W)` 时 `rm` 失败,改 `(R,W,D)` 就能删。三处一起修:⓵ 加 D;⓶ 删除失败不再被吞掉(`removeIfOwned` / `forgetStaleEndpoint` 都报 stderr,含路径与原因);⓷ **死地址自愈** —— 端口文件仍指向连不上的旧地址时不再信任它,改去 spawn 新 daemon,新 daemon 的覆盖写会救回那个删不掉的文件(实测:旧地址 `52347` → 新 daemon 写成 `52364`,同一 endpoint 恢复正常,rc=0)。另:`removeIfOwned` 读不到端口文件时也报一句(实测 `deny (D)` 连 `os.ReadFile` 都会 Access denied,原先静默 return 会让真故障完全无声),而 `NotExist` 保持静默(那是正常路径)。回归:`TestRestrictEndpointFileGrantsDelete`(判据用 icacls 文本,不用"能不能删")、`TestRemoveIfOwnedReportsDeleteFailure`(用不含 `FILE_SHARE_DELETE` 的句柄构造"可读但删不掉")、`TestRemoveIfOwnedReportsUnreadableEndpoint`、`TestRemoveIfOwnedStaysSilentWhenMissing`、`TestTrustEndpoint` |
 | `pwsh` 的列名按字母序 | 真实 PowerShell 会按对象属性定义顺序排版;我们排序是为了让两次运行的列序一致 |
 | 超时**不会**重放脚本 | 客户端超时后直接报错。早先它会重拉 daemon 把同一个请求原样重跑,于是 `echo RUN >> f; sleep 6` 配 `--timeout 2s` 会让文件出现**两行** —— 对写文件类脚本是数据损坏 |
 | 一条坏连接最多宽限 5 秒 | daemon 读完请求头就撤读预算,所以「只连、不说话」的连接会在 5 秒(`DefaultReadTimeout`)后被单独丢掉 —— 并发化之后它只占自己那支 goroutine 与一个 fd,不再让别人排队。修之前既没有这个上限(能一直挡到客户端自己超时),又因为是串行处理而拦住**所有**人 |
