@@ -355,3 +355,57 @@ func TestPwshInheritsBashExportedEnv(t *testing.T) {
 		t.Fatalf("out=%q(想要 42:常驻引擎看不到 bash 侧的 export)", got)
 	}
 }
+
+// 带 param(...) 的脚本文件必须能跑。
+//
+// 这里钉的是一个修过的缺陷,不是"顺手多测一条":PowerShell 要求 `param(...)` 是
+// scriptblock 的**第一条**语句。环境同步过去是拼在脚本文本**前面**的一段
+// `[Environment]::SetEnvironmentVariable(...)`,于是 param 不再是第一条,pwsh 报
+//
+//	The term 'param' is not recognized as a name of a cmdlet...
+//
+// (实测;同一个文件用原生 `pwsh -File` 完全正常)。现在环境走协议字段(session.ps1
+// 在脚本之外设),这条前缀也就不存在了。
+//
+// 必须带上 WithEnv:没有环境变量时老实现的 envPrelude 返回空串,
+// 这条测试对那个缺陷就是假绿的。
+func TestPwshScriptWithParamBlockRuns(t *testing.T) {
+	conn := startTestPwsh(t)
+	restoreEngineCwd(t, conn)
+	dir := t.TempDir()
+	// $Name 是 PowerShell 变量,原样写进文件(Go 不会对普通字符串字面量插值)。
+	body := "param($Name = \"default\")\nWrite-Output \"hello-$Name\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "param.ps1"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 相对文件名:顺带复用上一轮做好的"按会话 cwd 解析脚本路径"。
+	ctx := WithEnv(WithDir(context.Background(), dir), []string{"WINBASH_PARAM_PROBE=1"})
+	out, errw, exit := runPwshCmdCtx(t, ctx, conn, false, "param.ps1")
+	if exit != errs.ExitOK {
+		t.Fatalf("exit=%d stderr=%q(带 param 块的脚本跑不了:环境又回到脚本前导了?)", exit, errw)
+	}
+	if got := lines(out); len(got) != 1 || got[0] != "hello-default" {
+		t.Fatalf("out=%q(想要一行 hello-default:param 的默认值没生效)", out)
+	}
+}
+
+// `#Requires` 同样必须是脚本的第一条语句,所以它也是同一处缺陷的另一个面。
+func TestPwshScriptWithRequiresRuns(t *testing.T) {
+	conn := startTestPwsh(t)
+	restoreEngineCwd(t, conn)
+	dir := t.TempDir()
+	body := "#Requires -Version 5.1\nWrite-Output \"requires-ok\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "requires.ps1"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := WithEnv(WithDir(context.Background(), dir), []string{"WINBASH_REQUIRES_PROBE=1"})
+	out, errw, exit := runPwshCmdCtx(t, ctx, conn, false, "requires.ps1")
+	if exit != errs.ExitOK {
+		t.Fatalf("exit=%d stderr=%q(#Requires 开头的脚本跑不了)", exit, errw)
+	}
+	if got := lines(out); len(got) != 1 || got[0] != "requires-ok" {
+		t.Fatalf("out=%q(想要一行 requires-ok)", out)
+	}
+}

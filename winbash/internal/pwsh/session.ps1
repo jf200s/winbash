@@ -7,7 +7,7 @@
 # 也就没有第二份会话状态可争。
 #
 # 协议(两个方向都是):4 字节小端长度 + 该长度的 UTF-8 JSON。
-#   请求 : {"op":"run|ping","script":"...","cwd":"..."}
+#   请求 : {"op":"run|ping","script":"...","cwd":"...","env":["KEY=VALUE",...]}
 #   响应 : {"ok":bool,"out":"...","errors":[...],"meta":{"pid":N,"calls":N,"ms":N}}
 #
 # out 一律是 JSON 文本(见文件末尾的包装段),具体怎么渲染由 Go 侧决定 ——
@@ -52,6 +52,8 @@ while ($true) {
     } else {
         $__wb_sw = [Diagnostics.Stopwatch]::StartNew()
 
+        # 准备阶段(cwd、env)是否都成功。任何一项失败就**不跑脚本**:
+        # 在错误的目录/错误的环境下执行,会给出「成功但错」的结果,比报错更糟。
         $__wb_cwdOk = $true
         if ($__wb_req.PSObject.Properties.Match('cwd').Count -gt 0 -and $__wb_req.cwd) {
             try {
@@ -74,6 +76,40 @@ while ($true) {
             } catch {
                 $__wb_cwdOk = $false
                 $__wb_errors += "cannot change directory to '$($__wb_req.cwd)': $($_.Exception.Message)"
+            }
+        }
+
+        # 环境同步与 cwd 一样,必须是**协议字段**,不能拼成脚本前导文本。
+        #
+        # 原因(实测):PowerShell 要求 `param(...)`(以及 `#Requires`)是 scriptblock
+        # 的**第一条**语句。任何前缀 —— 哪怕只是一句 SetEnvironmentVariable —— 都会
+        # 让以 param 开头的脚本报
+        #   "The term 'param' is not recognized as a name of a cmdlet..."
+        # 而同一个文件用原生 `pwsh -File x.ps1` 完全正常。所以这件事只能在脚本
+        # **之外**发生,也就是这一层。
+        #
+        # 为什么用 [Environment]::SetEnvironmentVariable 而不是 `$env:NAME = ...`:
+        # Windows 的环境变量名不限于合法标识符(可以带括号、连字符),走 .NET API
+        # 就不会因为名字里的字符而解析失败。
+        if ($__wb_req.PSObject.Properties.Match('env').Count -gt 0 -and $__wb_req.env) {
+            # @() 包一层:单元素数组经 ConvertFrom-Json 后形状不保证,
+            # foreach 需要的是一个可枚举的东西。
+            foreach ($__wb_entry in @($__wb_req.env)) {
+                $__wb_kv = [string]$__wb_entry
+                # 按**第一个** = 切:值里可能还带 =(连接串、base64 参数都是这种)。
+                $__wb_i = $__wb_kv.IndexOf('=')
+                # i <= 0 同时挡掉两种:空名,以及 Windows 上 `=C:` 这类内部项
+                # (它们以 = 开头,既设不进去也不该设)。
+                if ($__wb_i -le 0) { continue }
+                $__wb_name = $__wb_kv.Substring(0, $__wb_i)
+                try {
+                    [Environment]::SetEnvironmentVariable($__wb_name, $__wb_kv.Substring($__wb_i + 1))
+                } catch {
+                    # 响亮失败:静默跳过会让脚本读到一个"看起来对"的旧值/空值,
+                    # 那正是这一层存在的意义要消灭的形态。
+                    $__wb_cwdOk = $false
+                    $__wb_errors += "cannot set environment variable '$__wb_name': $($_.Exception.Message)"
+                }
             }
         }
 
