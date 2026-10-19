@@ -6,12 +6,19 @@ package ipc
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 )
 
 // maxMessageBytes 是单帧 payload 的上限。超出视为协议损坏,而非合法请求。
 const maxMessageBytes = 64 << 20
+
+// ErrPayloadTooLarge 表示请求帧超过单帧上限(64 MiB)。
+//
+// 抽成哨兵错误是为了让调用方能把它与「连接断了」区分开:前者**重试必然再失败**
+// (同一份 body 再拼一次还是那么大),后者才值得重连重试。错误文本与原先逐字一致。
+var ErrPayloadTooLarge = errors.New("ipc: payload too large")
 
 // ProtoVersion 是请求/响应携带的协议版本。
 //
@@ -186,7 +193,7 @@ func CheckProto(what string, got int) error {
 // WriteMessage 写出 4 字节小端长度头,再写 payload。
 func WriteMessage(w io.Writer, payload []byte) error {
 	if len(payload) > maxMessageBytes {
-		return fmt.Errorf("ipc: payload too large (%d bytes)", len(payload))
+		return fmt.Errorf("%w (%d bytes)", ErrPayloadTooLarge, len(payload))
 	}
 	var hdr [4]byte
 	binary.LittleEndian.PutUint32(hdr[:], uint32(len(payload)))

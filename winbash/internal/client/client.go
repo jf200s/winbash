@@ -209,7 +209,16 @@ func oneShot(endpoint string, req ipc.Request, mustExist bool, timeout, idle tim
 	conn.Close()
 	if xerr == nil {
 		if resp.Auth {
-			return retryAfterAuthFailure(endpoint, req, timeout, idle)
+			// 鉴权失败证明 daemon **没执行**请求,所以重发不会跑两遍。
+			// 但带流式 stdin 时不能重发:第一条连接已经把 os.Stdin 消费掉了
+			// (理由见 mayRetryAfterAuth)。
+			if !mayRetryAfterAuth(req) {
+				resp.Errors = append(resp.Errors,
+					"client: 鉴权失败,但本次请求带流式 stdin(已被第一条连接消费),不能自动重发;"+
+						"请重新运行这条命令(命令本身未执行)")
+				return resp, nil
+			}
+			return retryAfterAuthFailure(endpoint, req, timeout, idle, mustExist)
 		}
 		return resp, nil
 	}
@@ -242,7 +251,11 @@ func oneShot(endpoint string, req ipc.Request, mustExist bool, timeout, idle tim
 	//
 	// 所以:发送失败 → 请求没送出去,重试安全;读响应失败 → 请求已送达,不重放,
 	// 由调用方决定要不要重跑(错误文案里会说清"命令可能已执行")。
-	if !isSendFailure(xerr) {
+	//
+	// 另外**确定性失败**(编码失败、超长帧)即使发生在发送阶段也不重试:
+	// 它们再发一次还是同一个结果,而重试会先删端口文件、再 spawn 一个新 daemon
+	// —— 为一个必然失败的原因干掉一个健康的 daemon,把旧的那个变成孤儿。
+	if !isSendFailure(xerr) || isPermanentFailure(xerr) {
 		return ipc.Response{}, xerr
 	}
 
@@ -274,12 +287,17 @@ func oneShot(endpoint string, req ipc.Request, mustExist bool, timeout, idle tim
 // 新 daemon 把同一个端口文件改写成了自己的地址与 token。重读一次就拿到新的了。
 //
 // 重试仍失败就把原来的 401 原样交上去 —— 那才可能是真的有人在乱连。
-func retryAfterAuthFailure(endpoint string, req ipc.Request, timeout, idle time.Duration) (ipc.Response, error) {
+//
+// mustExist 必须原样传下去:--stop / --status 的约定是「不为了管理操作把 daemon
+// 拉起来」(见 Stop / Status 的注释)。修之前这里写死 false,于是 `--status` 恰好
+// 撞上"读 token 后 daemon 退出"的竞态时,会顺手 spawn 一个新 daemon —— 管理命令
+// 把一个使用者以为已经停了的东西重新启动了。
+func retryAfterAuthFailure(endpoint string, req ipc.Request, timeout, idle time.Duration, mustExist bool) (ipc.Response, error) {
 	info2, err := readEndpoint(endpoint)
 	if err != nil {
 		return ipc.Response{}, fmt.Errorf("client: daemon 鉴权失败,且端口文件已不可读: %w", err)
 	}
-	conn2, err := dial(endpoint, info2.addr, false, idle)
+	conn2, err := dial(endpoint, info2.addr, mustExist, idle)
 	if err != nil {
 		return ipc.Response{}, err
 	}
@@ -363,12 +381,14 @@ func forgetStaleEndpoint(endpoint, addr string) {
 // 「请求送了、响应没读到」(命令可能已经执行,绝不能重放)。两者的底层错误
 // (connection reset)长得一模一样,只能靠**发生位置**判定。
 //
-// **已知边界(2026-10-19 复审指出,本次未修)**:编码失败与 `payload too large`
-// 也是"发送阶段"的失败,但它们**重试必然再失败**;而重试路径会先删端口文件、
-// 再 spawn 一个新 daemon —— 等于为了一个确定会失败的原因干掉一个健康的 daemon。
-// 现状与修前一致(修前也是"非超时一律重试"),不是本次收窄引入的。真要处理,
-// 给这个类型加一个 permanent 标志、让它不进重试分支即可。
-type sendFailure struct{ err error }
+// permanent 是第二个维度:**重试有没有意义**。编码失败与超长帧同样是"一个字节
+// 都没送出去",但它们重试必然再失败 —— 而重试路径会先删端口文件、再 spawn 一个
+// 新 daemon,等于为了一个确定会失败的原因干掉一个健康的 daemon(旧 daemon 变成
+// 孤儿,要等 idle 超时才退)。这类失败必须就地报错。
+type sendFailure struct {
+	err       error
+	permanent bool
+}
 
 func (e *sendFailure) Error() string { return e.err.Error() }
 func (e *sendFailure) Unwrap() error { return e.err }
@@ -377,6 +397,27 @@ func (e *sendFailure) Unwrap() error { return e.err }
 func isSendFailure(err error) bool {
 	var sf *sendFailure
 	return errors.As(err, &sf)
+}
+
+// isPermanentFailure 报告这次失败是不是「重试也不会好」。
+//
+// 只有发送阶段的失败才可能被标成 permanent(读响应阶段根本不该重试)。
+func isPermanentFailure(err error) bool {
+	var sf *sendFailure
+	return errors.As(err, &sf) && sf.permanent
+}
+
+// mayRetryAfterAuth 报告鉴权失败后能否安全重发。
+//
+// **带了流式 stdin 就不能**:第一次 exchange 已经在往连接里灌 os.Stdin,鉴权失败
+// 只说明 daemon 没执行命令,但 stdin 已经被消费掉了(可能全部)。重发会再起一支
+// io.Copy 读同一个 fd —— 两个读取者瓜分同一条输入,第二个 daemon 拿到的是残缺
+// 甚至空的 stdin,而命令照跑不误。那正是「静默给出错值」。
+//
+// 不带 stdin(StdinNone)时重发是安全的:daemon 的鉴权在 op 分派与执行**之前**
+// (daemon.handleConn),401 时它只写回响应就关连接。
+func mayRetryAfterAuth(req ipc.Request) bool {
+	return req.StdinMode != ipc.StdinStream
 }
 
 // exchange 在一条连接上完成一次"写请求 + 读响应"。
@@ -389,10 +430,22 @@ func exchange(conn net.Conn, req ipc.Request, timeout time.Duration) (ipc.Respon
 
 	body, err := ipc.Encode(req)
 	if err != nil {
-		// 编码失败 = 一个字节都没发出去,语义上等同发送失败。
-		return ipc.Response{}, &sendFailure{err: fmt.Errorf("client: 编码请求失败: %w", err)}
+		// 编码失败 = 一个字节都没发出去,语义上等同发送失败;
+		// 但重发同一份 req 会得到同一个错误,所以是 permanent。
+		return ipc.Response{}, &sendFailure{
+			err:       fmt.Errorf("client: 编码请求失败: %w", err),
+			permanent: true,
+		}
 	}
 	if err := ipc.WriteMessage(conn, body); err != nil {
+		if errors.Is(err, ipc.ErrPayloadTooLarge) {
+			// 超长帧:连重试都没有意义,更不该为了它去停掉一个健康的 daemon。
+			return ipc.Response{}, &sendFailure{
+				err: fmt.Errorf("client: 发送请求失败: %w\n"+
+					"         请求超过协议单帧上限,重试不会成功;请缩小脚本,或把它写成文件再执行", err),
+				permanent: true,
+			}
+		}
 		return ipc.Response{}, &sendFailure{err: fmt.Errorf(
 			"client: 发送请求失败: %w\n"+
 				"         命令**未执行**(请求没送达 daemon),可以安全重试", err)}
@@ -408,15 +461,14 @@ func exchange(conn net.Conn, req ipc.Request, timeout time.Duration) (ipc.Respon
 	// 上游永不 EOF 把它卡住也不阻塞主流程。真正必须精确回收的是 daemon 侧那支
 	// (见 daemon.startStdinStream 的 stop)—— 它若不回收,那个会话的队列会被一直占着,
 	// 投给同一个会话的后续命令全部排不上。
+	//
+	// 但它的**源端读错误**不能吞(修于 2026-10-19):stdin 是已关闭的文件、盘上
+	// 读失败之类,会让命令拿到不完整输入却照样 exit 0 —— 正是本项目要消灭的形态。
+	// 写端错误则静默:`yes | head -1` 这类正常用法里,head 退出后灌入端必然报
+	// broken pipe,真 bash 在那里是被 SIGPIPE 静默杀掉的。
+	var pump *stdinPump
 	if req.StdinMode == ipc.StdinStream {
-		go func() {
-			_, _ = io.Copy(conn, os.Stdin)
-			// 写完关写半侧:仍能读响应。Windows 上由 ws2_32.shutdown 实现,
-			// 项目 daemon.Serve 收尾处已在用同一调用。
-			if tc, ok := conn.(*net.TCPConn); ok {
-				_ = tc.CloseWrite()
-			}
-		}()
+		pump = startStdinPump(conn, os.Stdin)
 	}
 
 	raw, err := ipc.ReadMessage(conn)
@@ -427,7 +479,92 @@ func exchange(conn net.Conn, req ipc.Request, timeout time.Duration) (ipc.Respon
 		return ipc.Response{}, fmt.Errorf("client: 读取响应失败: %w\n"+
 			"         请求已送达 daemon,命令**可能已经执行**;请先确认副作用(文件、提交、进程)再决定是否重跑", err)
 	}
-	return ipc.DecodeResponse(raw)
+	resp, derr := ipc.DecodeResponse(raw)
+	if derr != nil {
+		return ipc.Response{}, derr
+	}
+	// stdin 的源端错误作为一行警告带回去:命令本身可能已经成功,但它的输入
+	// 不完整 —— 这件事必须让使用者知道,而不是让退出码替它说话。
+	if perr := pump.err(); perr != nil {
+		resp.Errors = append(resp.Errors, "client: "+perr.Error())
+	}
+	return resp, nil
+}
+
+// stdinPump 是一次流式 stdin 转发的句柄。
+type stdinPump struct {
+	done chan error
+}
+
+// startStdinPump 起一支 goroutine 把 src 灌进 conn。
+//
+// src 是参数而不是直接读 os.Stdin:这个函数的两种失败(源端读错、写端断掉)
+// 语义相反,必须有回归 —— 而 os.Stdin 是全局的,没法在测试里换成可控的读者。
+func startStdinPump(conn net.Conn, src io.Reader) *stdinPump {
+	p := &stdinPump{done: make(chan error, 1)}
+	go func() {
+		// 包一层读端,只为**精确区分源端与目标端的错误**:io.Copy 把两者都返回
+		// 成一个 error,而它们该不该报完全相反(见上面的注释)。
+		rec := &recordingReader{r: src}
+		_, copyErr := io.Copy(conn, rec)
+		// 写完关写半侧:仍能读响应。Windows 上由 ws2_32.shutdown 实现,
+		// 项目 daemon.Serve 收尾处已在用同一调用。
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+		switch {
+		case rec.err != nil:
+			// 源端读失败:输入真的不全,必须报。
+			p.done <- fmt.Errorf("读取 stdin 失败,命令拿到的是不完整输入: %w", rec.err)
+		default:
+			// 其余一律静默,copyErr **和** CloseWrite 的错误都算。
+			//
+			// 为什么 CloseWrite 的失败也不能报:命令不读 stdin 时(例如
+			// `winbash -c 'echo hi'` 配一个管道),daemon 写完响应就立刻
+			// closeConnGracefully,而它的接收缓冲里还有没人读的 stdin ——
+			// 那个 close 会发 RST,于是这边的 CloseWrite 报 WSAECONNRESET(10054)。
+			// 这是一条**完全正常**的路径,响应早就拿到了;把它报成"stdin 转发
+			// 收尾失败"只是在成功命令后面加一行噪音(复审当场指出,原先的
+			// isConnGone 只认 net.ErrClosed,恰好漏掉 Windows 这一个)。
+			//
+			// 写端 broken pipe 同理:`yes | head -1` 里 head 退出后灌入端必然
+			// 收到它,真 bash 在那里是被 SIGPIPE 静默杀掉的。
+			_ = copyErr
+			p.done <- nil
+		}
+	}()
+	return p
+}
+
+// err 非阻塞地取一次转发结果。
+//
+// 为什么非阻塞:命令不读 stdin 而上游仍在灌时(README「流式 stdin」那节),
+// ReadMessage 已经返回而 goroutine 还在流 —— 此时等它就是把一条正常命令
+// 变成挂死。拿不到就当作"没有可报的错误",这正是既有行为。
+func (p *stdinPump) err() error {
+	if p == nil {
+		return nil
+	}
+	select {
+	case err := <-p.done:
+		return err
+	default:
+		return nil
+	}
+}
+
+// recordingReader 记下**源端**的读失败,供 stdin 转发结束后汇报。
+type recordingReader struct {
+	r   io.Reader
+	err error
+}
+
+func (rr *recordingReader) Read(p []byte) (int, error) {
+	n, err := rr.r.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		rr.err = err
+	}
+	return n, err
 }
 
 // dialAddr 决定往哪个地址连。mustExist 时只读端口文件,绝不拉起新 daemon。

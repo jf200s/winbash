@@ -3,12 +3,15 @@ package client
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"winbash/internal/ipc"
 )
 
 // 本文件补的是"凭据读取"与"陈旧端口文件的删除条件"这两段 —— 纯文件级、不需要 daemon。
@@ -220,3 +223,129 @@ type timeoutError struct{}
 func (timeoutError) Error() string   { return "i/o timeout" }
 func (timeoutError) Timeout() bool   { return true }
 func (timeoutError) Temporary() bool { return true }
+
+// permanent 是「重试有没有意义」那一维。两类确定性失败必须被标出来:
+// 编码失败、超长帧 —— 它们一个字节都没送出去,但重发还是同一个结果,
+// 而重试会先删端口文件、再 spawn 一个新 daemon,把健康的那个变成孤儿。
+func TestIsPermanentFailureOnlyForDeterministicSends(t *testing.T) {
+	enc := &sendFailure{err: errors.New("encode"), permanent: true}
+	if !isPermanentFailure(enc) {
+		t.Fatal("编码失败应当被标成 permanent")
+	}
+	if !isSendFailure(enc) {
+		t.Fatal("编码失败同时仍是发送阶段失败(两个维度独立)")
+	}
+
+	// 连接重置:可重试,不该是 permanent。
+	reset := &sendFailure{err: errors.New("wsarecv: reset")}
+	if isPermanentFailure(reset) {
+		t.Fatal("连接重置不是确定性失败")
+	}
+	// 读响应失败:连 permanent 都谈不上(它根本不进重试分支)。
+	read := errors.New("read failed")
+	if isPermanentFailure(read) {
+		t.Fatal("普通错误不是 permanent")
+	}
+	if isPermanentFailure(nil) {
+		t.Fatal("nil 不是 permanent")
+	}
+}
+
+// 鉴权失败后能不能自动重发,唯一的判据是「stdin 有没有已经被第一条连接消费」。
+//
+// 带流式 stdin 时重发会再起一支 io.Copy 读同一个 fd:两个读取者瓜分同一条输入,
+// 第二个 daemon 拿到残缺甚至空的 stdin,而命令照跑 —— 静默给出错值。
+func TestMayRetryAfterAuthRefusesStreamStdin(t *testing.T) {
+	if !mayRetryAfterAuth(ipc.Request{}) {
+		t.Fatal("没有 stdin 时应当允许重发(daemon 的鉴权在执行之前)")
+	}
+	if !mayRetryAfterAuth(ipc.Request{StdinMode: ipc.StdinNone}) {
+		t.Fatal("StdinNone 时应当允许重发")
+	}
+	if mayRetryAfterAuth(ipc.Request{StdinMode: ipc.StdinStream}) {
+		t.Fatal("流式 stdin 已被消费,绝不能自动重发")
+	}
+}
+
+// 源端读失败必须报出来:命令拿到的是不完整输入,却可能照样 exit 0 ——
+// 那正是「静默给出错值」。
+func TestStdinPumpReportsSourceReadError(t *testing.T) {
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	defer peer.Close()
+	go func() { _, _ = io.Copy(io.Discard, peer) }() // 对端持续读,让写往前走
+
+	src := errReader{err: errors.New("disk on fire")}
+	p := startStdinPump(conn, src)
+
+	select {
+	case err := <-p.done:
+		if err == nil {
+			t.Fatal("源端读失败必须报错")
+		}
+		if !strings.Contains(err.Error(), "不完整输入") {
+			t.Errorf("错误信息应当说明输入不完整, got %q", err.Error())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pump 没有在 5s 内结束")
+	}
+}
+
+// 写端断掉必须**静默**:`yes | head -1` 就是这么走的 —— head 退出后连接被关,
+// 灌入端必然报 broken pipe,而真 bash 在那里是被 SIGPIPE 静默杀掉的。
+// 把它报出来会把一条正常命令变成一堆噪音。
+func TestStdinPumpStaysQuietOnBrokenPipe(t *testing.T) {
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	// 立刻关掉对端:任何写都会失败。
+	peer.Close()
+
+	p := startStdinPump(conn, strings.NewReader("data that nobody will read"))
+
+	select {
+	case err := <-p.done:
+		if err != nil {
+			t.Fatalf("写端断掉应当静默, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("pump 没有在 5s 内结束")
+	}
+}
+
+// err() 必须非阻塞:命令不读 stdin 而上游仍在灌时,等它就等于让一条正常命令挂死。
+func TestStdinPumpErrDoesNotBlock(t *testing.T) {
+	conn, peer := net.Pipe()
+	defer conn.Close()
+	defer peer.Close()
+	go func() { _, _ = io.Copy(io.Discard, peer) }()
+
+	pr, pw := io.Pipe() // 永不 eof,除非我们关
+	defer pw.Close()
+
+	p := startStdinPump(conn, pr)
+	if err := p.err(); err != nil {
+		t.Fatalf("还在流的时候不该有错误, got %v", err)
+	}
+	// 再调一次也不该阻塞(第二次 channel 已空)。
+	if err := p.err(); err != nil {
+		t.Fatalf("第二次取也应当返回 nil, got %v", err)
+	}
+}
+
+// recordingReader 只记非 EOF 的错误 —— EOF 是正常结束,记下来会把每条
+// 正常管道都变成警告。
+func TestRecordingReaderIgnoresEOF(t *testing.T) {
+	r := &recordingReader{r: strings.NewReader("")}
+	buf := make([]byte, 4)
+	if _, err := r.Read(buf); !errors.Is(err, io.EOF) {
+		t.Fatalf("应当返回 EOF, got %v", err)
+	}
+	if r.err != nil {
+		t.Fatalf("EOF 不该被记下来, got %v", r.err)
+	}
+}
+
+// errReader 是一个立刻返回错误的读者。
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }

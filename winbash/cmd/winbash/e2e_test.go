@@ -1023,3 +1023,39 @@ func countNonEmptyLines(path string) int {
 	}
 	return n
 }
+
+// TestStreamStdinOnCommandThatIgnoresItStaysQuiet 钉住「不读 stdin 的命令不该有噪音」。
+//
+// 这是一条**修 bug 引入、又当场被复审抓出来**的路径:stdin 转发收尾时
+// CloseWrite 会失败,而失败原因是 Windows 的 WSAECONNRESET —— daemon 写完响应
+// 就关连接,它的接收缓冲里还有没人读的 stdin,close 于是发 RST。那是一条完全
+// 正常的路径(命令根本没打算读 stdin),把它的错误报成「stdin 转发收尾失败」
+// 等于在成功命令后面加一行假警告。
+//
+// 判据是 stderr 必须**完全干净**。灌 64KB 是为了让 daemon 的接收缓冲里确实
+// 有没被读走的数据 —— 小输入可能恰好全被内核吞掉,那样这条用例的鉴别力就没了。
+//
+// **鉴别力的诚实说明**:这条用例对「把 CloseWrite 错误报出来」那个变异**不敏感**
+// —— 实测本机这条路径上 CloseWrite 并不失败(2026-10-19,`head -c 65536 | …`
+// 配 `echo done`,变异版也没打出警告)。所以复审那条担忧是源码层面的推断,不是
+// 可复现的缺陷。保留这条用例的理由是它钉的是**结果**:不读 stdin 的正常命令
+// stderr 必须干净 —— 将来谁在这一带加日志/警告,它会立刻红。
+func TestStreamStdinOnCommandThatIgnoresItStaysQuiet(t *testing.T) {
+	exe := buildWinbash(t)
+	endpoint := benchEndpoint(t)
+	t.Cleanup(func() { stopAndWait(t, exe, endpoint) })
+
+	cmd := exec.Command(exe, "--endpoint", endpoint, "-c", "echo done")
+	cmd.Stdin = strings.NewReader(strings.Repeat("x", 64<<10))
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("命令失败: %v\nstdout=%q stderr=%q", err, stdout.String(), stderr.String())
+	}
+	if got := strings.TrimSpace(stdout.String()); got != "done" {
+		t.Fatalf("stdout = %q", got)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("不读 stdin 的正常命令不该有 stderr, got %q", stderr.String())
+	}
+}
