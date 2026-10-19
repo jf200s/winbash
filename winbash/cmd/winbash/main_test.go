@@ -136,6 +136,23 @@ func TestUnknownFlagIsAUsageError(t *testing.T) {
 // 这比"忽略一个"严重得多:使用者想停掉 daemon,结果把自己挂在一个前台 daemon 上。
 // 两个开关都在手边、以为可以一起给,是最容易踩的一种。
 func TestControlFlagsAreMutuallyExclusive(t *testing.T) {
+	// 守卫:本用例曾经**不带 `--endpoint`** 跑过 `--stop`。不带就用 defaultEndpoint(),
+	// 也就是调用者正在用的那个 daemon —— 而本包经常在 winbash 会话里被跑(README
+	// 「开发」节)。那时这条 --stop 会把承载 `go test` 自己的 daemon 停掉:表现是
+	// `go test ./...` 只输出前几个包就断流、会话里的变量 / set -e / trap 一起没,
+	// 而本用例照样 PASS。所以这里快照默认端点,结束时要求它**原样不动**。
+	//
+	// 这条守卫只在「默认端点正被某个 daemon 使用」时才有鉴别力(CI 上通常没有),
+	// 但它恰好覆盖出事的那台机器:开发机上跑测试时 daemon 是常驻的。
+	defaultEP := defaultEndpoint()
+	before, beforeErr := os.ReadFile(defaultEP)
+	t.Cleanup(func() {
+		after, afterErr := os.ReadFile(defaultEP)
+		if (beforeErr == nil) != (afterErr == nil) || !bytes.Equal(before, after) {
+			t.Errorf("本用例改动了默认端点 %s:管理开关必须带 --endpoint,否则会停掉调用者自己的 daemon", defaultEP)
+		}
+	})
+
 	combos := [][]string{
 		{"--serve", "--stop"},
 		{"--serve", "--status"},
@@ -154,8 +171,11 @@ func TestControlFlagsAreMutuallyExclusive(t *testing.T) {
 		}
 	}
 	// 单独给的时候不能被误伤。
+	//
+	// 每条都显式指向**不存在的临时端点**:--stop / --status 在那种端点上返回 1
+	// (不是 2),正好够验证「单独给不是用法错误」这件事,又不会碰到任何真实 daemon。
 	for _, ctl := range []string{"--stop", "--status"} {
-		if code, _, errOut := runCLI(t, ctl); code == 2 {
+		if code, _, errOut := runCLI(t, ctl, "--endpoint", tmpEndpoint(t)); code == 2 {
 			t.Errorf("单独 %s 不该是用法错误,stderr=%q", ctl, errOut)
 		}
 	}
