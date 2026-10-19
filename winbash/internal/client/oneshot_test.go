@@ -276,3 +276,71 @@ func TestAuthRetryRespectsMustExist(t *testing.T) {
 		t.Fatalf("端口文件被删了 —— 说明 mustExist 没传到 dial,重试走了会 spawn 的那条路: %v", statErr)
 	}
 }
+
+// ⑥ dial 必须返回「实际连上的是哪个 daemon」。
+//
+// 这是 W1 的修复点。旧实现只返回 conn:旧地址连不上时,它内部会换一个 daemon
+// (ensureDaemonExcept 可能读到别人刚写好的新端口文件),而调用方手里还是旧 token
+// —— 拿旧 token 连新 daemon,必然 401。带流式 stdin 时那条 401 救不回来
+// (stdin 已被消费),本来能成功的调用就变成失败。
+//
+// 构造手法完全不碰 spawn:
+//   - 传给 dial 的 info 指向一个**死地址**(端口被占过又放掉,连不上);
+//   - 端口文件里写的是**另一个**活着的假 daemon 的地址与 token;
+//   - dial 连死地址失败 → forgetStaleEndpoint 因为"文件第一行不是死地址"而不删
+//     → ensureDaemonExcept 读到活地址且它不是 deadAddr → 信任并直接返回
+//     —— 不会 spawn,所以这条用例毫秒级完成,不会干等 startupBudget(20s)。
+func TestDialReturnsTheEndpointItActuallyConnectedTo(t *testing.T) {
+	live := startFakeDaemon(t, func(conn net.Conn, seq int) {
+		defer conn.Close()
+		req := readRequest(t, conn)
+		// 把收到的 token 回显出来,断言用的就是它。
+		reply(t, conn, ipc.Response{OK: true, Out: []byte(req.Token)})
+	})
+
+	// 造一个"死地址":先占住一个端口再放掉,之后连它必定被拒。
+	dead := deadAddr(t)
+
+	endpoint := filepath.Join(t.TempDir(), "w1.port")
+	// 端口文件指向活 daemon —— 注意它与传给 dial 的死的 info 不是同一个。
+	writePortFile(t, endpoint, live.addr, "live-token")
+
+	conn, used, err := dial(endpoint, endpointInfo{addr: dead, token: "stale-token"}, false, 0)
+	if err != nil {
+		t.Fatalf("dial 应当回落到端口文件里的活地址, got %v", err)
+	}
+	defer conn.Close()
+
+	if used.addr != live.addr {
+		t.Fatalf("返回的 addr = %q,期望活 daemon 的 %q", used.addr, live.addr)
+	}
+	if used.token != "live-token" {
+		t.Fatalf("返回的 token = %q,期望 %q —— 旧实现只返回 conn,调用方会继续用死地址那个 token",
+			used.token, "live-token")
+	}
+
+	// 端到端确认:用它回填的 token 能通过鉴权(假 daemon 只是把它回显出来)。
+	req := ipc.Request{Script: "echo hi", Token: used.token}
+	resp, xerr := exchange(conn, req, 5*time.Second)
+	if xerr != nil {
+		t.Fatalf("用回填的 token 发请求失败: %v", xerr)
+	}
+	if string(resp.Out) != "live-token" {
+		t.Fatalf("假 daemon 收到的 token = %q,期望 live-token", resp.Out)
+	}
+}
+
+// deadAddr 返回一个「刚刚还开着、现在已经关掉」的本地地址。
+//
+// 用它而不是 "127.0.0.1:1":后者在部分 Windows 环境上是 SYN 超时(要等满
+// dialTimeout),而刚关闭的端口会立刻回 RST,用例能毫秒级结束。
+func deadAddr(t *testing.T) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("占位 listener 建不起来: %v", err)
+	}
+	addr := ln.Addr().String()
+	_ = ln.Close()
+	return addr
+}

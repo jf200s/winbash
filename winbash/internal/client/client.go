@@ -194,16 +194,20 @@ func oneShot(endpoint string, req ipc.Request, mustExist bool, timeout, idle tim
 	if err != nil {
 		return ipc.Response{}, err
 	}
-	req.Token = info.token
+	// Token 不在这里设:dial 可能因为旧地址连不上而顺手拉一个新 daemon,
+	// 那时 token 会变。等 dial 返回「实际连上的是谁」之后再设(见下面)。
 	if timeout > 0 {
 		// daemon 侧也要知道上限:client 放弃不代表它该继续跑(见 ipc.Request.TimeoutMS)。
 		req.TimeoutMS = int(timeout / time.Millisecond)
 	}
 
-	conn, err := dial(endpoint, info.addr, mustExist, idle)
+	conn, used, err := dial(endpoint, info, mustExist, idle)
 	if err != nil {
 		return ipc.Response{}, err
 	}
+	// dial 可能换了 daemon(旧地址连不上,它顺手拉了一个新的)。连上哪个就用哪个的
+	// token —— 否则会拿旧 token 去连新 daemon,必然 401(见 dial 的注释)。
+	req.Token = used.token
 
 	resp, xerr := exchange(conn, req, timeout)
 	conn.Close()
@@ -269,12 +273,12 @@ func oneShot(endpoint string, req ipc.Request, mustExist bool, timeout, idle tim
 	if aerr != nil {
 		return ipc.Response{}, xerr
 	}
-	conn2, derr := dial(endpoint, info2.addr, false, idle)
+	conn2, used2, derr := dial(endpoint, info2, false, idle)
 	if derr != nil {
 		return ipc.Response{}, xerr
 	}
 	defer conn2.Close()
-	req.Token = info2.token
+	req.Token = used2.token
 	return exchange(conn2, req, timeout)
 }
 
@@ -297,12 +301,12 @@ func retryAfterAuthFailure(endpoint string, req ipc.Request, timeout, idle time.
 	if err != nil {
 		return ipc.Response{}, fmt.Errorf("client: daemon 鉴权失败,且端口文件已不可读: %w", err)
 	}
-	conn2, err := dial(endpoint, info2.addr, mustExist, idle)
+	conn2, used, err := dial(endpoint, info2, mustExist, idle)
 	if err != nil {
 		return ipc.Response{}, err
 	}
 	defer conn2.Close()
-	req.Token = info2.token
+	req.Token = used.token
 	resp, xerr := exchange(conn2, req, timeout)
 	if xerr != nil {
 		return ipc.Response{}, xerr
@@ -319,16 +323,24 @@ func isTimeout(err error) bool {
 	return errors.As(err, &ne) && ne.Timeout()
 }
 
-// dial 建立到 addr 的连接;mustExist 时连不上就直接报"没在运行"。
+// dial 建立到 info.addr 的连接,并返回**这次连接实际对应的**端点信息。
 //
-// idle 只在"端口文件指向的 daemon 已经不在了、得重新拉一个"时才用得上。
-func dial(endpoint, addr string, mustExist bool, idle time.Duration) (net.Conn, error) {
-	conn, err := net.DialTimeout("tcp", addr, dialTimeout)
+// 为什么返回值里要有 endpointInfo(修于 2026-10-19):旧地址连不上时,dial 会顺手
+// 拉起一个新 daemon —— 那个 daemon 的 token 与调用方手里的**不一样**。而调用方
+// 在 dial 之前就把 `req.Token = info.token` 设好了,于是它拿着旧 token 去连新 daemon,
+// 必然 401。没带 stdin 时这条 401 还能被 retryAfterAuthFailure 救回来(多一次往返);
+// 带流式 stdin 时救不回来(stdin 已被第一条连接消费),于是本来能成功的调用变成失败。
+//
+// 返回实际使用的 info,调用方据此覆盖 token,窗口就没了。
+//
+// mustExist=true 时不 spawn,返回值就是传进来的 info 本身。
+func dial(endpoint string, info endpointInfo, mustExist bool, idle time.Duration) (net.Conn, endpointInfo, error) {
+	conn, err := net.DialTimeout("tcp", info.addr, dialTimeout)
 	if err == nil {
-		return conn, nil
+		return conn, info, nil
 	}
 	if mustExist {
-		return nil, fmt.Errorf("client: daemon 没在运行(端口文件 %s 指向的地址连不上)", endpoint)
+		return nil, endpointInfo{}, fmt.Errorf("client: daemon 没在运行(端口文件 %s 指向的地址连不上)", endpoint)
 	}
 	// 端口文件指向的 daemon 已经不在了。清掉陈旧端口再拉一次。
 	//
@@ -337,16 +349,17 @@ func dial(endpoint, addr string, mustExist bool, idle time.Duration) (net.Conn, 
 	// "读到了就信任",拿回来的还是刚才连不上的同一个地址 —— 两条命令之间
 	// 一步也没前进。带 deadAddr 进去,它才会真的重新 spawn 一个 daemon,
 	// 由新 daemon 的 WriteFile 覆盖写那份残留文件。
-	forgetStaleEndpoint(endpoint, addr)
-	info, aerr := ensureDaemonExcept(endpoint, addr, idle)
+	forgetStaleEndpoint(endpoint, info.addr)
+	info2, aerr := ensureDaemonExcept(endpoint, info.addr, idle)
 	if aerr != nil {
-		return nil, aerr
+		return nil, endpointInfo{}, aerr
 	}
-	conn, err = net.DialTimeout("tcp", info.addr, dialTimeout)
+	conn, err = net.DialTimeout("tcp", info2.addr, dialTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("client: 连接 daemon 失败: %w", err)
+		return nil, endpointInfo{}, fmt.Errorf("client: 连接 daemon 失败: %w", err)
 	}
-	return conn, nil
+	// 连上的是 info2 那个 daemon —— token 也必须换成它的。
+	return conn, info2, nil
 }
 
 // forgetStaleEndpoint 只在端口文件**仍然指向 addr** 时才删它。

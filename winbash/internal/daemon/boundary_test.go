@@ -11,6 +11,7 @@ package daemon
 
 import (
 	"encoding/binary"
+	"errors"
 	"net"
 	"os"
 	"strconv"
@@ -348,5 +349,128 @@ func TestNamedSessionLimitIsReportedAndStatusListsSessions(t *testing.T) {
 	if !strings.Contains(out, "sessions="+strconv.Itoa(wantTotal)+" ") {
 		t.Fatalf("sessions= 计数不对(应当是 %d = %d 具名 + 1 默认):\n%s",
 			wantTotal, maxSessions, out)
+	}
+}
+
+// ★ 未鉴权的**管理命令**同样必须被拒,而且被拒之后 daemon 必须还活着。
+//
+// 为什么单独一条:已有 TestRequestWithoutTokenIsRejected 只覆盖了 `op:""`(执行脚本)。
+// 而注释里那句「实测裸 socket 发 {"op":"stop"} 就能把别人的 daemon 打停」讲的正是
+// op 分派**之前**的那道鉴权 —— 阻的是**管理能力**,不只是执行能力。这条断言若被
+// 挪到 op 分派之后,执行路径的用例照样全绿,而任何人仍能把 daemon 打停。
+//
+// status 一并测:它只读信息,但同样是"以 daemon 的身份"回答 —— 会话名、cwd、
+// 引擎状态都在里面,不该给外人看。
+func TestUnauthenticatedManagementOpsAreRejected(t *testing.T) {
+	ep := startDaemon(t, DefaultReadTimeout)
+	_, token := readEndpointFile(t, ep)
+
+	cases := []struct {
+		name string
+		req  ipc.Request
+	}{
+		{"无 token 的 stop", ipc.Request{Op: "stop"}},
+		{"错 token 的 stop", ipc.Request{Op: "stop", Token: "not-the-real-one"}},
+		{"无 token 的 status", ipc.Request{Op: "status"}},
+		{"错 token 的 status", ipc.Request{Op: "status", Token: "not-the-real-one"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			resp, err := rawRequest(t, ep, c.req)
+			if err != nil {
+				t.Fatalf("应当明确拒绝(而不是直接断连接,那样调用方分不清"+
+					"\"鉴权失败\"和\"daemon 崩了\"): %v", err)
+			}
+			if resp.OK {
+				t.Fatalf("OK=true,说明放行了: %+v", resp)
+			}
+			if !resp.Auth {
+				t.Fatalf("应当标记成鉴权失败, got %+v", resp)
+			}
+			if len(resp.Out) > 0 {
+				t.Fatalf("被拒的管理命令不该带回任何信息(那本身就是泄漏): %q", resp.Out)
+			}
+		})
+	}
+
+	// 最关键的一条:四条拒绝之后 daemon 必须还在服务。
+	// 若 stop 真的被执行了,这里会连不上 —— 而**前四条会全部通过**,
+	// 只是因为它们都"被拒绝了"。
+	resp, err := rawRequest(t, ep, ipc.Request{Proto: ipc.ProtoVersion, Token: token, Script: "echo STILL-HERE"})
+	if err != nil {
+		t.Fatalf("鉴权被拒之后 daemon 不再服务(它多半已经被未鉴权的 stop 打停了): %v", err)
+	}
+	if !resp.OK || !strings.Contains(string(resp.Out), "STILL-HERE") {
+		t.Fatalf("daemon 状态异常: %+v", resp)
+	}
+}
+
+// ★ 帧长度边界:0 长度与超上限都必须被拒,且 daemon 不能被打死。
+//
+// 这两个值在 daemon.handleConn 里走的是 ipc.ReadMessage 的同一个判断
+// (`n == 0 || n > maxMessageBytes`),但那是**单元**层面的。端到端要证明的是
+// 另一件事:daemon 收到这种帧之后**不会**把它当成一条 0 字节或超大请求往下跑,
+// 也不会因此挂住或退出。
+//
+// 构造时要只写帧头、不写 payload:超上限那种如果真写 64 MiB 出来,用例会白白
+// 慢一大截,而 daemon 在读头之后就该拒绝。
+func TestFrameLengthBoundariesAreRejected(t *testing.T) {
+	ep := startDaemon(t, DefaultReadTimeout)
+	addr, token := readEndpointFile(t, ep)
+
+	for _, c := range []struct {
+		name string
+		n    uint32
+	}{
+		{"0 长度", 0},
+		{"超上限(64MiB+1)", (64 << 20) + 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+			// **不设** 5s 读 deadline:那会让「daemon 挂住」伪装成「有结论」——
+			// 超时也是 error,而下面的 select 只关心"有没有返回"。修之前正是这样:
+			// 5s deadline 先到期,外层 10s 保护分支永远走不到,测试对挂死是假绿。
+			// 现在只留外层 select 当兜底,并且断言拿到的必须是**连接被关**而不是超时。
+
+			var hdr [4]byte
+			binary.LittleEndian.PutUint32(hdr[:], c.n)
+			if _, err := conn.Write(hdr[:]); err != nil {
+				t.Fatalf("写帧头: %v", err)
+			}
+
+			// 必须**立刻**有结论:daemon 读完 4 字节帧头就该判定这帧不可用并关连接。
+			// 判据是拿到 EOF,而不是"随便什么错误"——后者把超时也算进去,
+			// 而超时恰恰是"daemon 没在拒绝、只是没反应"的形态。
+			done := make(chan error, 1)
+			go func() {
+				_, rerr := ipc.ReadMessage(conn)
+				done <- rerr
+			}()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("daemon 居然回了一个响应 —— 坏帧不该被当成一条正常请求")
+				}
+				var ne net.Error
+				if errors.As(err, &ne) && ne.Timeout() {
+					t.Fatal("读等了整整 10s 才超时 —— daemon 没拒绝这个坏帧,只是没反应")
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("坏帧让连接挂住了:它必须立刻有结论")
+			}
+		})
+	}
+
+	// daemon 必须还活着,而且能正常执行。
+	resp, err := rawRequest(t, ep, ipc.Request{Proto: ipc.ProtoVersion, Token: token, Script: "echo ALIVE"})
+	if err != nil {
+		t.Fatalf("帧长度边界之后 daemon 不再服务: %v", err)
+	}
+	if !resp.OK || !strings.Contains(string(resp.Out), "ALIVE") {
+		t.Fatalf("帧长度边界之后 daemon 状态异常: %+v", resp)
 	}
 }
