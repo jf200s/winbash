@@ -2,6 +2,8 @@ package client
 
 import (
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -176,3 +178,45 @@ func TestServeArgsForwardsIdle(t *testing.T) {
 		}
 	})
 }
+
+// isSendFailure 是「能不能安全重试」的唯一判据,所以它本身要有回归。
+//
+// 两个方向都要钉住:
+//   - 发送阶段失败 → true(请求没送出去,daemon 不会执行);
+//   - 读响应失败   → false(请求已送达,命令可能已经跑了)。
+//
+// 第二个方向是最要紧的那条:把它判成 true 就等于恢复旧的「非超时一律重放」,
+// 而同一条脚本跑两遍正是本项目反复在消灭的失败形态。
+func TestIsSendFailureDistinguishesSendFromRead(t *testing.T) {
+	send := &sendFailure{err: errors.New("wsarecv: connection reset")}
+	if !isSendFailure(send) {
+		t.Fatal("发送阶段的失败必须被判为可安全重试")
+	}
+	// 包了一层也要能认出来(errors.As 的意义)。
+	if !isSendFailure(fmt.Errorf("wrapped: %w", send)) {
+		t.Fatal("包装过的发送失败同样要认出来")
+	}
+
+	// 读响应失败是普通 error —— 绝不能当成可重试。
+	read := errors.New("wsarecv: An existing connection was forcibly closed by the remote host")
+	if isSendFailure(read) {
+		t.Fatal("读响应失败不是发送失败:判 true 会让脚本被重放")
+	}
+	if isSendFailure(nil) {
+		t.Fatal("nil 不该被当成发送失败")
+	}
+
+	// 超时走的是另一条判据(isTimeout),但它可能出现在任一阶段;
+	// 这里只确认两条判据互不吞掉:超时错误不会被 isSendFailure 误判。
+	timeout := &net.OpError{Op: "read", Err: &timeoutError{}}
+	if isSendFailure(timeout) {
+		t.Fatal("裸超时不是发送失败")
+	}
+}
+
+// timeoutError 是最小的 net.Error 实现,给上面那条分类测试用。
+type timeoutError struct{}
+
+func (timeoutError) Error() string   { return "i/o timeout" }
+func (timeoutError) Timeout() bool   { return true }
+func (timeoutError) Temporary() bool { return true }

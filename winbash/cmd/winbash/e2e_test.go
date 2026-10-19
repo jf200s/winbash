@@ -928,3 +928,98 @@ func TestPwshScriptWithParamBlockAcrossProcesses(t *testing.T) {
 func shellPathArg(path string) string {
 	return "'" + filepath.ToSlash(path) + "'"
 }
+
+// TestDaemonKilledMidFlightDoesNotReplayTheScript 钉住 2026-10-19 收窄的重试判据。
+//
+// 请求帧**已经完整送出**之后连接断掉,client 绝不能重放脚本:
+//   - 那会让同一条脚本跑两遍(与「超时绝不重放」要消灭的是同一个失败形态);
+//   - 而且第二遍打在新拉起的 daemon 上,旧 daemon 那份可能还在跑 —— daemon 没有
+//     Job Object,它派生的子进程不会跟着退出,于是两个副本并发执行。
+//
+// 构造:后台发一条「先写标记、再 sleep」的命令,等标记出现(证明它真的开始执行了),
+// 然后强杀 daemon。判据是标记文件的行数:
+//   - 修后:1 行 —— client 不重放,直接报「命令可能已经执行」;
+//   - 修前:2 行 —— 重拉 daemon 又跑了一遍(这条用例就是为它写的,变异验证见提交信息)。
+//
+// 为什么必须端到端:重放发生在 client 与 daemon 的**连接生命周期**上,包内测试
+// 看不见「杀掉之后谁又拉起了一个 daemon」。
+func TestDaemonKilledMidFlightDoesNotReplayTheScript(t *testing.T) {
+	exe := buildWinbash(t)
+	endpoint := benchEndpoint(t)
+	t.Cleanup(func() { stopAndWait(t, exe, endpoint) })
+
+	if out, code := runWinbash(t, exe, endpoint, "-c", "echo warm"); code != 0 {
+		t.Fatalf("预热失败 exit=%d out=%q", code, out)
+	}
+	pid := pidFromStatus(t, mustStatus(t, exe, endpoint))
+
+	marker := filepath.Join(t.TempDir(), "replay.marker")
+	// sleep 3 而不是更长:修前那条路会重跑脚本、等它跑完才返回,3s 足够在变异
+	// 验证里看出差别,又不至于让正常路径白等。
+	script := "echo RUN >> " + shellPathArg(marker) + "; sleep 3"
+	cmd := exec.Command(exe, "--endpoint", endpoint, "--timeout", "30s", "-c", script)
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("启动被测命令失败: %v", err)
+	}
+	// 兜底:万一 client 卡住,别让整个包挂到 go test 的默认超时。
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+
+	waitForFile(t, marker, 15*time.Second)
+
+	// 强杀 daemon —— 模拟被 taskkill / 崩溃 / 机器资源回收。
+	taskkillPID(t, pid)
+
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("杀掉 daemon 之后 client 20s 还没返回")
+	}
+
+	// 给「重放」留出落地时间:修前那条路会在新 daemon 上重新执行、立刻写出第二行。
+	time.Sleep(1500 * time.Millisecond)
+
+	if n := countNonEmptyLines(marker); n != 1 {
+		t.Fatalf("标记文件里有 %d 行(期望 1 行)—— 脚本被重放了;输出: %q", n, out.String())
+	}
+
+	msg := out.String()
+	// 文案要能让人/AI 做决定:是「放心重跑」还是「先去确认副作用」。
+	if !strings.Contains(msg, "可能已经执行") {
+		t.Errorf("错误信息应当说明命令可能已经执行,实际: %q", msg)
+	}
+	if strings.Contains(msg, "未执行") {
+		t.Errorf("读响应失败却被说成「命令未执行」—— 那会诱导调用方放心重跑: %q", msg)
+	}
+	if code := cmd.ProcessState.ExitCode(); code != 1 {
+		t.Errorf("exit=%d,期望 1", code)
+	}
+}
+
+// taskkillPID 强杀一个 pid。用 taskkill 而不是 Process.Kill:后者只能杀我们自己
+// 启动的子进程,而 daemon 是 client 拉起的,测试进程与它没有父子关系。
+func taskkillPID(t *testing.T, pid int) {
+	t.Helper()
+	out, err := exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid)).CombinedOutput()
+	if err != nil {
+		t.Fatalf("强杀 daemon(pid=%d)失败: %v\n%s", pid, err, out)
+	}
+}
+
+// countNonEmptyLines 数文件里非空行的数量(文件不存在算 0)。
+func countNonEmptyLines(path string) int {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, ln := range strings.Split(string(b), "\n") {
+		if strings.TrimSpace(ln) != "" {
+			n++
+		}
+	}
+	return n
+}

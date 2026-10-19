@@ -228,8 +228,28 @@ func oneShot(endpoint string, req ipc.Request, mustExist bool, timeout, idle tim
 		return ipc.Response{}, xerr
 	}
 
-	// 剩下这类才是"半路上掉了":连接被重置、daemon 刚被杀。这种请求**极可能没送达**,
-	// 重试一次是「从偶发竞态里恢复」和「不在真故障上打转」之间的中点。
+	// ★ 只有**发送阶段**的失败才重试(2026-10-19 收窄)。
+	//
+	// 修之前这里对"非超时"一律重试,注释写的是「这种请求**极可能没送达**」。那句话
+	// 对 `WriteMessage` 失败成立,对 `ReadMessage` 失败**不成立**:能走到读响应这一步,
+	// 说明请求帧已经完整写出去了,daemon 可能已经读完、投进会话队列、甚至跑完了脚本。
+	// 那时再重拉一个 daemon 原样重跑,就是同一条脚本跑两遍 —— 与上面「超时绝不重放」
+	// 想消灭的是同一个失败形态,只是入口不同。
+	//
+	// 更要紧的是重放会打到**新** daemon 上(见下面的 ensureDaemonExcept),而旧 daemon
+	// 可能还活着、脚本正在它身上跑;daemon 没有 Job Object,它派生的子进程也不会跟着
+	// 退出 —— 于是新旧两个副本**并发**跑同一条脚本。
+	//
+	// 所以:发送失败 → 请求没送出去,重试安全;读响应失败 → 请求已送达,不重放,
+	// 由调用方决定要不要重跑(错误文案里会说清"命令可能已执行")。
+	if !isSendFailure(xerr) {
+		return ipc.Response{}, xerr
+	}
+
+	// 剩下这类才是"半路上掉了":连接被重置、daemon 刚被杀。请求帧没能完整写出,
+	// 所以 daemon 那边要么没读到、要么读到一半就放弃执行(daemon.handleConn 在
+	// ReadMessage 失败时直接关连接)。重试一次是「从偶发竞态里恢复」和
+	// 「不在真故障上打转」之间的中点。
 	forgetStaleEndpoint(endpoint, info.addr)
 	// 同样要带 deadAddr:删不掉的残留文件会让 ensureDaemon 把死地址再交回来。
 	info2, aerr := ensureDaemonExcept(endpoint, info.addr, idle)
@@ -337,6 +357,28 @@ func forgetStaleEndpoint(endpoint, addr string) {
 	}
 }
 
+// sendFailure 标明这次失败发生在**请求写出**阶段。
+//
+// 它存在只为一件事:让 oneShot 能区分「请求没送出去」(可以安全重试)与
+// 「请求送了、响应没读到」(命令可能已经执行,绝不能重放)。两者的底层错误
+// (connection reset)长得一模一样,只能靠**发生位置**判定。
+//
+// **已知边界(2026-10-19 复审指出,本次未修)**:编码失败与 `payload too large`
+// 也是"发送阶段"的失败,但它们**重试必然再失败**;而重试路径会先删端口文件、
+// 再 spawn 一个新 daemon —— 等于为了一个确定会失败的原因干掉一个健康的 daemon。
+// 现状与修前一致(修前也是"非超时一律重试"),不是本次收窄引入的。真要处理,
+// 给这个类型加一个 permanent 标志、让它不进重试分支即可。
+type sendFailure struct{ err error }
+
+func (e *sendFailure) Error() string { return e.err.Error() }
+func (e *sendFailure) Unwrap() error { return e.err }
+
+// isSendFailure 报告失败是否发生在发送阶段(含编码失败 —— 那种情况一个字节都没出去)。
+func isSendFailure(err error) bool {
+	var sf *sendFailure
+	return errors.As(err, &sf)
+}
+
 // exchange 在一条连接上完成一次"写请求 + 读响应"。
 func exchange(conn net.Conn, req ipc.Request, timeout time.Duration) (ipc.Response, error) {
 	if timeout > 0 {
@@ -347,10 +389,13 @@ func exchange(conn net.Conn, req ipc.Request, timeout time.Duration) (ipc.Respon
 
 	body, err := ipc.Encode(req)
 	if err != nil {
-		return ipc.Response{}, err
+		// 编码失败 = 一个字节都没发出去,语义上等同发送失败。
+		return ipc.Response{}, &sendFailure{err: fmt.Errorf("client: 编码请求失败: %w", err)}
 	}
 	if err := ipc.WriteMessage(conn, body); err != nil {
-		return ipc.Response{}, fmt.Errorf("client: 发送请求失败: %w", err)
+		return ipc.Response{}, &sendFailure{err: fmt.Errorf(
+			"client: 发送请求失败: %w\n"+
+				"         命令**未执行**(请求没送达 daemon),可以安全重试", err)}
 	}
 
 	// 流式 stdin:请求头之后把 os.Stdin 的字节接着灌给 daemon,灌完关**写半侧** ——
@@ -376,7 +421,11 @@ func exchange(conn net.Conn, req ipc.Request, timeout time.Duration) (ipc.Respon
 
 	raw, err := ipc.ReadMessage(conn)
 	if err != nil {
-		return ipc.Response{}, fmt.Errorf("client: 读取响应失败: %w", err)
+		// 走到这一行说明请求帧**已经完整写出**,daemon 可能已经执行了脚本。
+		// 措辞必须说清这一点:使用者(或 AI)要据此决定是"放心重跑"还是
+		// "先去确认副作用",而原先只有一句「读取响应失败」,什么都不敢做。
+		return ipc.Response{}, fmt.Errorf("client: 读取响应失败: %w\n"+
+			"         请求已送达 daemon,命令**可能已经执行**;请先确认副作用(文件、提交、进程)再决定是否重跑", err)
 	}
 	return ipc.DecodeResponse(raw)
 }

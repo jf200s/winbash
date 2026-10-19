@@ -137,7 +137,7 @@ CALL :find_dp0
 // npm 垫片里的 ELSE 分支是 `SET "_prog=node"` —— 裸名字。同目录没有 node.exe 时
 // 应当回落到 PATH 上的 node。
 func TestResolveShimFallsBackToNodeOnPath(t *testing.T) {
-	dir := t.TempDir()   // 垫片目录**没有** node.exe
+	dir := t.TempDir() // 垫片目录**没有** node.exe
 	pathDir := t.TempDir()
 	node := mkNode(t, pathDir)
 	cli := writeShim(t, dir, "node_modules/pkg/bin/x.js", "// x")
