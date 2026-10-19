@@ -201,3 +201,76 @@ func TestWhichCmdUsesSearchPathFromContext(t *testing.T) {
 		t.Fatalf("got %q", got)
 	}
 }
+
+// --layers 是诊断开关:逐层报告命中/未命中,而不是回答"命令落到哪"。
+//
+// 它必须**早于** ①② 层的提前返回处理 —— 修之前放在后面,`which --layers ls`
+// 退化成普通 `which ls`(只打一行 "ls"),实测踩过。这里钉住四件事:
+// 三层各有一行、① 层命中时不吞掉后两层、全部未命中时给出结论且 exit 1、
+// 以及与 --layers 同名的未知开关仍然响亮拒绝。
+func TestWhichLayersReportsEveryLayer(t *testing.T) {
+	dir := t.TempDir()
+	hit := filepath.Join(dir, "probe-layers.exe")
+	if err := os.WriteFile(hit, []byte("MZ"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithSearchPath(context.Background(), dir)
+
+	t.Run("①层命中也要报出③层的结果", func(t *testing.T) {
+		var out, errw bytes.Buffer
+		if code := WhichCmd(ctx, "", []string{"--layers", "ls"}, &out, &errw); code != errs.ExitOK {
+			t.Fatalf("exit=%d want 0, stderr=%q", code, errw.String())
+		}
+		s := out.String()
+		// ① 层命中只是第一行,不能像默认路径那样 continue 掉后两层。
+		if strings.Count(s, "\n") < 3 {
+			t.Fatalf("--layers 必须三层各一行, got %q", s)
+		}
+		for _, want := range []string{"① 内建", "② 内建", "③ PATH"} {
+			if !strings.Contains(s, want) {
+				t.Errorf("缺少 %q 这一行: %q", want, s)
+			}
+		}
+	})
+
+	t.Run("③层命中给绝对路径", func(t *testing.T) {
+		var out, errw bytes.Buffer
+		if code := WhichCmd(ctx, "", []string{"--layers", "probe-layers"}, &out, &errw); code != errs.ExitOK {
+			t.Fatalf("exit=%d want 0", code)
+		}
+		if !strings.Contains(out.String(), hit) {
+			t.Fatalf("③ 层应当报出 %s, got %q", hit, out.String())
+		}
+	})
+
+	t.Run("全部未命中给结论且非零", func(t *testing.T) {
+		var out, errw bytes.Buffer
+		code := WhichCmd(ctx, "", []string{"--layers", "probe-definitely-absent"}, &out, &errw)
+		if code != errs.ExitError {
+			t.Fatalf("exit=%d want %d", code, errs.ExitError)
+		}
+		if !strings.Contains(out.String(), "所有层都没有") {
+			t.Fatalf("应当给出结论行, got %q", out.String())
+		}
+		// 诊断模式下不再额外打一条「找不到: x」的错误行 —— 结论行已经够了,
+		// 两条一起出现会让人以为有两个问题。
+		if strings.Contains(errw.String(), "找不到") {
+			t.Fatalf("stderr 不该重复报「找不到」: %q", errw.String())
+		}
+	})
+
+	t.Run("多名字逐个诊断", func(t *testing.T) {
+		var out, errw bytes.Buffer
+		WhichCmd(ctx, "", []string{"--layers", "probe-layers", "probe-absent"}, &out, &errw)
+		if n := strings.Count(out.String(), "结论"); n != 1 {
+			t.Fatalf("只有一个名字缺失,应当只有一条结论行, got %d: %q", n, out.String())
+		}
+	})
+
+	t.Run("与未知开关一样响亮拒绝", func(t *testing.T) {
+		var out, errw bytes.Buffer
+		if code := WhichCmd(ctx, "", []string{"--layer", "ls"}, &out, &errw); code != errs.ExitUsage {
+			t.Fatalf("--layer(少个 s)应当 exit %d, got %d", errs.ExitUsage, code)
+		}
+	})
+}

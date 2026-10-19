@@ -181,11 +181,20 @@ func WhichCmd(ctx context.Context, cwd string, argv []string, out, errw io.Write
 	//   - 每个名字的每一处匹配各打一行(内置/②层只有一处);
 	//   - 一个都没找到时非零,否则 0(-a 与否都一样)。
 	all := false
+	layers := false
 	filtered := make([]string, 0, len(argv))
 	for _, a := range argv {
 		switch a {
 		case "-a", "--all":
 			all = true
+		case "--layers":
+			// 逐层报告:这个名字在 ①②③ 层分别命中哪里、在 ③ 层的每个目录里找没找到。
+			//
+			// 为什么值得单独一个开关:默认输出与 GNU which 一致(命中给一条、找不到
+			// 报错),「只报了 ffprobe 找不到」本身是**对的**语义 —— 但排查的人往往
+			// 想知道的是「另一层是不是有、我的 PATH 到底搜了哪几个目录」。
+			// 那件事没有 GNU 对应物,所以不塞进默认输出,单开一个开关。
+			layers = true
 		case "--":
 			// `--` 之后全是名字(照 POSIX 惯例)。
 		default:
@@ -211,6 +220,19 @@ func WhichCmd(ctx context.Context, cwd string, argv []string, out, errw io.Write
 		if name == "" {
 			continue
 		}
+		// --layers 必须在 ①② 层的提前返回**之前**:那两处的语义是「命中就打印名字、
+		// 结束」,而诊断要的是「每一层分别是什么结果」。放在后面会让 `which --layers ls`
+		// 退化成普通的 `which ls`(实测踩过)。
+		//
+		// 自带路径的写法不受它影响:逐层搜索对「./x」这种写法没有意义,照旧走下面的
+		// 解析 + 存在性判断。
+		if layers && !strings.ContainsAny(name, `/\`) {
+			if reportLayers(out, errw, name, searchPath) {
+				continue
+			}
+			code = errs.ExitError
+			continue
+		}
 		if IsBuiltin(name) {
 			fmt.Fprintln(out, name)
 			continue
@@ -233,6 +255,12 @@ func WhichCmd(ctx context.Context, cwd string, argv []string, out, errw io.Write
 				fmt.Fprintln(out, p)
 				continue
 			}
+		} else if layers {
+			// --layers:逐层报告,不打印"最终位置"也不报错 —— 它的产物是一份诊断,
+			// 不是"这个命令在哪"。退出码仍照 GNU 语义:一处都没命中就 1。
+			if reportLayers(out, errw, name, searchPath) {
+				continue
+			}
 		} else if all {
 			if hits := WhichAll(target, searchPath); len(hits) > 0 {
 				for _, p := range hits {
@@ -244,11 +272,75 @@ func WhichCmd(ctx context.Context, cwd string, argv []string, out, errw io.Write
 			fmt.Fprintln(out, p)
 			continue
 		}
-		fmt.Fprintln(errw, errs.Errorf("which", "找不到: "+name,
-			"①/② 层的名字由 winbash 提供(不在 PATH 里),③ 层会搜 Git Bash 的 usr\\bin;确认拼写"))
+		if !layers {
+			fmt.Fprintln(errw, errs.Errorf("which", "找不到: "+name,
+				"①/② 层的名字由 winbash 提供(不在 PATH 里),③ 层会搜 Git Bash 的 usr\\bin;确认拼写"))
+		}
 		// 与 `which` / `command -v` 的惯例一致:找不到就非零。用 1 而不是 127 ——
 		// 这两个命令在真环境里报的是 1,而 AI 常拿退出码做存在性判断。
 		code = errs.ExitError
 	}
 	return code
+}
+
+// reportLayers 打出「这个名字在每一层各命中什么」,返回是否至少命中一处。
+//
+// 输出形状固定、逐行一格,便于人读也便于 grep:
+//
+//	$ winbash -c 'which --layers ffprobe'
+//	① 内建      未命中
+//	② 内建      未命中
+//	③ PATH      (14 个目录全部未命中)
+//	结论        所有层都没有: ffprobe
+//
+// 为什么不并进默认输出:默认输出要与 GNU which 逐字一致(命中给一条、找不到报错),
+// 而这个开关回答的是另一个问题 ——「为什么没落到」。两者混在一起会让默认输出分叉。
+func reportLayers(out, errw io.Writer, name, searchPath string) bool {
+	hit := false
+
+	if IsBuiltin(name) {
+		fmt.Fprintf(out, "① 内建      %s\n", name)
+		hit = true
+	} else {
+		fmt.Fprintln(out, "① 内建      未命中")
+	}
+
+	if _, ok := winmgmt.Registry[name]; ok {
+		fmt.Fprintf(out, "② 内建      %s\n", name)
+		hit = true
+	} else {
+		fmt.Fprintln(out, "② 内建      未命中")
+	}
+
+	// ③ 层:逐目录报。搜索顺序必须与 Which 一致(filepath.SplitList,按 PATH 顺序),
+	// 否则这份诊断会和真正的落点打架 —— 那比不诊断更坏。
+	exts := pathExts()
+	var dirs []string
+	for _, d := range filepath.SplitList(searchPath) {
+		if d != "" {
+			dirs = append(dirs, d)
+		}
+	}
+	missed := 0
+	for _, d := range dirs {
+		if p, ok := findExecutable(filepath.Join(d, name), exts); ok {
+			fmt.Fprintf(out, "③ PATH      %s\n", p)
+			hit = true
+		} else {
+			missed++
+		}
+	}
+	switch {
+	case len(dirs) == 0:
+		fmt.Fprintln(errw, "③ PATH      搜索路径为空")
+	case missed == len(dirs):
+		fmt.Fprintf(out, "③ PATH      (%d 个目录全部未命中)\n", missed)
+	default:
+		fmt.Fprintf(out, "③ PATH      (其余 %d 个目录未命中)\n", missed)
+	}
+
+	if !hit {
+		fmt.Fprintf(out, "结论        所有层都没有: %s\n", name)
+	}
+	return hit
 }

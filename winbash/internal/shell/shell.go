@@ -699,41 +699,58 @@ func (s *Session) runExternal(ctx context.Context, args []string, hc interp.Hand
 	ext := strings.ToLower(filepath.Ext(abs))
 	if !isPEImage(abs) {
 		if ext == ".bat" || ext == ".cmd" {
-			// 批处理既不是 PE、也没有 shebang:CreateProcess 与 env.exe 都跑不了它
-			// (前者给 "%1 is not a valid Win32 application",后者报 exec format)。
-			// 显式说清楚并指路,而不是把一个看不懂的系统错误丢给使用者。
-			fmt.Fprintln(hc.Stderr, errs.Errorf(args[0],
-				"Windows 批处理("+ext+")不能直接执行 —— 它既不是 PE 程序,也没有 shebang",
-				"用 `cmd /c ...` 显式调它,或把里面的命令改写成 sh 脚本(winbash 会按 shebang 执行)"))
-			return interp.ExitStatus(errs.ExitNoExec)
+			// 批处理既不是 PE、也没有 shebang:CreateProcess 与 env.exe 都跑不了它。
+			// 但 npm / pnpm / tsc 这些工具的入口正是 .cmd 垫片,一律拒绝等于把整个
+			// Node 生态挡在门外。所以先试**翻译**:认出「垫片在调哪个 node 脚本」
+			// 就直接 exec 那个脚本,使用者传来的参数一个字节都不经过 cmd。
+			// 认不出来才保持原来的拒绝(不猜)。
+			if call, ok := resolveNodeShim(abs, s.searchPath); ok {
+				argv0 = call.Prog
+				leading = call.Args
+			} else if cmdShellFallbackEnabled(os.Getenv) {
+				// 兜底:显式打开的开关。代价是参数交给 cmd 重新解析
+				// (`&` `|` `^` `%VAR%` 都会被解释),所以它默认关。
+				argv0 = os.Getenv("COMSPEC")
+				if argv0 == "" {
+					argv0 = `C:\Windows\System32\cmd.exe`
+				}
+				leading = []string{"/c", abs}
+			} else {
+				fmt.Fprintln(hc.Stderr, errs.Errorf(args[0],
+					"Windows 批处理("+ext+")不能直接执行,且这条垫片不是可识别的 npm/node 形状",
+					"用 `cmd /c ...` 显式调它;若确认要 winbash 代劳,先 `export "+envCmdShellFallback+
+						"=1`(代价:参数会经 cmd 的解析器,`&` `|` `^` `%VAR%` 会被重新解释)"))
+				return interp.ExitStatus(errs.ExitNoExec)
+			}
+		} else {
+			envExe := ""
+			if usrBin := gitBashUsrBin(); usrBin != "" {
+				envExe = filepath.Join(usrBin, "env.exe")
+			}
+			if envExe == "" {
+				fmt.Fprintln(hc.Stderr, errs.Errorf(args[0],
+					"这是一个靠 shebang 运行的脚本,而 Windows 自己执行不了它",
+					"这台机器上找不到 Git Bash;装上它(或让 "+`C:\Program Files\Git\usr\bin\env.exe`+" 存在)再试"))
+				return interp.ExitStatus(errs.ExitNoExec)
+			}
+			// 反斜杠转成正斜杠:MSYS 认 `C:/…`。
+			//
+			// 脚本参数给**用户写的原串**,不是解析出来的绝对路径:它一路传到 MSYS 的
+			// bash 子进程当 $0,而 bash 运行时报错的前缀用的正是 $0 —— 传绝对路径,
+			// `./script.sh: line 1: foo: command not found` 就变成
+			// `C:/Users/…/script.sh: line 1: …`,真 bash 打的是用户写的那个。
+			// 两条例外,都传 abs:其一,挂载解析(`/tmp/x.sh`、`/c/x/y.sh`)改写过的 ——
+			// 合成挂载与 bash 自己的 MSYS 挂载表可能分叉,原串未必指向同一个文件;
+			// 其二,裸名字(`sed`、PATH 里的脚本)—— 原串要靠子进程自己搜 PATH,而它的
+			// PATH 是我们合成的 searchPath,搜索语义可能与定位时不同,原串未必可定位。
+			// 相对路径(`./x.sh`、`sub/x.sh`)则由子进程 cwd(= hc.Dir,见下 cmd.Dir)
+			// 兜底,一定能找到文件。
+			scriptArg := filepath.ToSlash(abs)
+			if strings.ContainsAny(args[0], `/\`) && builtins.ResolveShellPath(hc.Dir, args[0]) == args[0] {
+				scriptArg = args[0]
+			}
+			argv0, leading = envExe, []string{scriptArg}
 		}
-		envExe := ""
-		if usrBin := gitBashUsrBin(); usrBin != "" {
-			envExe = filepath.Join(usrBin, "env.exe")
-		}
-		if envExe == "" {
-			fmt.Fprintln(hc.Stderr, errs.Errorf(args[0],
-				"这是一个靠 shebang 运行的脚本,而 Windows 自己执行不了它",
-				"这台机器上找不到 Git Bash;装上它(或让 "+`C:\Program Files\Git\usr\bin\env.exe`+" 存在)再试"))
-			return interp.ExitStatus(errs.ExitNoExec)
-		}
-		// 反斜杠转成正斜杠:MSYS 认 `C:/…`。
-		//
-		// 脚本参数给**用户写的原串**,不是解析出来的绝对路径:它一路传到 MSYS 的
-		// bash 子进程当 $0,而 bash 运行时报错的前缀用的正是 $0 —— 传绝对路径,
-		// `./script.sh: line 1: foo: command not found` 就变成
-		// `C:/Users/…/script.sh: line 1: …`,真 bash 打的是用户写的那个。
-		// 两条例外,都传 abs:其一,挂载解析(`/tmp/x.sh`、`/c/x/y.sh`)改写过的 ——
-		// 合成挂载与 bash 自己的 MSYS 挂载表可能分叉,原串未必指向同一个文件;
-		// 其二,裸名字(`sed`、PATH 里的脚本)—— 原串要靠子进程自己搜 PATH,而它的
-		// PATH 是我们合成的 searchPath,搜索语义可能与定位时不同,原串未必可定位。
-		// 相对路径(`./x.sh`、`sub/x.sh`)则由子进程 cwd(= hc.Dir,见下 cmd.Dir)
-		// 兜底,一定能找到文件。
-		scriptArg := filepath.ToSlash(abs)
-		if strings.ContainsAny(args[0], `/\`) && builtins.ResolveShellPath(hc.Dir, args[0]) == args[0] {
-			scriptArg = args[0]
-		}
-		argv0, leading = envExe, []string{scriptArg}
 	}
 
 	// stderr 边转发边留尾:已知坑的识别靠它(见下),但输出不能延迟。

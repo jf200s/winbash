@@ -88,6 +88,15 @@ winbash: client: daemon 没有协议版本(它是旧版),与本端(4)不兼容
   (它表达的是「不指定」而不是「永不」),所以用 `-c` 调起来的那只会落回默认的 30 分钟。
   真要常驻不退出,就显式跑 `winbash --serve --idle 0`。
 
+另外两个环境变量,作用范围各不相同,别混:
+
+| 变量 | 影响什么 | 默认 |
+|---|---|---|
+| `WINBASH_SESSION_NAME` | 只给 **`--session`** 提供默认值(不碰管理开关) | 空 = 默认会话 |
+| `WINBASH_SESSION` | winbash **自己**派给 ③ 层子进程的标记,用来识别嵌套调用。使用者不该设它 | 不设 |
+| `WINBASH_CMD_SHELL` | 认不出的 `.cmd`/`.bat` 是否交 `cmd /c` 代跑(代价:参数经 cmd 重新解析) | **关** |
+| `WINBASH_BENCH` | `go test ./cmd/winbash/ -run Latency` 是否跑延迟报告 | 关 |
+
 ## 四层路由
 
 每条命令由 `ExecHandler` 判层,顺序如下。
@@ -99,7 +108,7 @@ winbash: client: daemon 没有协议版本(它是旧版),与本端(4)不兼容
 | `ls` | `[-l -a -h -1 -d] [路径...]`;默认按 POSIX **不列点文件**(要列用 `-a`)。`-d` 列**参数本身**而不展开目录:`ls -d */` 只给子目录名、`ls -ld 某目录` 只看那个目录的属性(与 bash 一致,也不打 `total` 行) |
 | `cat` | `[-n] [文件...]`;无参数 = 读 stdin,`-` 也是 stdin |
 | `grep` | `[-i -n -v -c -l -r -E -F -q] PATTERN [文件...]`;无文件 = 读 stdin |
-| `which` | `[-a\|--all] 名字 [名字...]`;认识下面**四层**,①/② 层报名字,③ 层报绝对路径。`-a` 列出**所有**匹配位置(按 PATH 顺序);不认识的开关**响亮拒绝**(`exit 2`)而不是当名字搜 |
+| `which` | `[-a\|--all] [--layers] 名字 [名字...]`;认识下面**四层**,①/② 层报名字,③ 层报绝对路径。`-a` 列出**所有**匹配位置(按 PATH 顺序)。`--layers` 是**诊断**开关:逐行报出 ①② 层各命中与否、③ 层的每个目录分别是否命中,全都没有时给一行「结论 所有层都没有」并以 `1` 退出 —— 它回答的是「为什么没落到」而不是「落到哪」,所以不打印最终位置。不认识的开关**响亮拒绝**(`exit 2`)而不是当名字搜 |
 
 GNU grep 的两个高频选项 `--include` / `--exclude` **不支持**(① 层只有上表那些开关)。它们常被
 写在 PATTERN **之后**(`grep -rn x --include='*.go' .`),而真 grep 靠 getopt 的 **permutation**
@@ -209,8 +218,15 @@ BRE 这一条是修过的:**早先默认按整串字面匹配**,于是这几个�
 - **自带路径的写法**(`./x.sh`、`/c/x/y.sh`、`C:\x\y.exe`)按**会话 cwd** 解析,不是进程 cwd
   —— 否则 `cd /tmp && ./t.sh` 会去 daemon 启动时那个目录里找。判"能不能直接执行"看的是
   **文件头是不是 PE**,不是扩展名:`.sh`/`.py` 这类带 shebang 的脚本因此能像在真 bash 里
-  一样跑(`usr\bin` 的 `env.exe` 读 shebang 找解释器);`.bat`/`.cmd` 既不是 PE 也没有 shebang,
-  会显式报错并指路 `cmd /c`,而不是丢一句 `%1 is not a valid Win32 application`。
+  一样跑(`usr\bin` 的 `env.exe` 读 shebang 找解释器)。
+- **`.cmd` / `.bat` 垫片会被翻译,而不是一律拒绝**(2026-10-19)。npm / pnpm / tsc 这些工具的
+  入口都是批处理,一律拒绝等于把整个 Node 生态挡在门外。所以先认垫片的**形状**:只要它符合
+  npm 系模板(收尾是 `"%_prog%" "%_cli%" %*`,变量值能一路展开到真实路径),就把「它要调哪个
+  node 脚本」翻译成一次直接 exec —— **使用者传来的参数一个字节都不经过 cmd**,`&` `|` `^`
+  `%VAR%` 原样到达(实测 `npm exec -- node -e ... 'c&d' 'e%F%g'` 四个参数逐字一致)。
+  认不出来的批处理**保持拒绝**(`exit 126`)并给两条出路;想让 winbash 代劳可以显式
+  `export WINBASH_CMD_SHELL=1` 走 `cmd /c` 兜底 —— 但那条路会把参数交给 cmd 重新解析,
+  所以它**默认关**,不替人做主。
 - 子进程拿到的是**同一条** PATH,所以 `xargs`、`find -exec`、`make` 这类"子进程再 exec"也能找到工具集。
 - **参数怎么送进去,这两类目标不是同一套规则。** Windows 上"父→子"的参数是拼成一条命令行字符串
   传的,由**子进程自己**按它认的规则拆回 argv,而这个规则不是 ABI 钉死的:
@@ -453,6 +469,7 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 | `grep -E 'a*?'` | **接受**,按 ERE 语义(`*` 后跟字面 `?`)。它是**已知差异**:真 bash 也接受,但两边对同一输入的匹配数不同(winbash 2 / 真 bash 0)—— Perl 的"懒惰量词"在这里没意义。早先 README 把它写成"拒收",与实际实现不符,已改正 |
 | `grep -E '[\d]'` | **支持**,按 ERE 原意匹配「反斜杠或字母 d」。Go 的 `regexp.CompilePOSIX` 不认字符类里的 `\`,内部归一化成 `\\` 再编译,而不是退化成 Perl 语义。两个边界同样按 ERE 处理:**已转义**的 `\\` 不会再转一次(`[\\d]`、`[\\]` 仍合法),`[` / `[^` 后**紧跟**的 `]` 是字面量(`[\]]` 不被截断)。这 11 个形状有 golden 表钉住,期望值由真 Git Bash 生成(`go test ./internal/builtins/ -update-grep-golden`),不手写 |
 | `more` | Git Bash 里没有,我们用了 Windows 的——多一个工具,不是缺陷 |
+| `.cmd` / `.bat` 垫片 | **已支持(2026-10-19)**,范围限于**可识别的 npm 系形状**:收尾是 `"%_prog%" "%_cli%" %*`、变量能一路展开到真实存在的路径。这类垫片被翻译成一次直接 exec(`node xxx-cli.js`),使用者参数不经 cmd —— 实测 `npm` / `npx` / `pnpm` / 第三方包(直接 exec `.exe` 的形态)都能跑,`'a b' 'c&d' 'e%F%g' 'h^i'` 四个参数逐字到达。**认不出来的批处理仍拒绝**(`exit 126`),两条出路写在错误里:`cmd /c` 显式调用,或 `export WINBASH_CMD_SHELL=1` 让 winbash 走 `cmd /c` 兜底。**兜底为什么默认关**:那条路把参数交给 cmd.exe 重新解析,`&` `|` `^` `%VAR%` 会被二次解释,与「不静默做错事」冲突,必须由使用者显式选择。**已知边界**:依赖 `FOR /F` 运行时值决定脚本路径的垫片翻译不出来(会保持拒绝,而不是猜);这条只看形状不看版本,所以 npm/pnpm 以后再改模板时会退化成拒绝——那时补形状即可,`cmdshim_test.go` 的四种形态用例是改动的靶子 |
 | `mktemp` 的默认目录 | **不是 msyspath 的映射错误,是 MSYS 自己解析 `/tmp` 的结果**:winbash 的 `/tmp` 恒等于 `%TEMP%`;而 `mktemp.exe` 启动时若把 `/tmp` 解析成 `%TEMP%` 的**父目录**,它就会把 `TMPDIR` 投影成 `/tmp/<TEMP 的 basename>/tmp.XXX` —— 那个路径在两侧不是一个目录,`f=$(mktemp); cat "$f"` 于是读不回来(真 Git Bash 在同一个进程里也读不回来)。实测:直接派生 `mktemp.exe` 时稳定复现,经 `bash -c` 或 winbash ③ 层派生时约 1% 触发,**且触发一次后成片触发**(直到另一次干净的启动)。所以要跨工具链传临时路径,就在同一侧创建并消费;`internal/shell/msyspath_e2e_test.go` 对这种形态按「TEMP 的 basename 在路径里连续出现两次」跳过,而不是红 —— 判据精确到不会掩盖真的映射故障 |
 | **MSYS 挂载点** | `/`、`/tmp`、`/usr/bin`、`/bin`、`/c`…**支持**,与真 Git Bash 的挂载表对齐(`/` = Git 安装根,`/tmp` = 用户 `%TEMP%`)。所以 `mktemp`、`echo x > /tmp/f`、`cd /c/Windows`、`[ -d /tmp ]` 都能用。**`cd` 的三种写法都规范化了**:`cd /x`、`command cd /x`、`builtin cd /x`(`TestCdThroughCommandAndBuiltinTakesEffect`)。**一条限制**:`[ -e /etc ]` 这类"根挂载点下的子路径"走 `test`/`[` 时**不支持** —— mvdan/sh 会先把路径拼成 `<cwd>\etc`,而相对路径 `etc` 拼出**同一个字符串**,无法区分,所以不猜(猜错会把大量相对路径误判成"存在")。同样的判断用 `ls /etc` 就行(那条能拿到原始路径) |
 | `ls` 默认不列点文件 | **与 bash 一致**(POSIX 语义)。要列用 `-a`;`-a` 时 `.` / `..` **参与同一个排序**(与 bash 一致) |
