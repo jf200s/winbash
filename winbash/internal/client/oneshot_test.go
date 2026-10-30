@@ -127,6 +127,12 @@ func TestOneShotDoesNotRetryAuthWhenStdinIsStreaming(t *testing.T) {
 		defer conn.Close()
 		readRequest(t, conn)
 		reply(t, conn, ipc.Response{Auth: true, Exit: 1})
+		// 回完先排干入站再关:此刻流式 stdin 的字节还堆在接收缓冲里没被读,
+		// Windows 对「带着未读数据的 close」回 RST 而不是 FIN —— client 的
+		// 401 响应会被 RST 打掉,读到的是「连接被强制关闭」而不是响应。排干后
+		// 才是优雅的 FIN;client 半关了写端,EOF 很快到,2s 是兜底。
+		_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+		_, _ = io.Copy(io.Discard, conn)
 	})
 
 	resp, err := oneShot(fd.endpoint, ipc.Request{
