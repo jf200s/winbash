@@ -49,6 +49,18 @@ wb() { "$EXE" --endpoint "$EP" "$@"; }
 TXT="wb-smoke-$$.txt"
 BIN="wb-smoke-$$.bin"
 
+# 「含空格与中文的路径」不依赖本机布局(没有任何一台机器的布局是标准):现场在临时
+# 目录里造夹具,测完随 trap 清掉。空格/中文放在夹具自己的名字里 —— /tmp 经 cygpath
+# 转出来可能是 8.3 短名(Test User → TESTUS~1),指望不上父路径自带空格。
+# cygpath -m 给出 Windows 混合形式(C:/a/b):被测的 winbash.exe 吃 Windows 路径。
+FIXROOT="$(mktemp -d "${TMPDIR:-/tmp}/wb-smoke-fx-XXXXXX")" || exit 1
+mkdir -p "$FIXROOT/中文夹具" "$FIXROOT/spaced dir" || { rm -rf "$FIXROOT"; exit 1; }
+: > "$FIXROOT/中文夹具/marker"
+CN_DIR="$(cygpath -m "$FIXROOT/中文夹具")"
+SP_DIR="$(cygpath -m "$FIXROOT/spaced dir")"
+# 用户主目录的 POSIX 形式(/c/Users/<名>)同样从环境派生,不写死盘符和用户名。
+HOME_POSIX="$(cygpath -u "${USERPROFILE:-$HOME}")"
+
 fail=0
 check() {
     if [ "$2" = "$3" ]; then
@@ -60,6 +72,7 @@ check() {
 }
 
 cleanup() {
+    rm -rf "$FIXROOT"
     rm -f "$TXT" "$BIN"
     wb --stop >/dev/null 2>&1
     rm -f "$EP"
@@ -96,7 +109,9 @@ check "ps 内存是纯字节数"   "1"     "$(wb -c 'ps pwsh' | head -1 | grep -
 check "输出无 ANSI 色码"    "0"     "$(wb -c 'svc list --running' | grep -c $'\x1b')"
 
 echo "-- 第三类:管道一致性(与同一台机器上的 bash 对比)"
-BASH_BIN="/c/Program Files/Git/bin/bash.exe"
+# 「同一台机器上的 bash」就是运行本脚本的那个 bash($BASH),不写死安装路径;
+# 万一取不到,照旧走下面的 skip 分支,不假红。
+BASH_BIN="${BASH:-$(command -v bash 2>/dev/null)}"
 if [ -x "$BASH_BIN" ]; then
     check "wc -l 与 bash 一致"    "$("$BASH_BIN" -c 'cat go.mod | wc -l' | tr -d ' ')" "$(wb -c 'cat go.mod | wc -l' | tr -d ' ')"
     check "grep -c 与 bash 一致"  "$("$BASH_BIN" -c 'cat go.mod | grep -c require' | tr -d ' ')" "$(wb -c 'cat go.mod | grep -c require' | tr -d ' ')"
@@ -119,7 +134,7 @@ check "which 认得四层"                "3"  "$(wb -c 'which ls svc git | wc -
 check "which -a 不把开关当名字"       "0"  "$(wb -c 'which -a ls >/dev/null 2>&1; echo $?')"
 check "which 未知开关响亮拒绝"        "2"  "$(wb -c 'which -Z ls' >/dev/null 2>&1; echo $?)"
 check "command cd / 生效"             "yes" "$(wb -c 'command cd / && [ -d etc ] && echo yes')"
-check "builtin cd /c/Users 生效"      "Users" "$(wb -c 'builtin cd /c/Users && basename "$PWD"')"
+check "builtin cd 用户目录上层 生效"  "$(basename "$(dirname "$HOME_POSIX")")" "$(wb -c "builtin cd '$(dirname "$HOME_POSIX")' && basename \"\$PWD\"")"
 check "锚定替换被拦下"                "2"  "$(wb -c 'v=prefix-x; echo "${v/#prefix/root}"' >/dev/null 2>&1; echo $?)"
 
 echo "-- 第四类:错误路径"
@@ -187,10 +202,10 @@ check "嵌套也拿到管道内容"     "nested" "$(printf 'nested\n' | timeout 
 check "嵌套无 stdin 立即结束"   "0"      "$(timeout 15 "$EXE" --endpoint "$EP" -c "$EXE -c cat" </dev/null >/dev/null 2>&1; echo $?)"
 check "嵌套之后 daemon 仍活"   "0"      "$(wb --status >/dev/null 2>&1; echo $?)"
 
-echo "-- Review Focus 第 1 条:含空格与中文的路径"
-check "中文路径可列"         "1"     "$(wb -c 'ls "D:/work/中文 目录"' | grep -c '^winbash$')"
-check "含空格路径可列"       "0"     "$(wb -c 'ls "C:/Users/Test User"' >/dev/null 2>&1; echo $?)"
-check "POSIX 路径可列"       "1"     "$(wb -c 'ls /c/Users' | grep -c '^Test User$')"
+echo "-- Review Focus 第 1 条:含空格与中文的路径(夹具现场造,见 FIXROOT)"
+check "中文路径可列"         "1"     "$(wb -c "ls \"$CN_DIR\"" | grep -c '^marker$')"
+check "含空格路径可列"       "0"     "$(wb -c "ls \"$SP_DIR\"" >/dev/null 2>&1; echo $?)"
+check "POSIX 路径可列"       "1"     "$(wb -c "ls '$(dirname "$HOME_POSIX")'" | grep -cxF "$(basename "$HOME_POSIX")")"
 
 echo
 if [ "$fail" = 0 ]; then
