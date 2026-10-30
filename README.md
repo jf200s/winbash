@@ -1,5 +1,7 @@
 # winbash
 
+[![CI](https://github.com/jf200s/winbash/actions/workflows/ci.yml/badge.svg)](https://github.com/jf200s/winbash/actions/workflows/ci.yml)
+
 bash 语法 + pwsh 能力的常驻 shell，给在 Windows 上干活的 AI 用。
 
 AI 熟悉 bash，但 bash 管不了 Windows；pwsh 管得了，却不熟、而且每次冷启约 480 ms。
