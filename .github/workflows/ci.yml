@@ -1,0 +1,50 @@
+# 全量质量门禁:go vet + go test + Git Bash 端到端 smoke,单 job 固化。
+#
+# - 只有 windows:测试依赖 Windows 服务/注册表/icacls/daemon 拉起,其它平台跑不了。
+# - 不设 GOPROXY:开发机用 goproxy.cn 是因为 proxy.golang.org 本机不通;
+#   GitHub runner 默认可达,设了反而绕远。
+# - shell: bash 在 windows runner 上就是 runner 自带的 Git Bash,与 smoke 脚本
+#   的运行前提一致(smoke-gitbash.sh 必须从真 Git Bash 跑)。
+# - 所有 Go 代码与 smoke-gitbash.sh 都在 winbash/ 子目录,run 步骤统一切过去。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  gate:
+    name: vet + test + smoke (windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+        working-directory: winbash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go(版本跟随 winbash/go.mod,不写死)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: winbash/go.mod
+          # go.sum 不在仓库根而在 winbash/,不指对路径缓存会报「找不到依赖文件」
+          cache-dependency-path: winbash/go.sum
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test(全量,-count=1 禁用测试缓存)
+        run: go test ./... -count=1
+
+      # smoke-gitbash.sh 开头自检:找不到 winbash.exe 直接以 1 退出,所以先构建
+      - name: Build winbash.exe(smoke 前置)
+        run: go build -o winbash.exe ./cmd/winbash
+
+      # 用 `bash ./` 而非 `./`:脚本在 git 里没有可执行位(100644)
+      - name: smoke(端到端回归,自带隔离端点)
+        shell: bash
+        run: bash ./smoke-gitbash.sh
