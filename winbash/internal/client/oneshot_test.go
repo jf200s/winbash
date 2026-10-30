@@ -344,3 +344,120 @@ func deadAddr(t *testing.T) string {
 	_ = ln.Close()
 	return addr
 }
+
+// ⑦ 发送阶段的失败(请求帧没能完整写出)必须走重试路径:forgetStaleEndpoint →
+// ensureDaemonExcept 拿一个新 daemon → 用**新 daemon 的 token** 重发。
+//
+// 这是 ③(超长帧就地报错)的对照面:两类失败底层长得一样(都是连接断了),
+// 分叉只在 oneShot 那一个 if 上 —— permanent 就地报错,瞬时发送失败重试一次。
+// 只钉谓词不钉接线的话,把这两类掉个头测试照样全绿。
+//
+// 怎么确定性造出「发送阶段失败」:请求体 60 MiB(单帧上限 64 MiB 之内),对端
+// 在 accept 后立刻 SetLinger(0)+Close 发 RST。两个实测事实撑起这里的时序:
+//   - Windows 回环会把**任意大小**的写整个吃进内核缓冲(8 MiB、60 MiB 都实测
+//     如此),对端不读也不会让写阻塞 —— 所以「靠缓冲区塞满让写失败」在本机不
+//     成立,RST 只会打死读端;
+//   - 60 MiB 的 JSON 编码要几十毫秒,而 RST 在握手完成后毫秒级就到 —— client
+//     第一次 write 之前,socket 必然已被标记 reset,写端直接报错。
+//
+// 于是失败铁定落在 WriteMessage 里:「一个字节都没进 daemon 的读端」,读响应
+// 根本没开始,重发是安全的。睡 20ms 再动手是让 dial 稳稳返回,别让 RST 抢在
+// 握手收尾前到。
+func TestOneShotRetriesSendFailureOnNewDaemon(t *testing.T) {
+	// 第二个 daemon:重试的目标。它回显收到的 token,证明重发用的是**新**凭据
+	// (旧实现的 dial 只返回 conn 不返回 info,这里就会拿旧 token 连新 daemon)。
+	fd2 := startFakeDaemon(t, func(conn net.Conn, seq int) {
+		defer conn.Close()
+		req := readRequest(t, conn)
+		reply(t, conn, ipc.Response{OK: true, Out: []byte(req.Token)})
+	})
+
+	var fd1 *fakeDaemon
+	fd1 = startFakeDaemon(t, func(conn net.Conn, seq int) {
+		defer conn.Close()
+		// 不读任何东西;先把端口文件改指向新 daemon(模拟「新 daemon 接管」),
+		// 再发 RST。顺序不能反:重试路径要先能从端口文件里拿到一个**不是死地址**
+		// 的新地址,否则它只能去 spawn(等 20s)。
+		time.Sleep(20 * time.Millisecond)
+		writePortFile(t, fd1.endpoint, fd2.addr, "fresh-token")
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetLinger(0)
+		}
+	})
+
+	resp, err := oneShot(fd1.endpoint, ipc.Request{Script: strings.Repeat("x", 60<<20)},
+		false, 10*time.Second, 0)
+	if err != nil {
+		t.Fatalf("发送阶段的瞬时失败应当被重试救回来, got %v", err)
+	}
+	if got := fd1.conns.Load(); got != 1 {
+		t.Errorf("第一个 daemon 收到 %d 条连接,期望 1(重试不该回头找旧 daemon)", got)
+	}
+	if got := fd2.conns.Load(); got != 1 {
+		t.Errorf("第二个 daemon 收到 %d 条连接,期望 1(重试应当发给新 daemon)", got)
+	}
+	if string(resp.Out) != "fresh-token" {
+		t.Errorf("重发应当携带新 daemon 的 token, got %q", resp.Out)
+	}
+	// 端口文件此刻指向**新** daemon —— forgetStaleEndpoint 拿旧地址比对,不许误删它。
+	b, rerr := os.ReadFile(fd1.endpoint)
+	if rerr != nil {
+		t.Fatalf("新 daemon 的端口文件不该被重试路径删掉: %v", rerr)
+	}
+	if !strings.Contains(string(b), fd2.addr) {
+		t.Errorf("端口文件被改动了: %q", string(b))
+	}
+}
+
+// ⑧ 请求**已送达**(对端把请求帧完整读走了)之后连接断开 → 就地报错,绝不重放。
+//
+// 这条与 ⑦ 是同一枚硬币的两面:⑦ 的失败发生在写出阶段,重发安全;这里请求帧
+// 已经完整交给了 daemon,它可能已经把脚本跑了 —— 重放就是同一条脚本跑两遍
+// (mkdir / git commit / 写文件都被双重执行)。判据:假 daemon 只收到 1 条连接。
+// 谓词单测(TestIsSendFailureDistinguishesSendFromRead)钉的是分类,这里钉的是
+// 分类结果真的接到了「不重试」上。
+func TestOneShotDoesNotReplayAfterRequestWasDelivered(t *testing.T) {
+	fd := startFakeDaemon(t, func(conn net.Conn, seq int) {
+		defer conn.Close()
+		readRequest(t, conn) // 完整读走请求帧 —— 从这一刻起「命令可能已经执行」
+		// 不回响应,直接断开:模拟 daemon 在执行中途消失。
+	})
+
+	_, err := oneShot(fd.endpoint, ipc.Request{Script: "mkdir important"}, false, 5*time.Second, 0)
+	if err == nil {
+		t.Fatal("对端没回响应,应当报错")
+	}
+	if !strings.Contains(err.Error(), "可能已经执行") {
+		t.Fatalf("错误必须说明命令可能已执行(调用方要据此先查副作用再决定重跑), got %q", err.Error())
+	}
+	if got := fd.conns.Load(); got != 1 {
+		t.Fatalf("假 daemon 收到 %d 条连接,期望 1 —— 第二条连接就意味着重放", got)
+	}
+	// 读失败路径连 ensureDaemonExcept 都不该去问,更不该碰端口文件。
+	if _, serr := os.Stat(fd.endpoint); serr != nil {
+		t.Fatalf("端口文件不该被读失败路径动: %v", serr)
+	}
+}
+
+// ⑨ 鉴权重试时端口文件已经不可读 → 明确报「端口文件已不可读」,而不是哑着失败。
+//
+// 构成:daemon 回 401 的同时把端口文件删掉(极端形态:读完 token 后 daemon 退出,
+// 文件也跟着没了)。retryAfterAuthFailure 的第一件事是重读端口文件,读不到就该把
+// 这件事说出来 —— 修之前那条读错误会被一层层包成一句没头没尾的「读取失败」。
+func TestAuthRetryReportsUnreadablePortFile(t *testing.T) {
+	var fd *fakeDaemon
+	fd = startFakeDaemon(t, func(conn net.Conn, seq int) {
+		defer conn.Close()
+		readRequest(t, conn)
+		_ = os.Remove(fd.endpoint)
+		reply(t, conn, ipc.Response{Auth: true, Exit: 1})
+	})
+
+	_, err := oneShot(fd.endpoint, ipc.Request{Script: "echo hi"}, false, 5*time.Second, 0)
+	if err == nil {
+		t.Fatal("端口文件没了,鉴权重试无从谈起,应当报错")
+	}
+	if !strings.Contains(err.Error(), "端口文件已不可读") {
+		t.Fatalf("错误应当说明端口文件已不可读, got %q", err.Error())
+	}
+}
