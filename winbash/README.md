@@ -42,6 +42,11 @@ go build -o winbash.exe ./cmd/winbash
 —— 把 `winbash\` 追加进了 `HKCU\Environment` 的用户 `Path`,所以那台机器上直接写命令名就能跑;
 这是本机配置,不是开箱状态。)
 
+**③ 层有个硬前提**:真实工具(`sed`/`awk`/`find`/`head`/`tail`/`wc`/`sort`…)来自 Git for Windows
+的 `usr\bin`(③ 层搜索路径把它排在最前)。没装 Git for Windows 时这些命令会 `127`,
+`find`/`sort` 会落到 `C:\Windows\System32` 的同名程序、拿到完全不同的语义
+(Windows 的 `find` 是"在文件里找字符串"、`sort` 按本地代码页)。
+
 ## 命令行
 
 | 参数 | 说明 |
@@ -117,6 +122,8 @@ winbash: client: daemon 没有协议版本(它是旧版),与本端(5)不兼容
 | `ls` | `[-l -a -h -1 -d] [路径...]`;默认按 POSIX **不列点文件**(要列用 `-a`)。`-d` 列**参数本身**而不展开目录:`ls -d */` 只给子目录名、`ls -ld 某目录` 只看那个目录的属性(与 bash 一致,也不打 `total` 行) |
 | `cat` | `[-n] [文件...]`;无参数 = 读 stdin,`-` 也是 stdin |
 | `grep` | `[-i -n -v -c -l -r -E -F -q -A N -B N -C N -o -w -e P] PATTERN [文件...]`;无文件 = 读 stdin,`-` 也是 stdin |
+| `egrep` | `grep -E` 的历史同义词。前置的 `-E` 算**显式**方言:`egrep -F` 按冲突拒绝(`conflicting matchers specified`,GNU 同)。不走 ③ 层是有意的:usr\bin 里的 `egrep`/`fgrep` 是**无扩展名 wrapper 脚本**,Windows 的 CreateProcess 执行不了,所以映射到自己的 grep(同一套方言仲裁) |
+| `fgrep` | `grep -F` 的历史同义词。前置的 `-F` 算**显式**方言(修之前这个前置 `-F` 被**静默丢掉**,fixed-string 从未生效,`fgrep 'a.c'` 连 `abc` 都匹配);单独再给一遍 `-F` 不算冲突 |
 | `which` | `[-a\|--all] [--layers] 名字 [名字...]`;认识下面**四层**,①/② 层报名字,③ 层报绝对路径。`-a` 列出**所有**匹配位置(按 PATH 顺序)。`--layers` 是**诊断**开关:逐行报出 ①② 层各命中与否、③ 层的每个目录分别是否命中,全都没有时给一行「结论 所有层都没有」并以 `1` 退出 —— 它回答的是「为什么没落到」而不是「落到哪」,所以不打印最终位置。不认识的开关**响亮拒绝**(`exit 2`)而不是当名字搜 |
 
 GNU grep 的两个高频选项 `--include` / `--exclude` **不支持**(① 层只有上表那些开关)。它们常被
@@ -412,6 +419,17 @@ token 仍在、daemon 仍可用,只是这层加固没生效,而使用者有权�
   (`client.RunTimeout` 的嵌套分支),`Session` 选项在那条路径上**根本没被应用** —— 写
   `--session build` 不报错,但也不会真的落到 build 会话。要分会话就在**非嵌套**的调用里指定。
 - **非嵌套调用完全不受影响**,照旧走常驻 daemon。
+
+## 故障排查速查
+
+只做索引:现象 → 去哪节看。细节都在指到的节里,这里不重写(指路用小节名,行号会漂)。
+
+| 现象 | 去哪看 |
+|---|---|
+| 替换过 `winbash.exe` 之后报「daemon 没有协议版本(它是旧版),与本端(5)不兼容」 | **「升级与协议版本」**:旧 daemon 还活着是正常状态,处置只有一步 `winbash --stop`;`--stop`/`--status` 刻意不参与版本检查,否则「要停它得先连上它」会死锁 |
+| 设了 `WINBASH_SESSION_NAME` 之后 `--stop`/`--status`(或拉 daemon)出问题 | **「升级与协议版本」的「同类陷阱」**:它只给 `--session` 提供默认值,**不碰** `--serve`/`--stop`/`--status`/`--fresh`(按值判断导致连 daemon 都起不来的旧 bug 已修;但这个变量只影响「执行脚本」那条路) |
+| 嵌套调用(winbash 里再调 winbash)里写 `--session`,不报错但也没落到那个会话 | **「嵌套调用」**:嵌套走本进程一次性会话,`--session` 在那条路径上**静默不生效** —— 要分会话就在非嵌套的调用里指定;`--status`/`--stop` 在嵌套里则直接报错 |
+| 从 winbash 会话里跑 `smoke-gitbash.sh`,以 `2` 退出 | **「开发」**:smoke 刻意拒绝从 winbash 会话启动 —— 那 4 条 daemon 管理断言会齐刷刷假红;请从真 Git Bash 跑(`& 'C:\Program Files\Git\bin\bash.exe' ./smoke-gitbash.sh`) |
 
 ## 值保证与输出
 

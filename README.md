@@ -19,9 +19,9 @@ winbash --json -c 'sys mem'        # 类型化 JSON 输出
 
 ## 这条仓库怎么读
 
-**上手手册是 [`winbash/README.md`](winbash/README.md)**（525 行）—— 命令行参数、四层路由、
-安全边界、会话级状态、性能口径。与真 bash 的差异另立档案
-**[`winbash/已知差异与限制.md`](winbash/已知差异与限制.md)**（74 行，每条差异都注明回归测试在哪）。
+**上手手册是 [`winbash/README.md`](winbash/README.md)** —— 命令行参数、四层路由、
+安全边界、会话级状态、性能口径、故障排查速查。与真 bash 的差异另立档案
+**[`winbash/已知差异与限制.md`](winbash/已知差异与限制.md)**（每条差异都注明回归测试在哪）。
 **先读手册，查差异去档案。**
 
 | 路径 | 是什么 |
@@ -47,6 +47,10 @@ go build -o winbash.exe ./cmd/winbash
 
 想把 `winbash` 当命令名用，把 `winbash\` 目录加进用户 `PATH` 即可 —— 没有安装器、
 没有服务、没有注册表项；卸载就是从 `PATH` 里删掉那一条。
+
+**③ 层有个硬前提**：真实工具（`sed`/`awk`/`find`/`head`/`tail`/`wc`/`sort`…）来自
+Git for Windows 的 `usr\bin`。没装 Git for Windows 时这些命令会 `127`，`find`/`sort`
+会落到 `C:\Windows\System32` 的同名程序、拿到完全不同的语义（Windows 的 `find` 是"在文件里找字符串"）。
 
 ## 它凭什么值得存在
 
@@ -79,7 +83,7 @@ Windows 程序抢走；以及每条命令省掉一次语法切换。
 
 | 层 | 内容 |
 |---|---|
-| ① 纯 Go 内建 | `ls` / `cat` / `grep` / `which`，bash 文本语义（`grep` 默认是 **BRE**，不是字面匹配） |
+| ① 纯 Go 内建 | `ls` / `cat` / `grep` / `egrep` / `fgrep` / `which`（`egrep` = `grep -E`、`fgrep` = `grep -F`，历史同义词映射到同一个 grep），bash 文本语义（`grep` 默认是 **BRE**，不是字面匹配） |
 | ② Go 内建 + 常驻 pwsh | `svc` / `reg` / `ps` / `sys` / `pwsh` |
 | ③ 真实工具 | Git Bash 的 `usr\bin` **排在 PATH 最前**，所以 `sed`/`awk`/`find` 拿到的是 Unix 语义 |
 | ④ 兜底 | 三行式错误（问题 + 怎么办）+ `127`，措辞按命令对齐真 GNU |
@@ -91,7 +95,7 @@ Windows 程序抢走；以及每条命令省掉一次语法切换。
 
 | 项 | 值 |
 |---|---|
-| 生产代码 / 测试代码 | 8,734 行 / 13,797 行（测试比生产多，比例 1.58） |
+| 生产代码 / 测试代码 | 测试代码多于生产代码（具体行数与比例不再记录 —— 代码在长，行数指标必然过时） |
 | 包 | 11 个 |
 | 唯一直接依赖 | `mvdan.cc/sh/v3 v3.14.1` —— **本地打过补丁**，见 [`winbash/third_party/mvdan-sh/WINBASH-PATCH.md`](winbash/third_party/mvdan-sh/WINBASH-PATCH.md) |
 | 门禁 | `go test ./... -count=1` 全绿 + `smoke-gitbash.sh`（必须从真 Git Bash 跑） |
