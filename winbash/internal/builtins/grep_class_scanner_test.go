@@ -89,13 +89,13 @@ func TestPerlShorthandRejectionIsBidirectional(t *testing.T) {
 			`(?i)abc`: `(?`,
 		}
 		for pattern, wantFragment := range rejected {
-			re, problem, _ := compileGrep(pattern, &grepOpts{extended: true})
+			m, problem, _ := compileGrep([]string{pattern}, &grepOpts{extended: true})
 			if problem == "" {
 				t.Errorf("compileGrep(%q) 被接受了;它是类外的 Perl 语法,必须拒收 —— 放过去就是'静默少匹配'的正门", pattern)
 				continue
 			}
-			if re != nil {
-				t.Errorf("compileGrep(%q) 拒收时不该同时返回正则", pattern)
+			if m != nil {
+				t.Errorf("compileGrep(%q) 拒收时不该同时返回匹配器", pattern)
 			}
 			if !contains(problem, wantFragment) {
 				t.Errorf("compileGrep(%q) 的报错没点出 %q: %s", pattern, wantFragment, problem)
@@ -113,7 +113,7 @@ func TestPerlShorthandRejectionIsBidirectional(t *testing.T) {
 			`a*?`,           // ERE 里 `*?` 是合法的 —— 见 README 已知差异(vs Perl 的懒惰量词)
 		}
 		for _, pattern := range accepted {
-			if _, problem, remedy := compileGrep(pattern, &grepOpts{extended: true}); problem != "" {
+			if _, problem, remedy := compileGrep([]string{pattern}, &grepOpts{extended: true}); problem != "" {
 				t.Errorf("compileGrep(%q) 被拒收了;它是合法 ERE\n  问题: %s\n  怎么办: %s", pattern, problem, remedy)
 			}
 		}

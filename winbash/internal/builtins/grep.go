@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"winbash/internal/errs"
@@ -22,14 +23,15 @@ import (
 // 无文件名时读 in;有文件名时逐个读;`-` 作为文件名显式表示 in。
 // (cat 没有这个入口,因为它的签名没有 in —— 那是 Task 5 的既定形状,先记着。)
 //
-// 方言是这里最要紧的决策(见 compileGrep):默认按字面匹配,`-E` 走 POSIX ERE,
-// 两者都不接受 Perl 简写。理由是「不翻车」:`grep -E '\d+'` 在真 grep 里匹配不到数字,
-// 如果 winbash 悄悄用 Perl 语义让它匹配了,使用者会得到和真实环境不同的结果,
-// 而且是在没人告诉他的情况下。
+// 方言是这里最要紧的决策(见 compileGrep):默认是 BRE(真 grep 的默认方言),
+// `-E` 走 POSIX ERE,`-F` 按字面匹配;`-E` 与 `-F` 同时给出按 GNU 响亮拒绝
+// (conflicting matchers,exit 2)。后两者都不接受 Perl 简写。理由是「不翻车」:
+// `grep -E '\d+'` 在真 grep 里匹配不到数字,如果 winbash 悄悄用 Perl 语义让它匹配了,
+// 使用者会得到和真实环境不同的结果,而且是在没人告诉他的情况下。
 func Grep(ctx context.Context, cwd string, argv []string, in io.Reader, out, errw io.Writer) int {
-	opts, pattern, files, aerr := parseGrepArgs(argv)
+	opts, patterns, files, aerr := parseGrepArgs(argv)
 	if aerr != nil {
-		remedy := "用法: grep [-i -n -v -c -l -r -E -F -q] PATTERN [文件...]"
+		remedy := "用法: grep [-i -n -v -c -l -r -E -F -q -A N -B N -C N -o -w -e P] PATTERN [文件...]"
 		if ue, ok := aerr.(*usageErr); ok {
 			// 带针对性指路的错误(例如 GNU 的 --include):通用那句「用法:」对它
 			// 没有任何帮助,使用者还得再花一轮问"那该怎么写"。
@@ -50,7 +52,7 @@ func Grep(ctx context.Context, cwd string, argv []string, in io.Reader, out, err
 		out = io.Discard
 	}
 
-	re, problem, remedy := compileGrep(pattern, opts)
+	m, problem, remedy := compileGrep(patterns, opts)
 	if problem != "" {
 		fmt.Fprintln(errw, errs.Errorf("grep", problem, remedy))
 		return errs.ExitUsage
@@ -66,8 +68,15 @@ func Grep(ctx context.Context, cwd string, argv []string, in io.Reader, out, err
 		code = errs.ExitError
 	}
 
+	// 组间隔线的游标是**整个调用**级的:实测 GNU 给了 -A/-B/-C 之后,`--` 也跨
+	// 文件/跨流 —— 上一组在 f1、新组在 f2 时照样补一条(文件列表、stdin 的 `-`、
+	// -r 递归都是如此)。所以游标放这里,每条流一个递增的 streamID。
+	sep := &grepSep{contextGiven: opts.contextGiven}
+	streamID := uint64(0)
+
 	if len(files) == 0 {
-		res, binary, ierr := grepStream(in, re, opts, "", showName, out)
+		streamID++
+		res, binary, ierr := grepStream(in, m, opts, "", showName, out, sep, streamID)
 		if ierr != nil {
 			report(ierr, "读输入时出错")
 		}
@@ -80,7 +89,8 @@ func Grep(ctx context.Context, cwd string, argv []string, in io.Reader, out, err
 			if f == "-" {
 				// `-` 显式表示标准输入。与无文件名时的区别是:这时它是「文件列表里的一员」,
 				// 多文件输出要给出行归属 —— bash 用的名字就是 "(standard input)"。
-				res, binary, ierr := grepStream(in, re, opts, "(standard input)", showName, out)
+				streamID++
+				res, binary, ierr := grepStream(in, m, opts, "(standard input)", showName, out, sep, streamID)
 				if ierr != nil {
 					report(ierr, "读标准输入时出错")
 				}
@@ -114,12 +124,13 @@ func Grep(ctx context.Context, cwd string, argv []string, in io.Reader, out, err
 					report(fmt.Errorf("%s: Is a directory", f), "递归搜索目录请加 -r: grep -r PATTERN "+f)
 					continue
 				}
-				anyMatch = grepTree(abs, f, re, opts, out, errw, report) || anyMatch
+				anyMatch = grepTree(abs, f, m, opts, out, errw, report, sep, &streamID) || anyMatch
 				continue
 			}
 
-			m, ok := grepFile(abs, re, opts, f, showName, out, errw, report)
-			anyMatch = anyMatch || (ok && m)
+			streamID++
+			match, ok := grepFile(abs, m, opts, f, showName, out, errw, report, sep, streamID)
+			anyMatch = anyMatch || (ok && match)
 		}
 	}
 
@@ -141,18 +152,40 @@ type grepOpts struct {
 	count      bool
 	namesOnly  bool
 	recursive  bool
-	extended   bool
+	extended   bool // -E:POSIX ERE
+	fixed      bool // -F:按字面匹配(不再"恰好等于默认方言",见 compileGrep)
 	quiet      bool
+
+	onlyMatching bool // -o:只输出命中段
+	wordRegexp   bool // -w:命中段必须整个落在词边界内
+
+	afterN  int // -A:命中行之后跟几行上下文
+	beforeN int // -B:命中行之前带几行上下文(-C 两者都设,-A/-B 显式给过的维度优先)
+	// contextGiven:-A/-B/-C 是否出现过(哪怕显式给 0)。实测 GNU:完全没给上下文
+	// 开关时两组命中之间**不打** `--`;显式 -A0 / -B0 / -C0 却照样打。分组发射
+	// 整套逻辑只在该开关组被给过时启用。
+	contextGiven bool
+
+	// ePatterns 是 -e 给的模式列表(≥1 时**所有**位置参数都是文件名 —— 实测
+	// `grep -e a b f.txt` 里 b 与 f.txt 都是文件,pattern 只有 a)。
+	ePatterns []string
 }
 
-// parseGrepArgs 吃开关,返回 opts、pattern 与文件名列表。
+// parseGrepArgs 吃开关,返回 opts、模式列表与文件名列表。
 //
 // 开关解析在第一个非开关参数处停止 —— 之后的都是 pattern 和文件名。
-// pattern 以 `-` 开头时必须用 `--` 分隔(bash 惯例),这样 `grep -- -x f` 才有解。
-func parseGrepArgs(argv []string) (*grepOpts, string, []string, error) {
+// pattern 以 `-` 开头时用 `-e -x`(GNU 惯例)或 `--` 分隔,这样 `grep -e -x f`、
+// `grep -- -x f` 才有解。
+//
+// -E 与 -F 同时给出时按 GNU 响亮拒绝(conflicting matchers,exit 2)—— 实测
+// GNU 对 -FE / -EF / -E -F / -F -E 一律如此,静默选一个方言是"静默做错事"。
+func parseGrepArgs(argv []string) (*grepOpts, []string, []string, error) {
 	opts := &grepOpts{}
 	i := 0
 	sawDashDash := false
+	sawExtended, sawFixed := false, false
+	var aVal, bVal, cVal int
+	sawA, sawB, sawC := false, false, false
 	for ; i < len(argv); i++ {
 		a := argv[i]
 		if a == "--" {
@@ -166,10 +199,13 @@ func parseGrepArgs(argv []string) (*grepOpts, string, []string, error) {
 		// 长开关整体报出。逐字符解析会把 `--nope` 报成 `--`,
 		// 使用者拿着这个提示定位不到问题(ls 那边踩过同一个坑)。
 		if strings.HasPrefix(a, "--") {
-			return nil, "", nil, fmt.Errorf("不认识的参数: %s", a)
+			return nil, nil, nil, fmt.Errorf("不认识的参数: %s", a)
 		}
-		// 合并写法 -iE / -in 是 bash 惯例,AI 也常写。
-		for _, c := range a[1:] {
+		// 合并写法 -iE / -in / -nA2 是 bash 惯例,AI 也常写。
+		// 带值的开关(A/B/C/e)吃掉本 token 里剩下的字符,没有就吃下一个参数
+		// (实测 -nA2、-nA + 下一参、-e'l3' 三种形态 GNU 都这么收)。
+		for j := 1; j < len(a); j++ {
+			c := a[j]
 			switch c {
 			case 'i':
 				opts.ignoreCase = true
@@ -185,25 +221,87 @@ func parseGrepArgs(argv []string) (*grepOpts, string, []string, error) {
 				opts.recursive = true
 			case 'E':
 				opts.extended = true
+				sawExtended = true
 			case 'F':
-				// -F 是"按字面匹配",而这**本来就是默认方言**(见 compileGrep:
-				// 非 -E 分支用 QuoteMeta)。原先这里还设了一个 opts.fixed 字段,
-				// 但全包没有任何地方读它 —— 那个字段只是让"支持 -F"看起来有实现。
-				// 保留这个 case 有两个理由:-F 必须被接受;它还要把 -E 顶掉
-				// (`grep -EF` 按字面,与 bash 一致:后出现的那个胜)。
-				opts.extended = false
+				opts.fixed = true
+				sawFixed = true
 			case 'q':
 				opts.quiet = true
+			case 'o':
+				opts.onlyMatching = true
+			case 'w':
+				opts.wordRegexp = true
+			case 'A', 'B', 'C':
+				val, ok := takeFlagValue(argv, &i, a, j)
+				if !ok {
+					return nil, nil, nil, fmt.Errorf("开关 -%c 需要一个参数(上下文行数)", c)
+				}
+				n, nerr := strconv.Atoi(val)
+				if nerr != nil || n < 0 {
+					// 措辞对齐 GNU(实测:grep: 2x: invalid context length argument)。
+					return nil, nil, nil, &usageErr{
+						problem: val + ": invalid context length argument",
+						remedy:  "-A / -B / -C 后面要跟非负整数,行数可以直接附着(-A2)也可以隔开(-A 2)",
+					}
+				}
+				switch c {
+				case 'A':
+					aVal, sawA = n, true
+				case 'B':
+					bVal, sawB = n, true
+				case 'C':
+					cVal, sawC = n, true
+				}
+				opts.contextGiven = true
+			case 'e':
+				val, ok := takeFlagValue(argv, &i, a, j)
+				if !ok {
+					return nil, nil, nil, fmt.Errorf("开关 -e 需要一个参数(模式)")
+				}
+				opts.ePatterns = append(opts.ePatterns, val)
 			default:
 				// 不认识的开关必须报错:静默忽略会让使用者以为它生效了。
-				return nil, "", nil, fmt.Errorf("不认识的参数: -%c", c)
+				return nil, nil, nil, fmt.Errorf("不认识的参数: -%c", c)
+			}
+			if c == 'A' || c == 'B' || c == 'C' || c == 'e' {
+				break // 带值开关吃掉了 token 里剩余的字符(或下一个参数)
 			}
 		}
 	}
 
+	// -A/-B/-C 的合成规则(实测 GNU,与出现顺序无关):-A 定 after、-B 定 before、
+	// -C 两者都定;某维度被 -A/-B **显式**给过时,-C 对该维度让位。
+	// 实测:-A3 -C1 与 -C1 -A3 都是 after=3/before=1;-C1 -B3 是 before=3/after=1。
+	if sawA {
+		opts.afterN = aVal
+	} else if sawC {
+		opts.afterN = cVal
+	}
+	if sawB {
+		opts.beforeN = bVal
+	} else if sawC {
+		opts.beforeN = cVal
+	}
+
+	// 方言仲裁:两个都显式给过才冲突(重复给同一个没问题,实测 -FF、-EE 都合法)。
+	if sawExtended && sawFixed {
+		return nil, nil, nil, &usageErr{
+			problem: "conflicting matchers specified(-E 与 -F 是两种匹配方言)",
+			remedy:  "只能选一个:-E 按 POSIX ERE,-F 按字面匹配;egrep / fgrep 本身已分别是 grep -E / grep -F,不要再叠加另一个",
+		}
+	}
+
 	rest := argv[i:]
-	if len(rest) == 0 {
-		return nil, "", nil, fmt.Errorf("没有指定 pattern")
+	var patterns []string
+	var files []string
+	if len(opts.ePatterns) > 0 {
+		// 实测 GNU:`grep -e a b f.txt` 里 b、f.txt 都是文件名,pattern 只有 a。
+		patterns, files = opts.ePatterns, rest
+	} else {
+		if len(rest) == 0 {
+			return nil, nil, nil, fmt.Errorf("没有指定 pattern")
+		}
+		patterns, files = rest[:1], rest[1:]
 	}
 	// 选项写在 PATTERN **之后**:bash 的 getopt 会做置换(permutation)把它挪到前面,
 	// 我们不做置换 —— 于是 `--include` 会被当成**文件名**。实测的后果比"报错"更坏:
@@ -213,16 +311,32 @@ func parseGrepArgs(argv []string) (*grepOpts, string, []string, error) {
 	//
 	// 过滤没生效、退出码还是成功 —— 这正是本项目要消灭的"静默做错事"。所以这里
 	// 必须响亮拒绝,并把"该改用哪种写法"直接说清楚(见 afterPatternOptionErr)。
-	// `--` 之后的 `-` 开头参数是**文件名**,不在此列。
+	// `--` 之后的 `-` 开头参数是**文件名**,不在此列;-e 模式以 `-` 开头时也不在此列
+	// (它已经被 -e 吃成模式了,不会落进文件名列表)。
 	if !sawDashDash {
-		for _, f := range rest[1:] {
+		for _, f := range files {
 			// 单独的 `-` 是「读 stdin」的惯用文件名(grep x a.txt -),不是选项。
 			if f != "-" && strings.HasPrefix(f, "-") {
-				return nil, "", nil, afterPatternOptionErr(f)
+				return nil, nil, nil, afterPatternOptionErr(f)
 			}
 		}
 	}
-	return opts, rest[0], rest[1:], nil
+	return opts, patterns, files, nil
+}
+
+// takeFlagValue 取带值开关(-A/-B/-C/-e)的值:优先 token 内附着(-A2、-e'x'),
+// 否则吃下一个参数(实测 GNU 对 -nA + 下一参也这么收,连它像不像开关都不看 ——
+// `grep -nA -e x` 报 `-e: invalid context length argument`)。
+// 返回 ok=false 表示没有下一个参数可吃(调用方报"缺参数")。
+func takeFlagValue(argv []string, i *int, tok string, j int) (string, bool) {
+	if j+1 < len(tok) {
+		return tok[j+1:], true
+	}
+	if *i+1 < len(argv) {
+		*i++
+		return argv[*i], true
+	}
+	return "", false
 }
 
 // usageErr 是一个**带针对性指路**的参数错误。
@@ -332,32 +446,60 @@ func breToEre(pattern string) string {
 	return b.String()
 }
 
-// compileGrep 按方言决策编译 pattern,失败时返回「问题 + 怎么办」两行文案。
+// compileGrep 按方言决策编译模式列表,失败时返回「问题 + 怎么办」两行文案。
 //
-// 默认(无 -E):先把 BRE 翻成 ERE(见 breToEre),再走与 -E 相同的路径。
+// 方言仲裁(parseGrepArgs 已把 -E/-F 同现拦在门外),三条路:
 //
-// -E:走 regexp.CompilePOSIX,即 POSIX ERE,最接近 `grep -E`。
-// Perl 简写(\d \w \s \D \W \S)在这里没有定义,先显式拒收再编译 ——
+//   - -F:不做任何正则编译,模式就是字面串。实测 GNU `grep -F 'a.c'` 对含
+//     abc 与 a.c 的输入只匹配 a.c —— 修之前这里对非 -E 分支一律走 BRE 编译,
+//     `-F` 静默按 BRE 跑,`a.c` 连 abc 都匹配上了。
+//   - 默认(无 -E):每个模式先按 BRE 翻成 ERE(见 breToEre)。
+//   - -E:模式按 POSIX ERE 原样进编译。
+//
+// 多个 -e 模式编成**一个**正则(各自包一层分组再用 | 连接)—— GNU 也把多个
+// -e 合成一个 DFA,于是 `-o` 的输出按**行内位置**排序(实测 `grep -oE -e b -e a`
+// 对 `ab` 给 a、b,不是按 -e 的给出顺序)。单模式不包分组,报错文案保持原样。
+//
+// POSIX ERE 不接受 Perl 简写(\d \w \s \D \W \S),先显式拒收再编译 ——
 // 实测 `regexp.CompilePOSIX("\d+")` 确实会报 invalid escape sequence,
 // 但那条信息不会告诉使用者「你写的是 Perl 方言」,更不会给出替代写法。
-func compileGrep(pattern string, opts *grepOpts) (re *regexp.Regexp, problem, remedy string) {
-	if !opts.extended {
-		// 默认方言 = 真 grep 的 **BRE**。翻译成 ERE 之后走与 -E 完全相同的编译
-		// 路径:两种方言的差别只在翻译层,后面的方言校验、-i、leftmost-longest
-		// 因此只有一份实现(见 breToEre 里那张对照表)。
-		pattern = breToEre(pattern)
+func compileGrep(patterns []string, opts *grepOpts) (*grepMatcher, string, string) {
+	if opts.fixed {
+		// -F:字面匹配,没有正则可言。多个 -e 各是一条字面量(实测 -Fe 也成立)。
+		// -w 对 -F 同样生效(实测 fgrep -w 就是"字面量两侧都是词边界")。
+		// 字面量提前转成 []byte:matchLine / findAll 对每行、每个位置都要用,
+		// 现场转换是纯浪费。
+		lits := make([][]byte, len(patterns))
+		for i, p := range patterns {
+			lits[i] = []byte(p)
+		}
+		return &grepMatcher{lits: lits, wordRegexp: opts.wordRegexp}, "", ""
 	}
 
-	if cls, ok := firstPerlClass(pattern); ok {
-		return nil, "-E 使用 POSIX ERE 方言," + cls + " 属于 Perl 简写,在这里没有定义",
-			"改用 POSIX 写法: [0-9] / [[:digit:]] / [[:alpha:]] / [[:space:]]"
+	translated := make([]string, len(patterns))
+	for i, p := range patterns {
+		if !opts.extended {
+			p = breToEre(p)
+		}
+
+		if cls, ok := firstPerlClass(p); ok {
+			return nil, "-E 使用 POSIX ERE 方言," + cls + " 属于 Perl 简写,在这里没有定义",
+				"改用 POSIX 写法: [0-9] / [[:digit:]] / [[:alpha:]] / [[:space:]]"
+		}
+
+		// `(?...)` 内联开关在 ERE 里没有定义。Perl 引擎会接受它,放过去等于默默换了
+		// 方言,所以先显式挡掉 —— 这是下面那条回退路径唯一的例外。
+		if strings.Contains(p, "(?") {
+			return nil, "模式里有 (?...) 内联开关,那是 Perl 语法,POSIX ERE 里没有定义",
+				"-E 的方言是 POSIX ERE;要忽略大小写用 -i,不要把 (?i) 写进模式"
+		}
+		translated[i] = p
 	}
 
-	// `(?...)` 内联开关在 ERE 里没有定义。Perl 引擎会接受它,放过去等于默默换了
-	// 方言,所以先显式挡掉 —— 这是下面那条回退路径唯一的例外。
-	if strings.Contains(pattern, "(?") {
-		return nil, "模式里有 (?...) 内联开关,那是 Perl 语法,POSIX ERE 里没有定义",
-			"-E 的方言是 POSIX ERE;要忽略大小写用 -i,不要把 (?i) 写进模式"
+	joined := translated[0]
+	if len(translated) > 1 {
+		// 分组再连接:模式里可能有顶层 |,裸连会改变结合;分组对 Match/Find 无副作用。
+		joined = "(" + strings.Join(translated, ")|(") + ")"
 	}
 
 	// 先用 POSIX 模式校验方言,把 `*?`、`\b` 这类 Perl 语法挡在门外,
@@ -372,29 +514,131 @@ func compileGrep(pattern string, opts *grepOpts) (re *regexp.Regexp, problem, re
 	// 曾经试过"编译失败就回退到 Perl 引擎 + Longest()",那更糟:Perl 把 `[\w]`
 	// 当成词字符,于是它匹配 `b`,而真 bash 不匹配 —— 语义**静默变了**,只有
 	// 内容里正好有词字符时才显形。精确改写比宽泛回退好。
-	normalized := normalizeEreClasses(pattern)
+	normalized := normalizeEreClasses(joined)
 	if posixErr := func() error { _, err := regexp.CompilePOSIX(normalized); return err }(); posixErr != nil {
 		return nil, "模式不是合法的 POSIX ERE: " + posixErr.Error(),
 			`要按字面匹配特殊字符就转义它(\\. ),字符类用 [[:alpha:]] 这种 POSIX 写法`
 	}
 
+	var r *regexp.Regexp
 	if opts.ignoreCase {
 		// 实测:Go 的 POSIX 模式不支持内联开关(`(?i)alpha` 报 missing argument),
 		// 所以 -i 与 -E 只能叠加成「POSIX 校验 + Perl 引擎 + Longest()」:
 		// 方言已由上面钉死,Longest() 再把匹配语义还原成 leftmost-longest。
-		r, err := regexp.Compile("(?i)" + normalized)
+		rr, err := regexp.Compile("(?i)" + normalized)
 		if err != nil {
 			return nil, "模式无法编译: " + err.Error(), "检查模式里的括号与转义"
 		}
+		r = rr
 		r.Longest()
-		return r, "", ""
+	} else {
+		rr, err := regexp.CompilePOSIX(normalized)
+		if err != nil {
+			return nil, "模式不是合法的 POSIX ERE: " + err.Error(), "检查模式里的括号与转义"
+		}
+		r = rr
+	}
+	return &grepMatcher{re: r, wordRegexp: opts.wordRegexp}, "", ""
+}
+
+// grepMatcher 把三种方言(-F 字面 / BRE / ERE)折成同一个问法:
+// 「这一行命中吗」与「命中段在哪」。-w 的词边界检查放在**命中之后**逐段验,
+// 而不是给模式包 \b(...) —— 实测两者不等价:GNU 检查的是**命中段**两侧是不是
+// 词字符,模式本身以非词字符开头/结尾时(如 `-w 'a!'` 对 `a!`)GNU 照样命中,
+// 包 \b 的写法会漏。词字符的定义两边一致:字母、数字、下划线。
+type grepMatcher struct {
+	re         *regexp.Regexp // -E / BRE(已翻译)的编译结果;-F 时为 nil
+	lits       [][]byte       // -F:模式原文就是字面量(提前转好的字节切片)
+	wordRegexp bool           // -w:只认两侧都是词边界的命中段
+}
+
+// matchLine 报告这一行是否命中(考虑 -w;不考虑 -v,反转在调用方做)。
+func (m *grepMatcher) matchLine(content []byte) bool {
+	if !m.wordRegexp {
+		if m.re != nil {
+			return m.re.Match(content)
+		}
+		for _, l := range m.lits {
+			if bytes.Contains(content, l) {
+				return true
+			}
+		}
+		return false
+	}
+	return len(m.findAll(content)) > 0
+}
+
+// findAll 返回本行内所有**可用**的命中段:最左最长、互不重叠、跳过空命中;
+// -w 时再按词边界过滤。返回值按行内位置升序。
+//
+// -w 的重试语义对齐 GNU:一个命中段没过词边界检查时,从它的**起点 +1** 重新找
+// (不是从终点继续)—— 更靠后、起点落在失败段内部的命中仍然有机会入选。
+func (m *grepMatcher) findAll(content []byte) [][]int {
+	if m.re != nil {
+		if !m.wordRegexp {
+			var locs [][]int
+			for _, loc := range m.re.FindAllIndex(content, -1) {
+				if loc[1] > loc[0] { // GNU 实测:-o 不输出空命中(`b*` 对 `abc` 只给 b)
+					locs = append(locs, loc)
+				}
+			}
+			return locs
+		}
+		var locs [][]int
+		for pos := 0; pos <= len(content); {
+			loc := m.re.FindIndex(content[pos:])
+			if loc == nil {
+				break
+			}
+			s, e := pos+loc[0], pos+loc[1]
+			if e > s && wordBounded(content, s, e) {
+				locs = append(locs, []int{s, e})
+				pos = e // 命中入选:从它后面继续(不重叠)
+			} else {
+				pos = s + 1 // 没过词边界:起点 +1 重试(GNU 同款)
+			}
+		}
+		return locs
 	}
 
-	r, err := regexp.CompilePOSIX(normalized)
-	if err != nil {
-		return nil, "模式不是合法的 POSIX ERE: " + err.Error(), "检查模式里的括号与转义"
+	// -F:在每个位置找**最长**的命中字面量(最左最长,与合成 DFA 的 GNU 一致)。
+	var locs [][]int
+	for pos := 0; pos < len(content); {
+		best := 0
+		for _, l := range m.lits {
+			if len(l) > best && bytes.HasPrefix(content[pos:], l) {
+				best = len(l)
+			}
+		}
+		if best == 0 {
+			pos++
+			continue
+		}
+		if !m.wordRegexp || wordBounded(content, pos, pos+best) {
+			locs = append(locs, []int{pos, pos + best})
+			pos += best
+		} else {
+			pos++ // 没过词边界:起点 +1 重试
+		}
 	}
-	return r, "", ""
+	return locs
+}
+
+// wordBounded 报告 content[s:e] 这个命中段两侧是否都是词边界
+// (行首/行尾、或紧邻非词字符)。词字符 = 字母、数字、下划线(实测 GNU:
+// `_` 算词字符,`abc_def` 不被 `-w abc` 命中)。
+func wordBounded(content []byte, s, e int) bool {
+	if s > 0 && isWordByte(content[s-1]) {
+		return false
+	}
+	if e < len(content) && isWordByte(content[e]) {
+		return false
+	}
+	return true
+}
+
+func isWordByte(b byte) bool {
+	return b == '_' || ('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z') || ('0' <= b && b <= '9')
 }
 
 // classEnd 返回从 start(必须指向 `[`)开始的字符类的**闭合 `]` 之后**那个下标。
@@ -541,6 +785,18 @@ type grepResult struct {
 	lines   int  // 符合条件的行数
 }
 
+// grepSep 持有组间隔线(`--`)的**调用级**游标,跨文件/跨流共享。
+//
+// 实测 GNU:给了 -A/-B/-C 之后,`--` 也出现在文件边界上 —— 上一组在 f1、新组
+// 在 f2(f、stdin 的 `-`、-r 递归同理)时同样补一条。只有"从本调用开始还没输出
+// 过任何组"(lastStream == 0)才不打。没给上下文开关时整个分组逻辑不启用
+// (contextGiven=false,游标不更新也不会打)。
+type grepSep struct {
+	contextGiven bool
+	lastStream   uint64 // 上一次输出所属的流编号(0 = 还没有任何组输出)
+	groupEnd     int    // 上一组覆盖到的最后一行(该流自己的行号:命中行 + after)
+}
+
 // grepStream 逐行扫描一个输入。
 //
 // 用 bufio.Reader.ReadBytes 而不是 bufio.Scanner:Scanner 有 64KB 的行长上限,
@@ -550,12 +806,46 @@ type grepResult struct {
 // 行尾只剥 \n,不剥 \r:CRLF 文件在 Git Bash 的 grep 下也会把 \r 带进匹配与输出,
 // 这里保持一致,而不是替使用者做「这应该是文本行」的假设。
 //
-// binary 这第三个返回值见 noteBinary:它只用于**提示**,不影响输出内容。
-func grepStream(r io.Reader, re *regexp.Regexp, opts *grepOpts, label string, showName bool, out io.Writer) (grepResult, bool, error) {
+// binary 这第二个返回值见 noteBinary:它只用于**提示**,不影响输出内容。
+//
+// 上下文(-A/-B/-C)的发射规则全部按真 grep 实测钉死:
+//
+//   - 命中行打 `:` 前缀,上下文行打 `-` 前缀(-n 时行号后同样 `:` / `-`);
+//   - 两组之间有**没被任何组覆盖**的空档时补一条 `--`(组间隔线,无文件名前缀);
+//   - 组相邻/重叠时合并,不打 `--`;**换流必打** —— 实测 GNU 的 `--` 是调用级的,
+//     文件列表、stdin 的 `-`、-r 递归的文件边界上同样补 `--`(游标在 grepSep);
+//   - 没给过任何 -A/-B/-C 时整个分组逻辑不启用(实测裸的多组命中之间没有 `--`,
+//     显式 -A0 才有);
+//   - 组的覆盖范围 = [命中行 - before, 命中行 + after],**-o 不打印上下文行,
+//     但组覆盖照算** —— 实测 `-o -A1` 在两组隔空时照样给 `--`;
+//   - 已作为上一组上下文输出过的行,轮到它命中时按**命中行**重新打印一次
+//     (实测 -n -A2 命中 l3、l4 给 `3:l3 / 4:l4 / 5-l5 / 6-l6`);
+//   - -c / -l / -q 下不输出行,-A/-B/-C 全部失效(-c 只给计数,与实测一致)。
+func grepStream(r io.Reader, m *grepMatcher, opts *grepOpts, label string, showName bool, out io.Writer, sep *grepSep, streamID uint64) (grepResult, bool, error) {
 	var res grepResult
 	binary := false
 	br := bufio.NewReaderSize(SafeStdin(r), 64*1024)
 	lineNo := 0
+
+	// 本输入流的发射游标(跨流的组间隔游标在 sep,不在这里)。
+	lastEmitted := 0     // 本流内最后一行**实际输出**的行号(-B 去重的依据)
+	afterPending := 0    // 命中行之后还欠几行 -A 上下文
+	var history [][]byte // -B 的行缓冲(最近 beforeN 行,按行号升序)
+
+	emitLine := func(n int, content []byte, context bool) {
+		writeGrepLine(out, label, showName, n, opts, content, context)
+		lastEmitted = n
+	}
+	// 组间隔线:换流必补;同流内,这一组的第一行与上一组覆盖末尾之间有空档
+	// (≥1 行谁都没覆盖)时补。第一条组之前(sep.lastStream == 0)不打。
+	sepIfNeeded := func(groupStart int) {
+		if !opts.contextGiven || sep.lastStream == 0 {
+			return
+		}
+		if sep.lastStream != streamID || groupStart > sep.groupEnd+1 {
+			io.WriteString(out, "--\n")
+		}
+	}
 
 	for {
 		raw, err := br.ReadBytes('\n')
@@ -567,7 +857,7 @@ func grepStream(r io.Reader, re *regexp.Regexp, opts *grepOpts, label string, sh
 				content = content[:len(content)-1]
 			}
 
-			hit := re.Match(content)
+			hit := m.matchLine(content)
 			if opts.invert {
 				hit = !hit
 			}
@@ -585,8 +875,51 @@ func grepStream(r io.Reader, re *regexp.Regexp, opts *grepOpts, label string, sh
 					fmt.Fprintln(out, nameForListing(label))
 					return res, binary, nil
 				}
-				if !opts.count {
-					writeGrepLine(out, label, showName, lineNo, opts, content)
+
+				if !opts.count && !(opts.onlyMatching && opts.invert) {
+					groupStart := lineNo - opts.beforeN
+					if groupStart < 1 {
+						groupStart = 1
+					}
+					sepIfNeeded(groupStart)
+					// -B:先补前导上下文;已输出过、或已滑出窗口的行跳过。
+					for k, hc := range history {
+						hn := lineNo - len(history) + k
+						if hn <= lastEmitted || hn < groupStart {
+							continue
+						}
+						if !opts.onlyMatching {
+							emitLine(hn, hc, true)
+						}
+					}
+					if opts.onlyMatching {
+						// -o:只输出命中段(按行内位置序、跳过空段),前缀与整行同款。
+						for _, loc := range m.findAll(content) {
+							writeGrepLine(out, label, showName, lineNo, opts, content[loc[0]:loc[1]], false)
+							lastEmitted = lineNo
+						}
+					} else {
+						emitLine(lineNo, content, false)
+					}
+					// -o 与 -v 同给:实测一个字都不出(被选中的行本来就不含模式的命中段,
+					// 连组间隔线都没有);exit 仍只看有没有行被选中。
+					sep.groupEnd = lineNo + opts.afterN
+					sep.lastStream = streamID
+				}
+				afterPending = opts.afterN
+			} else if afterPending > 0 {
+				// -A:紧跟上一组;流是连续的,这一行必然与已输出内容相接,不用查间隔线。
+				afterPending--
+				if !opts.count && !opts.onlyMatching {
+					emitLine(lineNo, content, true)
+				}
+			}
+
+			// 维护 -B 缓冲:命中行自身也算后面命中的前文。
+			if opts.beforeN > 0 {
+				history = append(history, content)
+				if len(history) > opts.beforeN {
+					history = history[len(history)-opts.beforeN:]
 				}
 			}
 		}
@@ -638,12 +971,18 @@ func nameForListing(label string) string {
 	return label
 }
 
-func writeGrepLine(out io.Writer, label string, showName bool, lineNo int, opts *grepOpts, content []byte) {
+// writeGrepLine 输出一行。context=true 是 -A/-B/-C 带出的上下文行:实测 GNU 把
+// 行前缀的分隔符从 `:` 换成 `-`(文件名与行号两处都是),命中行仍是 `:`。
+func writeGrepLine(out io.Writer, label string, showName bool, lineNo int, opts *grepOpts, content []byte, context bool) {
+	sep := ":"
+	if context {
+		sep = "-"
+	}
 	if showName && label != "" {
-		io.WriteString(out, label+":")
+		io.WriteString(out, label+sep)
 	}
 	if opts.lineNumber {
-		fmt.Fprintf(out, "%d:", lineNo)
+		fmt.Fprintf(out, "%d%s", lineNo, sep)
 	}
 	out.Write(content)
 	io.WriteString(out, "\n")
@@ -661,7 +1000,7 @@ func writeGrepCount(out io.Writer, label string, showName bool, n int) {
 //
 // 第二个返回值为 false 表示这个文件根本没读成(已被 report 报了错),
 // 调用方不能把它当「没命中」——否则退出码会从「错误」退化成「没找到」。
-func grepFile(abs string, re *regexp.Regexp, opts *grepOpts, label string, showName bool, out io.Writer, errw io.Writer, report func(error, string)) (matched, ok bool) {
+func grepFile(abs string, m *grepMatcher, opts *grepOpts, label string, showName bool, out io.Writer, errw io.Writer, report func(error, string), sep *grepSep, streamID uint64) (matched, ok bool) {
 	f, err := os.Open(abs)
 	if err != nil {
 		report(err, "先确认文件存在,或用 winbash -c 'ls 目录' 看有哪些名字")
@@ -669,7 +1008,7 @@ func grepFile(abs string, re *regexp.Regexp, opts *grepOpts, label string, showN
 	}
 	defer f.Close()
 
-	res, binary, err := grepStream(f, re, opts, label, showName, out)
+	res, binary, err := grepStream(f, m, opts, label, showName, out, sep, streamID)
 	if err != nil {
 		report(err, "读 "+label+" 时出错")
 		return res.matched, false
@@ -687,7 +1026,7 @@ func grepFile(abs string, re *regexp.Regexp, opts *grepOpts, label string, showN
 // 而不是把 WalkDir 给的绝对路径直接打出去 —— 实测 `grep -r b .` 原本输出
 // `/c/Users/…/d.txt:b`,而真 bash 给 `./d.txt:b`。AI 拿到绝对路径后很难
 // 与它自己的输入对应起来(它写的是 `.`),这是那种"能用但总会让人怀疑"的差异。
-func grepTree(root, display string, re *regexp.Regexp, opts *grepOpts, out io.Writer, errw io.Writer, report func(error, string)) bool {
+func grepTree(root, display string, m *grepMatcher, opts *grepOpts, out io.Writer, errw io.Writer, report func(error, string), sep *grepSep, streamID *uint64) bool {
 	anyMatch := false
 	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, werr error) error {
 		if werr != nil {
@@ -703,7 +1042,8 @@ func grepTree(root, display string, re *regexp.Regexp, opts *grepOpts, out io.Wr
 		}
 		// 递归输出里的路径用正斜杠:① 层的文本语义按 bash 来。
 		label := filepath.ToSlash(displayRel(display, p, root))
-		if matched, ok := grepFile(p, re, opts, label, true, out, errw, report); ok && matched {
+		*streamID++
+		if matched, ok := grepFile(p, m, opts, label, true, out, errw, report, sep, *streamID); ok && matched {
 			anyMatch = true
 		}
 		return nil
