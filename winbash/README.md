@@ -40,7 +40,7 @@ winbash.exe --stop      # 停掉 daemon(不会为了停掉它而先把它拉起�
 
 | 参数 | 说明 |
 |---|---|
-| `-c` / `--script` | 要执行的脚本(也可以直接写位置参数:`winbash ls -l`) |
+| `-c` / `--script` | 要执行的脚本(也可以直接写位置参数:`winbash ls -l`)。**-c 后面的位置参数**按真 bash 语义绑成 $0/$1…(`winbash -c 'echo $0 $1' foo bar` 输出 `foo bar`,与 `bash -c` 及脚本文件路径的绑法一致;修之前它们被静默扔掉)。参数按参数传,引号与空格原样保留 |
 | `--json` / `-j` | 输出类型化 JSON 数组。**是整次调用的开关,写在 `-c` 之前** |
 | `--serve` | 前台运行 daemon |
 | `--stop` / `--status` | 停掉 / 查看 daemon(都不会把它拉起来)。两者都有 **5 s 上限**(`client.manageTimeout`),但那是**最后的保险**,不是常态:并发化之后它们**不再排队** —— op 分派在会话队列**之前**(见 `daemon.handleConn`),所以 daemon 正被一条长命令占着时它们仍会**立刻**返回真状态。5 s 只在 daemon 卡在关停这类极端情况下才兑现(端到端测试 `TestManageCommandsDoNotQueueBehindLongCommand` 钉着「忙时立刻返回」)。**`--stop` 的执行语义**:先把监听关掉、端口文件删掉(client 收到 OK 时 daemon 已经"消失"),再给正在跑的命令 **5 s 宽限**(`daemon.stopGrace`)让它收尾,到点仍在跑的会被取消 |
@@ -53,14 +53,14 @@ winbash.exe --stop      # 停掉 daemon(不会为了停掉它而先把它拉起�
 
 ## 升级与协议版本
 
-client 与 daemon 之间有协议版本(当前 **4**,见 `internal/ipc/ipc.go` 的 `ProtoVersion`)。
+client 与 daemon 之间有协议版本(当前 **5**,见 `internal/ipc/ipc.go` 的 `ProtoVersion`)。
 daemon 是**常驻**的(默认 30 分钟才退),且它由 client 用**同一个 exe 路径**拉起 —— 所以
 「你替换了 `winbash.exe`、而旧 daemon 还活着」是**正常状态**,不是意外。
 
 这种情况下新 client 连旧 daemon **会明确报错,不静默执行**:
 
 ```text
-winbash: client: daemon 没有协议版本(它是旧版),与本端(4)不兼容
+winbash: client: daemon 没有协议版本(它是旧版),与本端(5)不兼容
 怎么办: 运行 `winbash --stop` 停掉旧 daemon,下次调用会自动用新 exe 重建
 ```
 
@@ -72,6 +72,9 @@ winbash: client: daemon 没有协议版本(它是旧版),与本端(4)不兼容
 
 同一理由适用于 **4**:旧 daemon 不认识 `session` 字段,会当成没写 —— 于是 `--session build`
 静默退化成默认会话,并行的几条命令全挤在同一个队列里排队,而调用方以为已经分开了。
+
+同一理由适用于 **5**:旧 daemon 不认识 `args` 字段,会当成没写 —— 于是 `winbash -c 'echo $0 $1' foo bar`
+里的 `foo bar` 被静默扔掉,而真 bash 把它们绑成 $0/$1。
 
 处置只有一步:**`winbash --stop`**。`--stop` 与 `--status` **刻意不参与版本检查** ——
 否则「版本不匹配时先 `--stop`」这个推荐处置会被版本检查自己挡掉,陷入「要停它得先连上它」的死锁。

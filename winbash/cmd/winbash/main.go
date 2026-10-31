@@ -162,8 +162,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
+	// 位置参数的两种去向:
+	//   - 没有 -c:整体拼成脚本(README 承诺的 `winbash ls -l` 写法),沿用原行为;
+	//   - 有 -c:按真 bash 语义绑成 $0/$1…(`bash -c 'script' name arg1` 把 name 绑成
+	//     $0、arg1 绑成 $1)。修之前它们在这里被静默扔掉 —— 违反「不静默做错事」。
+	// 注意 `-c ''` 这类空脚本仍走拼接分支:那是从前的行为,不趁机改语义。
+	positional := fs.Args()
 	if script == "" {
-		script = strings.Join(fs.Args(), " ")
+		script = strings.Join(positional, " ")
+		positional = nil
 	}
 	if strings.TrimSpace(script) == "" {
 		fmt.Fprintln(stderr, "winbash: 没有要执行的脚本。用法: winbash -c 'ls -l'")
@@ -186,6 +193,11 @@ func run(args []string, stdout, stderr io.Writer) int {
 	// 是没意义的噪音 —— daemon 侧本来也会因为 fresh 而忽略它。
 	if !freshGiven {
 		opts = append(opts, client.Session(session))
+	}
+	// -c 后面的位置参数按参数传(不拼进脚本文本):引号与空格要原样活到 $0/$1。
+	// 没有位置参数时不传,daemon 侧与引入之前完全等价。
+	if len(positional) > 0 {
+		opts = append(opts, client.Args(positional...))
 	}
 	resp, err := client.RunTimeout(endpoint, script, cwd, jsonOut, timeout, idle, opts...)
 	if err != nil {

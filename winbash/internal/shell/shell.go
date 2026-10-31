@@ -1070,6 +1070,25 @@ func (s *Session) closeStdin() {
 // 退出码沿用 shell 惯例:0 成功,非零失败;语法解析失败返回 2。
 // jsonOut 是本次调用的 --json 开关,② 层命令据此改用类型化 JSON 输出。
 func (s *Session) Run(ctx context.Context, script string, jsonOut bool) (stdout string, exit int, errs []string) {
+	return s.RunArgs(ctx, script, nil, jsonOut)
+}
+
+// RunArgs 同 Run,并把 args 绑成位置参数:args[0] 是 $0,args[1:] 依次是 $1/$2/…。
+// 与脚本文件路径的绑法一致 —— bash 跑 `./s.sh a b` 与 mvdan 的 DefaultExecHandler
+// 跑脚本文件(interp/handler.go)都是「文件名当 $0、其余当 $1+」,`bash -c 's' name a`
+// 也是同一形状。args 为空时与 Run 完全等价(解析 name 用空串,Params 一字不动)。
+//
+// 会话级状态的两条纪律:
+//   - $1+ 落在 runner.Params(interp/vars.go 的 "1".."9" 分支),它是**跨 Run 持久**
+//     的会话状态,注入后必须还原 —— 否则这条命令的 $1 会泄漏给同一会话的下一条命令。
+//   - $0 走的是 File.Name(interp/api.go 的 Run:filename 每次 Run 都重置),不持久,
+//     无需还原。
+func (s *Session) RunArgs(ctx context.Context, script string, args []string, jsonOut bool) (stdout string, exit int, errs []string) {
+	name := ""
+	if len(args) > 0 {
+		name = args[0]
+	}
+
 	s.jsonOut = jsonOut
 
 	s.outBuf.Reset()
@@ -1083,7 +1102,7 @@ func (s *Session) Run(ctx context.Context, script string, jsonOut bool) (stdout 
 		s.closeStdin()
 	}()
 
-	prog, perr := syntax.NewParser().Parse(strings.NewReader(script), "")
+	prog, perr := syntax.NewParser().Parse(strings.NewReader(script), name)
 	if perr != nil {
 		return "", 2, []string{perr.Error()}
 	}
@@ -1093,6 +1112,18 @@ func (s *Session) Run(ctx context.Context, script string, jsonOut bool) (stdout 
 	}
 	if rerr := rejectUnsupportedParamExpansion(prog); rerr != nil {
 		return "", 2, []string{rerr.Error()}
+	}
+
+	// 注入 $1+。直接读写导出字段而不是 interp.Params(...) 选项:那个选项按 `set`
+	// 的规则解析开头带 - 的参数(`Params("-e", …)` 会打开 errexit 而不是把它绑成 $0),
+	// 而这里绑的是**用户写的原样参数**,不解析。保存/还原的形状与 interp 自己对
+	// 函数调用的处理一致(interp/runner.go 的 call:oldParams → r.Params = args[1:]
+	// → 执行 → 还原)。Restore 恒为旧值,即使脚本里跑过 `set -- x y` 也一样:
+	// 这次请求的参数来自调用方 argv,不该被会话记住。
+	if len(args) > 1 {
+		oldParams := s.runner.Params
+		s.runner.Params = args[1:]
+		defer func() { s.runner.Params = oldParams }()
 	}
 
 	runErr := s.runner.Run(ctx, prog)
