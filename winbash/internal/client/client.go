@@ -58,6 +58,15 @@ func Fresh() Option { return func(r *ipc.Request) { r.Fresh = true } }
 // 同名会话内仍然串行且状态持久;不同名会话之间才并行。语义见 ipc.Request.Session。
 func Session(name string) Option { return func(r *ipc.Request) { r.Session = name } }
 
+// Args 给这条命令带上位置参数:args[0] 绑成脚本的 $0,args[1:] 依次绑成 $1/$2/…。
+// 与 bash 的两种绑法一致 —— `bash -c 'script' name arg1` 与脚本文件 `./s.sh a b`
+// 都是第一个参数当 $0、其余当 $1+。不传 = 无位置参数,与引入本开关之前完全等价。
+//
+// 为什么要按参数传而不是把位置参数拼进脚本文本:拼接会把参数与代码混在一起
+// 重新解释,引号、空格、`$` 都会变义 —— `winbash -c 'echo $1' 'a b'` 里的空格
+// 必须原样活到 $1,拼接做不到。
+func Args(args ...string) Option { return func(r *ipc.Request) { r.Args = args } }
+
 // RunTimeout 同 Run,但给整个往返设一个上限(timeout<=0 表示不设限)。
 //
 // 这个上限会同时传给 daemon(见 ipc.Request.TimeoutMS):client 放弃不代表
@@ -68,11 +77,6 @@ func Session(name string) Option { return func(r *ipc.Request) { r.Session = nam
 //
 // 嵌套里(见 inSession)不走 daemon,直接在本进程执行 —— 理由见 runLocal。
 func RunTimeout(endpoint, script, cwd string, jsonOut bool, timeout, idle time.Duration, opts ...Option) (ipc.Response, error) {
-	if inSession() {
-		// 嵌套时 runLocal 本来就每次新建 Session,天然是 fresh 的,所以 opts 在这里
-		// 无事可做 —— 写出来是为了别让人以为漏了。
-		return runLocal(script, jsonOut, timeout)
-	}
 	req := ipc.Request{
 		Proto:     ipc.ProtoVersion,
 		Script:    script,
@@ -80,8 +84,17 @@ func RunTimeout(endpoint, script, cwd string, jsonOut bool, timeout, idle time.D
 		JSON:      jsonOut,
 		StdinMode: ipc.StdinNone,
 	}
+	// opts 在进嵌套分支**之前**展开:Args 是脚本语义的一部分,嵌套里同样要绑
+	// (见下面 runLocal 的调用);Fresh/Session 在嵌套里确实无事可做,但读进 req
+	// 再忽略与"根本没展开"是两回事 —— 后者会让新增的 Option 静默失效。
 	for _, o := range opts {
 		o(&req)
+	}
+	if inSession() {
+		// 嵌套时 runLocal 本来就每次新建 Session,天然是 fresh 的,Fresh/Session
+		// 在这里无事可做;但位置参数必须带上 —— 修之前嵌套里的 `winbash -c 'echo $0' foo`
+		// 把 foo 静默丢掉,与主路径是同一个 bug。
+		return runLocal(script, req.Args, jsonOut, timeout)
 	}
 	if stdinIsStream() {
 		req.StdinMode = ipc.StdinStream
@@ -875,7 +888,7 @@ func inSession() bool {
 //
 // 关于 cwd:唯一调用方是 cmd/winbash,它传的就是本进程的 cwd,而 NewSession 本来
 // 就以进程 cwd 起始,所以这里不需要再切一次。
-func runLocal(script string, jsonOut bool, timeout time.Duration) (ipc.Response, error) {
+func runLocal(script string, args []string, jsonOut bool, timeout time.Duration) (ipc.Response, error) {
 	sess := shell.NewSession()
 	defer sess.Close()
 
@@ -910,7 +923,7 @@ func runLocal(script string, jsonOut bool, timeout time.Duration) (ipc.Response,
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	out, exit, errs := sess.Run(ctx, script, jsonOut)
+	out, exit, errs := sess.RunArgs(ctx, script, args, jsonOut)
 	if cerr := ctx.Err(); cerr != nil {
 		// os.ErrDeadlineExceeded 带 Timeout() 方法,与 daemon 路径的超时是同一类,
 		// 上游能一眼认出"这是超时,不是脚本本身失败"。

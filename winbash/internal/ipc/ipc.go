@@ -37,6 +37,9 @@ var ErrPayloadTooLarge = errors.New("ipc: payload too large")
 //	2 流式 stdin:请求头之后跟**裸字节流**,不再缓存到内存(理由见 StdinMode)。
 //	3 Request.Fresh:一条命令可以要求跑在**一次性会话**里(理由见 Fresh 字段)。
 //	4 Request.Session:一条命令可以指定落到哪个**会话**里(理由见 Session 字段)。
+//	5 Request.Args:脚本的位置参数($0/$1…)。旧 daemon 不认识这个字段会当成没写
+//	  —— 于是 `-c` 后面的位置参数被静默扔掉,正是本次要修的 bug 形态,所以照旧
+//	  响亮拒绝错配(理由见 Args 字段)。
 //
 // 1 → 2 必须**两端同时**升级:如果 client 切到流式、daemon 还是 1,那么 daemon
 // 只解请求头就去执行,根本不读后面那串字节 —— 于是 stdin 静默丢失,而脚本照样
@@ -49,8 +52,11 @@ var ErrPayloadTooLarge = errors.New("ipc: payload too large")
 // 3 → 4 同样必须同时升级:旧 daemon 不认识 session 字段,会当没写 —— 于是
 // `--session build` 静默退化成默认会话,调用方以为已经隔离了。与 2 → 3 是同一个理由。
 //
+// 4 → 5 亦是:旧 daemon 不认识 args 字段,会当没写 —— 于是 `winbash -c 'echo $1' foo`
+// 里的 foo 被静默扔掉,而真 bash 把它绑成 $0。与 2 → 3 是同一个理由。
+//
 // 改动协议时把它 +1,并在两端的检查处同步更新说明。
-const ProtoVersion = 4
+const ProtoVersion = 5
 
 // StdinMode 的取值:一次请求的 stdin 走什么形态。
 const (
@@ -141,6 +147,17 @@ type Request struct {
 	// 稳定身份可用来自动路由。CLI 侧由 --session 或环境变量 WINBASH_SESSION_NAME
 	// 提供(见 cmd/winbash/main.go)。
 	Session string `json:"session,omitempty"`
+
+	// Args 是脚本的位置参数:Args[0] 绑成 $0,Args[1:] 依次绑成 $1/$2/…。
+	// 与 bash 的两种绑法一致 —— `bash -c 'script' name arg1` 把 name 绑成 $0、
+	// arg1 绑成 $1;脚本文件 `./s.sh a b` 把路径绑成 $0(见 interp 的
+	// DefaultExecHandler:文件名进 Parse、其余进 Params)。空 = 无位置参数。
+	//
+	// 之所以进协议而不是 client 自己拼进脚本文本:按**参数**传才能保住引号与空格
+	// (拼文本是把两类东西混在一起重解释,正是「不能字符串 join」的原因)。
+	// 旧 daemon 不认识本字段会当成没写 —— 位置参数被静默扔掉,正是「不静默做错事」
+	// 要消灭的形态,所以 ProtoVersion 随本字段升到 5,两端都响亮拒绝错配。
+	Args []string `json:"args,omitempty"`
 }
 
 // Response 是 daemon 返回给客户端的一条结果。

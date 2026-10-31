@@ -268,6 +268,73 @@ func TestPositionalArgsBecomeTheScript(t *testing.T) {
 	}
 }
 
+// -c 后面的位置参数按真 bash 语义绑成 $0/$1…:真 bash 对
+// `bash -c 'echo $0 $1' foo bar` 输出 `foo bar`(第一个位置参数当 $0,其余当 $1+),
+// 与脚本文件路径的绑法一致。修之前这些参数被**静默扔掉** —— 违反「不静默做错事」。
+//
+// --endpoint 必须写在位置参数之前,理由同 TestPositionalArgsBecomeTheScript。
+func TestDashCPositionalArgsBindToDollar0And1(t *testing.T) {
+	ep := tmpEndpoint(t)
+	t.Cleanup(func() { _, _, _ = runCLI(t, "--stop", "--endpoint", ep) })
+	startDaemon(t, ep)
+
+	// 基本绑定:$0 = 第一个位置参数,$1 = 第二个,与真 bash 逐字一致。
+	code, out, errOut := runCLI(t, "--endpoint", ep, "-c", "echo $0 $1", "foo", "bar")
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%q", code, errOut)
+	}
+	if got := strings.TrimSpace(out); got != "foo bar" {
+		t.Fatalf("got %q want %q", got, "foo bar")
+	}
+
+	// 参数按**参数**传,不是拼进脚本文本:引号与空格要原样活到 $0/$1。
+	// 若被 join 进脚本,`a b` 会裂成两个词、`$0` 就只剩 `a`。
+	// (绑法与 bash 一致:第一个位置参数是 $0,`a b` 是 $0、`c d` 才是 $1。)
+	code, out, errOut = runCLI(t, "--endpoint", ep, "-c", `echo "[$0] [$1]"`, "a b", "c d")
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%q", code, errOut)
+	}
+	if got := strings.TrimSpace(out); got != "[a b] [c d]" {
+		t.Fatalf("参数没有按原样绑定: got %q want %q", got, "[a b] [c d]")
+	}
+}
+
+// 无位置参数的 -c 行为不变:$1/$2 照旧为空(修之前后都一样),不凭空多出参数。
+// $0 的默认值(interp 的兜底)刻意不钉 —— 那是另一件事,本任务不引入新行为。
+func TestDashCWithoutPositionalArgsUnchanged(t *testing.T) {
+	ep := tmpEndpoint(t)
+	t.Cleanup(func() { _, _, _ = runCLI(t, "--stop", "--endpoint", ep) })
+	startDaemon(t, ep)
+
+	code, out, errOut := runCLI(t, "-c", `echo "[$1] [$2]"`, "--endpoint", ep)
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%q", code, errOut)
+	}
+	if got := strings.TrimSpace(out); got != "[] []" {
+		t.Fatalf("无位置参数时 $1/$2 应当为空: got %q", got)
+	}
+}
+
+// 这条命令注入的 $1 不得泄漏给同一会话的下一条命令:runner.Params 是跨 Run 持久的
+// 会话状态,注入后必须还原(见 shell.RunArgs)。同一条 daemon、同一个默认会话,
+// 第二条命令的 $1 必须为空。
+func TestDashCPositionalArgsDoNotLeakIntoNextCommand(t *testing.T) {
+	ep := tmpEndpoint(t)
+	t.Cleanup(func() { _, _, _ = runCLI(t, "--stop", "--endpoint", ep) })
+	startDaemon(t, ep)
+
+	if code, _, errOut := runCLI(t, "--endpoint", ep, "-c", "echo $1", "leaked"); code != 0 {
+		t.Fatalf("预热失败: code=%d stderr=%q", code, errOut)
+	}
+	code, out, errOut := runCLI(t, "--endpoint", ep, "-c", `echo "[$1]"`)
+	if code != 0 {
+		t.Fatalf("code=%d stderr=%q", code, errOut)
+	}
+	if got := strings.TrimSpace(out); got != "[]" {
+		t.Fatalf("位置参数泄漏进了同会话的下一条命令: got %q want \"[]\"", got)
+	}
+}
+
 // --status 看到 daemon,--stop 停掉它,之后 --status 必须失败(而不是又把它拉起来)。
 func TestStatusThenStopThenStatusFails(t *testing.T) {
 	ep := tmpEndpoint(t)

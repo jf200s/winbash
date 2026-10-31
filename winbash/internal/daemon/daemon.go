@@ -810,7 +810,10 @@ func (d *daemon) runJob(e *sessionEntry, j job) {
 		return
 	}
 
-	out, exit, errs := execSess.Run(ctx, req.Script, req.JSON)
+	// req.Args 按参数传进来绑 $0/$1…(bash 对 `-c 's' name a` 与脚本文件都是同一
+	// 绑法,见 shell.RunArgs)。旧 daemon 不认识这个字段 —— 那正是 ProtoVersion 升到 5
+	// 后 CheckProto 会响亮拒绝的错配,不会走到这里静默丢参数。
+	out, exit, errs := execSess.RunArgs(ctx, req.Script, req.Args, req.JSON)
 
 	// Run 一返回就回收喂入 goroutine。**顺序不能改**:Run 内部的 defer 已经关掉
 	// 读端并换回 /dev/null,但那支 goroutine 可能还卡在 conn.Read 上 ——
