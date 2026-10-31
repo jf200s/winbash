@@ -45,6 +45,44 @@ func Reg(ctx context.Context, conn *pwsh.Conn, argv []string, jsonOut bool, out,
 	}
 }
 
+// rejectUnknownFlags 挡下白名单之外的 -- 开头参数。
+//
+// 拼错的开关若不被拦下,会被当成键名/值名解释 —— 修前实测
+// `reg get HKCU\Environment --headr` 报「注册表值不存在: --headr」(exit 1),
+// `reg set <键> <名> <数据> --json` 报「set 需要 <键> <值名> <数据>」,
+// 都把注意力引向注册表内容或参数个数,而真正的问题是开关拼错了。
+// 口径对齐同层的 ps:-- 开头一律「不认识的参数」+ exit 2(ps.go 的未知参数路径)。
+//
+// 白名单条目两种写法:裸开关(如 "--header",只认全等)与带值开关(条目以 "="
+// 结尾,如 "--type=",按前缀匹配放行 "--type=REG_DWORD")。裸 -- 分隔符本层
+// (ps)没有支持的先例,不另发明:它同样落进「不认识的参数」。
+//
+// 必须在碰注册表之前调用 —— 拼错开关的请求一次脚本都不该跑。
+// 返回 false 时三行式错误已写好,调用方直接 return errs.ExitUsage。
+func rejectUnknownFlags(argv []string, allowed []string, remedy string, errw io.Writer) bool {
+	for _, a := range argv {
+		if !strings.HasPrefix(a, "--") {
+			continue
+		}
+		known := false
+		for _, f := range allowed {
+			if strings.HasSuffix(f, "=") {
+				known = strings.HasPrefix(a, f)
+			} else {
+				known = a == f
+			}
+			if known {
+				break
+			}
+		}
+		if !known {
+			fmt.Fprintln(errw, errs.Errorf("reg", "不认识的参数: "+a, remedy))
+			return false
+		}
+	}
+	return true
+}
+
 // regPrelude 是每段脚本都要用到的三个辅助函数。
 //
 // 用 .NET 的 RegistryKey 而不是 PowerShell 的 `HKLM:\` 提供者路径:
@@ -77,6 +115,10 @@ function __wb_regopen([string]$path, [bool]$writable) {
 `
 
 func regGet(ctx context.Context, conn *pwsh.Conn, argv []string, jsonOut bool, out, errw io.Writer) int {
+	if !rejectUnknownFlags(argv, []string{"--header"},
+		"reg get 只认开关 --header;"+regUsage, errw) {
+		return errs.ExitUsage
+	}
 	var (
 		pos        []string
 		withHeader bool
@@ -126,6 +168,10 @@ func regGet(ctx context.Context, conn *pwsh.Conn, argv []string, jsonOut bool, o
 }
 
 func regSet(ctx context.Context, conn *pwsh.Conn, argv []string, jsonOut bool, out, errw io.Writer) int {
+	if !rejectUnknownFlags(argv, []string{"--type", "--type="},
+		"reg set 只认开关 --type(带值写法 --type=REG_SZ);"+regUsage, errw) {
+		return errs.ExitUsage
+	}
 	var (
 		pos  []string
 		kind = "REG_SZ"
@@ -196,6 +242,10 @@ $k.SetValue($__wb_name, $__wb_value, $__wb_vk)
 }
 
 func regDel(ctx context.Context, conn *pwsh.Conn, argv []string, out, errw io.Writer) int {
+	if !rejectUnknownFlags(argv, nil,
+		"reg del 不接受开关;"+regUsage, errw) {
+		return errs.ExitUsage
+	}
 	if len(argv) < 1 || len(argv) > 2 {
 		fmt.Fprintln(errw, errs.Errorf("reg", "del 需要 <键> 或 <键> <值名>", regUsage))
 		return errs.ExitUsage
@@ -233,6 +283,10 @@ $null`
 }
 
 func regKeys(ctx context.Context, conn *pwsh.Conn, argv []string, jsonOut bool, out, errw io.Writer) int {
+	if !rejectUnknownFlags(argv, nil,
+		"reg keys 不接受开关;"+regUsage, errw) {
+		return errs.ExitUsage
+	}
 	if len(argv) != 1 {
 		fmt.Fprintln(errw, errs.Errorf("reg", "keys 需要一个键", regUsage))
 		return errs.ExitUsage

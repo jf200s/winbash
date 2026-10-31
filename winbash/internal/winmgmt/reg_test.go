@@ -176,6 +176,70 @@ func TestRegKeysListsSubkeys(t *testing.T) {
 	}
 }
 
+// 拼错的 -- 开关必须报「不认识的参数」,不能当键名/值名解释 —— 修前实测:
+// `reg get HKCU\Environment --headr` 报「注册表值不存在: --headr」exit 1,
+// `reg set … --json` 报「set 需要 <键> <值名> <数据>」,都把注意力引向了
+// 错误的地方。口径对照同层 ps:ps --headr → 「不认识的参数: --headr」exit 2。
+//
+// conn 传 nil:拒绝发生在碰引擎之前,任何"先跑了脚本再报错"的回归都会在这
+// 里 panic 而不是静默写注册表。
+func TestRegMisspelledFlagIsRejectedNotInterpreted(t *testing.T) {
+	cases := []struct {
+		name string
+		argv []string
+	}{
+		{"get", []string{"get", `HKCU\Environment`, "--headr"}},
+		{"set", []string{"set", `HKCU\Software\winbash-selftest`, "N", "42", "--json"}},
+		{"del", []string{"del", `HKCU\Software\winbash-selftest`, "--headr"}},
+		{"keys", []string{"keys", `HKCU\Environment`, "--headr"}},
+		// 裸 -- 分隔符本层不支持(同 ps),同样按不认识的参数拒绝,不当键名。
+		{"get-bare-dashdash", []string{"get", `HKCU\Environment`, "--"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var errw bytes.Buffer
+			code := Reg(context.Background(), nil, tc.argv, false, io.Discard, &errw)
+			if code != errs.ExitUsage {
+				t.Fatalf("%s: code=%d want %d", tc.name, code, errs.ExitUsage)
+			}
+			msg := errw.String()
+			if !strings.Contains(msg, "不认识的参数") {
+				t.Fatalf("%s: must say 不认识的参数, got %q", tc.name, msg)
+			}
+			if !strings.Contains(msg, tc.argv[len(tc.argv)-1]) {
+				t.Fatalf("%s: error must name the original arg: %q", tc.name, msg)
+			}
+			for _, misleading := range []string{"注册表值不存在", "需要 <键>", "需要一个键"} {
+				if strings.Contains(msg, misleading) {
+					t.Fatalf("%s: misleading message leaked: %q", tc.name, msg)
+				}
+			}
+			// remedy 要列出该子命令支持的开关,而不是只甩用法。
+			if !strings.Contains(msg, "开关") {
+				t.Fatalf("%s: remedy should name the supported flags: %q", tc.name, msg)
+			}
+		})
+	}
+}
+
+// set 的带值写法 --type=REG_DWORD 与空格写法等效(白名单按前缀放行它)。
+func TestRegSetWithTypeEqualsForm(t *testing.T) {
+	conn := startTestPwsh(t)
+	key := regTestKey
+	t.Cleanup(func() { Reg(context.Background(), conn, []string{"del", key}, false, io.Discard, io.Discard) })
+	if code := Reg(context.Background(), conn, []string{"set", key, "N", "42", "--type=REG_DWORD"}, false, io.Discard, io.Discard); code != 0 {
+		t.Fatalf("set with --type= failed: %d", code)
+	}
+	var out bytes.Buffer
+	Reg(context.Background(), conn, []string{"get", key, "N"}, false, &out, io.Discard)
+	if strings.Contains(out.String(), "0x") {
+		t.Fatalf("hex leaked: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "42") {
+		t.Fatalf("want 42: %q", out.String())
+	}
+}
+
 // set 必须回读出真实值:与其说「命令成功了」,不如给出结果本身。
 func TestRegSetReportsTheStoredValue(t *testing.T) {
 	conn := startTestPwsh(t)
