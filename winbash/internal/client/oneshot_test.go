@@ -382,10 +382,16 @@ func TestOneShotRetriesSendFailureOnNewDaemon(t *testing.T) {
 	fd1 = startFakeDaemon(t, func(conn net.Conn, seq int) {
 		defer conn.Close()
 		// 不读任何东西;先把端口文件改指向新 daemon(模拟「新 daemon 接管」),
-		// 再发 RST。顺序不能反:重试路径要先能从端口文件里拿到一个**不是死地址**
-		// 的新地址,否则它只能去 spawn(等 20s)。
+		// 再把 listener 一并关掉、发 RST。顺序不能反:重试路径要先能从端口文件里
+		// 拿到一个**不是死地址**的新地址,否则它只能去 spawn(等 20s)。
+		//
+		// listener 也必须关:重试路径会先对旧地址探活(发送失败不证明 daemon
+		// 死了),fd1 的 listener 还开着就会被判「活着」、重发落回 fd1 而不是
+		// fd2。真死的 daemon 连 listener 都没了,探活必然失败 —— 所以这条用例
+		// 同时是「探活失败 → 走原有换新路径」的回归。
 		time.Sleep(20 * time.Millisecond)
 		writePortFile(t, fd1.endpoint, fd2.addr, "fresh-token")
+		fd1.ln.Close()
 		if tc, ok := conn.(*net.TCPConn); ok {
 			_ = tc.SetLinger(0)
 		}
@@ -465,5 +471,72 @@ func TestAuthRetryReportsUnreadablePortFile(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "端口文件已不可读") {
 		t.Fatalf("错误应当说明端口文件已不可读, got %q", err.Error())
+	}
+}
+
+// ⑩ 发送失败但旧 daemon **还活着** → 探活发现活着 → 在**同一个** daemon 上重发,
+// 不换新、不孤儿化。
+//
+// 与 ⑦ 的分界线:⑦ 里 fd1 把 listener 也关了(daemon 真死),探活失败、重试落到
+// 新 daemon;这里 listener 一直开着(daemon 活着,只是这条连接被打断 —— 正是
+// daemon 读预算到点关连接时 client 侧看到的样子),探活必须成功、重发必须回到
+// 它自己身上。修之前这里无条件 forgetStaleEndpoint + ensureDaemonExcept,会把
+// 活 daemon 变成孤儿(端口文件被删、--status 看不到、要等 idle 才退)。
+//
+// 「端口文件被删」也一并构造进去:活分支要负责用已知 addr+token 原样写回,
+// 否则下一次调用读不到文件又会 spawn 一个新 daemon,孤儿换个地方再生。
+func TestOneShotResendsOnAliveDaemonWithoutSpawn(t *testing.T) {
+	var fd *fakeDaemon
+	fd = startFakeDaemon(t, func(conn net.Conn, seq int) {
+		defer conn.Close()
+		if seq == 1 {
+			// 第一条连接:模拟 daemon 中途断开 —— listener 保持开着(daemon
+			// 活着),顺手删掉端口文件,把「活分支要写回端口文件」钉进同一条用例。
+			// 睡 20ms + SetLinger(0) 发 RST,时序依据同 ⑦:60 MiB 的编码要几十
+			// 毫秒,RST 在第一次 write 之前就到,失败铁定落在发送阶段。
+			time.Sleep(20 * time.Millisecond)
+			_ = os.Remove(fd.endpoint)
+			if tc, ok := conn.(*net.TCPConn); ok {
+				_ = tc.SetLinger(0)
+			}
+			return
+		}
+		// 之后每条连接:探活的裸连接 dial 后立刻关、一个字节都不带,ReadMessage
+		// 读到 EOF;重发连接带着完整的请求帧。按「读不读得到帧」区分,不按序号
+		// —— 探活连接同样要占一个 accept 序号(这本身就是本用例钉住的事实:
+		// 探活对 daemon 只是「连上即断」,handleConn 静默丢弃,不留状态)。
+		raw, err := ipc.ReadMessage(conn)
+		if err != nil {
+			return // 探活连接:安静关掉,与真 daemon 的 handleConn 同一待遇
+		}
+		req, derr := ipc.DecodeRequest(raw)
+		if derr != nil {
+			t.Errorf("假 daemon 解请求失败: %v", derr)
+			return
+		}
+		// 重发连接:回显 token —— 断言重发用的还是**旧**凭据(没有换新 daemon,
+		// 自然没有新 token)。
+		reply(t, conn, ipc.Response{OK: true, Out: []byte(req.Token)})
+	})
+
+	resp, err := oneShot(fd.endpoint, ipc.Request{Script: strings.Repeat("x", 60<<20)},
+		false, 10*time.Second, 0)
+	if err != nil {
+		t.Fatalf("探活发现 daemon 活着,应当在同一个 daemon 上重发成功, got %v", err)
+	}
+	if got := fd.conns.Load(); got != 3 {
+		t.Fatalf("假 daemon 收到 %d 条连接,期望 3(第一条失败 + 探活裸连接 + 同一 daemon 上重发);"+
+			"只有 1 条说明没走探活,多于 3 条说明在别处反复重试", got)
+	}
+	if string(resp.Out) != "fake-token" {
+		t.Fatalf("重发应当携带**旧** daemon 的 token(没有换新), got %q", resp.Out)
+	}
+	// 端口文件被活分支原样写回 —— 下一次调用不必再 spawn。
+	b, rerr := os.ReadFile(fd.endpoint)
+	if rerr != nil {
+		t.Fatalf("端口文件应当被写回: %v", rerr)
+	}
+	if !strings.Contains(string(b), fd.addr) || !strings.Contains(string(b), "fake-token") {
+		t.Fatalf("端口文件内容 = %q,期望原样的 addr + fake-token", string(b))
 	}
 }

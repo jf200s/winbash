@@ -267,6 +267,37 @@ func oneShot(endpoint string, req ipc.Request, mustExist bool, timeout, idle tim
 	// 所以 daemon 那边要么没读到、要么读到一半就放弃执行(daemon.handleConn 在
 	// ReadMessage 失败时直接关连接)。重试一次是「从偶发竞态里恢复」和
 	// 「不在真故障上打转」之间的中点。
+	//
+	// 但"发送失败"**不证明 daemon 死了**:daemon 侧每条连接有 5 秒读预算
+	// (daemon.DefaultReadTimeout)读到一半就关连接,client 侧同样表现为写失败。
+	// 修之前这里无条件「删端口文件 + 换新 daemon」,把这种还活着的旧 daemon 变成
+	// 孤儿(--status 看不到、要等 idle 才退,可能还各抱一个 pwsh 引擎)—— 与
+	// permanent 失败路径(上面那个 if,刻意不碰 daemon)的取舍正好相反。
+	// 所以先对旧地址探活:活着就在它身上重发,确死才走换新的老路。
+	if probeDaemon(info.addr) {
+		// 活着:不 spawn。用手里留着的 addr+token 直接在旧 daemon 上重发。
+		// 刻意**不**走 forgetStaleEndpoint —— 文件指向一个活着的 daemon,
+		// 删它正好制造我们要避免的孤儿窗口;文件若已被别的进程删掉,原样写回
+		// (见 restoreEndpoint),否则下一次调用读不到文件又会 spawn 一个新的。
+		restoreEndpoint(endpoint, info)
+		conn2, derr := net.DialTimeout("tcp", info.addr, dialTimeout)
+		if derr == nil {
+			req.Token = info.token
+			resp2, xerr2 := exchange(conn2, req, timeout)
+			conn2.Close()
+			if xerr2 == nil {
+				return resp2, nil
+			}
+			// 探活之后 daemon 恰好死了、或重发又碰上别的失败:门槛与第一次
+			// 完全相同 —— 只有仍是**发送阶段**的瞬时失败才落回下面的换新路径
+			// (请求依旧没送达,重发仍然安全);超时、读失败(可能已执行)、
+			// permanent 都就地报错,绝不重放。
+			if !isSendFailure(xerr2) || isPermanentFailure(xerr2) {
+				return ipc.Response{}, xerr2
+			}
+		}
+	}
+	// 探活失败(真死了,连 listener 都没了)或活着重发又瞬时失败:走原有路径。
 	forgetStaleEndpoint(endpoint, info.addr)
 	// 同样要带 deadAddr:删不掉的残留文件会让 ensureDaemon 把死地址再交回来。
 	info2, aerr := ensureDaemonExcept(endpoint, info.addr, idle)
@@ -385,6 +416,46 @@ func forgetStaleEndpoint(endpoint, addr string) {
 				"(必要时手动删除,或 `icacls %s /grant:r <用户>:(R,W,D)`)\n",
 				endpoint, err, addr, endpoint)
 		}
+	}
+}
+
+// probeTimeout 是发送失败后对旧 daemon 探活的 dial 上限。
+//
+// 比 dialTimeout 短:这只是「还听不听得见」的一问,问不出声就当死了。真死
+// (端口没人听)在回环上立刻被拒,探活毫秒级返回;这个上限只为不会应答的地址
+// (防火墙吞 SYN 之类)兜底,别让重试在它身上白等太久。
+const probeTimeout = 2 * time.Second
+
+// probeDaemon 对旧 daemon 的地址做一次 TCP 探活,报告它是否还在监听。
+//
+// 只 dial 不说话:daemon 对一条读不到请求的连接本来就是静默关掉(handleConn
+// 在 ReadMessage 失败时 closeConnGracefully),所以探活连接不在 daemon 侧留下
+// 任何状态,也不推进任何会话。发送失败 ≠ daemon 死了 —— daemon 侧的读预算
+// (daemon.DefaultReadTimeout)读到一半关连接,client 侧同样是写失败;拿
+// 「写失败」当「进程已死」去换新 daemon,活着的那个就成了孤儿。
+func probeDaemon(addr string) bool {
+	conn, err := net.DialTimeout("tcp", addr, probeTimeout)
+	if err != nil {
+		return false
+	}
+	_ = conn.Close()
+	return true
+}
+
+// restoreEndpoint 在探活确认 daemon 活着之后,把缺失的端口文件用已知的
+// addr+token 原样写回。
+//
+// 只在文件**读不出来**时写:文件还在但不指向我们这份内容,说明有新 daemon
+// 已经接管(或另一个调用方正在写),覆盖写会把别人变成孤儿 —— 正是这次要
+// 消灭的形态。写失败只警告不拦路:重发走的是手里的 addr+token,不依赖文件。
+func restoreEndpoint(endpoint string, info endpointInfo) {
+	if _, err := readEndpoint(endpoint); err == nil {
+		return
+	}
+	if err := os.WriteFile(endpoint, []byte(info.addr+"\n"+info.token+"\n"), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "winbash: 警告: 端口文件 %s 写不回(%v);"+
+			"旧 daemon 仍在 %s 上服务,但下一次调用会重建一个新 daemon\n",
+			endpoint, err, info.addr)
 	}
 }
 
