@@ -2,6 +2,7 @@ package shell
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -37,5 +38,44 @@ func TestLayerThreeCommandsDoNotStartTheEngine(t *testing.T) {
 	_, _, _ = s.Run(context.Background(), "git --version", false)
 	if !strings.HasPrefix(s.EngineStatus(), "pwsh=not-started") {
 		t.Fatalf("③ 层的命令不该启动 ② 层的引擎: %s", s.EngineStatus())
+	}
+}
+
+// ② 层的 env/dir ctx 值现在只对 `pwsh` 子命令构造(shell.go 的 layerWinmgmt 分支
+// 按命令名收进了 if)。这条从 ① 层会话一路走到常驻引擎,钉住「pwsh 拿得到
+// export 的环境变量、以及会话 cd 过的目录」:分支收错了对象(比如漏掉 pwsh),
+// 这里会红。svc/reg/ps/sys 不读这两个值,由 winmgmt 包自己的测试覆盖。
+func TestPwshSubcommandSeesSessionEnvAndDir(t *testing.T) {
+	s := NewSession()
+	defer s.Close()
+
+	dir := t.TempDir()
+	// 同一条脚本里先 export、再 cd、最后 pwsh —— 三件事都在常驻引擎动手**之前**
+	// 发生,引擎启动那一刻继承的 env/cwd 必然是旧的,只有 ctx 值被真正带上才会对。
+	script := "export WINBASH_PWSH_PROBE=7; cd '" + filepath.ToSlash(dir) + "'; " +
+		`pwsh -c 'Write-Output $env:WINBASH_PWSH_PROBE; Write-Output (Get-Location).Path'`
+	out, exit, errsOut := s.Run(context.Background(), script, false)
+	if exit != 0 {
+		t.Fatalf("exit=%d errs=%v", exit, errsOut)
+	}
+
+	wantBase := strings.ToLower(filepath.Base(filepath.ToSlash(dir)))
+	var sawEnv, sawDir bool
+	for _, ln := range strings.Split(strings.TrimRight(out, "\r\n"), "\n") {
+		switch strings.TrimSpace(ln) {
+		case "7":
+			sawEnv = true
+		default:
+			if strings.ToLower(filepath.ToSlash(strings.TrimSpace(ln))) == wantBase ||
+				strings.HasSuffix(strings.ToLower(filepath.ToSlash(strings.TrimSpace(ln))), wantBase) {
+				sawDir = true
+			}
+		}
+	}
+	if !sawEnv {
+		t.Fatalf("pwsh 没拿到会话 export 的环境变量(out=%q errs=%v)—— env ctx 值没有带上", out, errsOut)
+	}
+	if !sawDir {
+		t.Fatalf("pwsh 的 (Get-Location) 不在会话目录 %s 下(out=%q)—— dir ctx 值没有带上", dir, out)
 	}
 }

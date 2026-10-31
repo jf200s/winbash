@@ -371,3 +371,55 @@ func TestCwdFailureIsReportedNotSilent(t *testing.T) {
 		t.Fatalf("报错没说清楚实际在哪执行: %q", errText)
 	}
 }
+
+// ★ 「目录相同就跳过 cd」的回归保护,一次钉住两半:
+//
+//  1. 会话目录被切到别处**之后**,下一条请求带的 client cwd 必须仍然切回去 ——
+//     这是这条优化唯一真正的风险面:跳错了对象,后续所有相对路径都跑在会话
+//     当前目录(而不是 client cwd)里,而且不报任何错。
+//  2. 目录真相同时,跳过 cd 与执行 cd 给出同样的可观察结果:pwd 不变、没有
+//     「无法切换」的错误行 —— 跳过是语义无操作。
+//
+// 两半都走同一个机制(请求带 cwd),所以四条请求交替换目录:任何一版
+// 「记住了上次 cwd 就跳过」的错实现都会在第 2/4 条上红。
+func TestCwdSkipIsNoopAndStillSwitchesBack(t *testing.T) {
+	ep := startDaemon(t, DefaultReadTimeout)
+	_, token := readEndpointFile(t, ep)
+
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+	baseA := strings.ToLower(filepath.Base(filepath.ToSlash(dirA)))
+	baseB := strings.ToLower(filepath.Base(filepath.ToSlash(dirB)))
+
+	// want 是每条请求的预期 pwd 尾段:前两条故意让 client cwd 与会话目录
+	// **不同**(必走 cd),后两条让它**相同**(命中跳过)。
+	steps := []struct{ cwd, wantBase string }{
+		{dirA, baseA}, // 建立会话目录 = dirA
+		{dirB, baseB}, // 切去 dirB(与会话目录不同 → 必须真的 cd)
+		{dirB, baseB}, // 相同 → 命中跳过;pwd 必须仍是 dirB
+		{dirA, baseA}, // 又切回去(再钉一次"不同必须切")
+	}
+	for i, st := range steps {
+		resp, err := rawRequest(t, ep, ipc.Request{
+			Proto:  ipc.ProtoVersion,
+			Token:  token,
+			Script: "pwd",
+			Cwd:    st.cwd,
+		})
+		if err != nil {
+			t.Fatalf("第 %d 条请求没拿到响应: %v", i+1, err)
+		}
+		if !resp.OK {
+			t.Fatalf("第 %d 条请求失败: exit=%d errs=%v", i+1, resp.Exit, resp.Errors)
+		}
+		errText := strings.ToLower(strings.Join(resp.Errors, " "))
+		if strings.Contains(errText, "无法切换") {
+			t.Fatalf("第 %d 条请求不该出现 cd 失败的 note: errs=%v", i+1, resp.Errors)
+		}
+		got := strings.ToLower(filepath.ToSlash(strings.TrimSpace(string(resp.Out))))
+		if !strings.HasSuffix(got, st.wantBase) {
+			t.Fatalf("第 %d 条请求 pwd=%q,期望尾段 %q —— cwd 没有生效(或跳过不是无操作)",
+				i+1, got, st.wantBase)
+		}
+	}
+}

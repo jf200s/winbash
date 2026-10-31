@@ -60,6 +60,14 @@ type Session struct {
 	engine    *pwsh.Conn
 	engineErr error
 
+	// parser 是语法分析器,会话内复用。
+	// mvdan 明确文档化「Parse can be called more than once, but not concurrently」
+	// (third_party/mvdan-sh/syntax/parser.go),每次 Parse 开头都会 reset() 清掉
+	// 上一次的解析状态,且每次调用传各自的 name —— 复用省掉的是每条命令一次
+	// NewParser 的分配。为什么安全:会话内的请求严格串行(interp.Runner 本身也
+	// 不保证并发安全,见 Session 的说明),不会撞上"不能并发"那一条。
+	parser *syntax.Parser
+
 	// searchPath 是 ③ 层要用的搜索路径:真实 PATH + Git Bash 的 usr\bin。
 	// 它在构造时算一次,存下来 —— 进程环境不动(Global Constraints),
 	// 所以这条路径只活在 Session 里。
@@ -126,6 +134,7 @@ func NewSession() *Session {
 	s := &Session{
 		stdout:     &switchWriter{},
 		stderr:     &switchWriter{},
+		parser:     syntax.NewParser(),
 		searchPath: BuildSearchPath(os.Getenv("PATH")),
 	}
 
@@ -245,12 +254,17 @@ func (s *Session) execHandler(ctx context.Context, args []string) error {
 		// 而 shell 里的 export 发生在之后 —— 不同步的话 `export X=1; pwsh -c '$env:X'`
 		// 会静默给出空值(见 winmgmt/pwshcmd.go)。
 		// 复用同一个 envList:③ 层子进程的环境与 ② 层的 $env: 因此保持一致。
-		// 注意这两个 ctx 值只有 `pwsh` 子命令会取用:svc/reg/ps/sys 是固定脚本,
-		// 走 conn.Run,不读 cwd/env(见 winmgmt/pwshcmd.go 与 common.go)。
-		ctx = winmgmt.WithEnv(ctx, envList(hc.Env, s.searchPath))
-		// 引擎常驻,所以 cwd 也必须每条同步(与 env 同一个理由):它的 cwd 是 daemon
-		// 启动时继承的那个,不会跟着会话的 `cd` 走。同样只有 `pwsh` 子命令取用。
-		ctx = winmgmt.WithDir(ctx, hc.Dir)
+		// 这两个 ctx 值只有 `pwsh` 子命令会取用:svc/reg/ps/sys 是固定脚本,
+		// 走 conn.Run,不读 cwd/env(envFrom/dirFrom 的调用点只在 pwshcmd.go:137,169)。
+		// 为什么安全:对那四条命令,附上去的值从来没人读 —— 白做;按名字收进 pwsh
+		// 分支后行为零变化。代价是 shell 包硬编码了 "pwsh" 这个名字:将来 ② 层若有
+		// 新命令要读 env/dir,必须同步这里(两条注释互指)。
+		if args[0] == "pwsh" {
+			ctx = winmgmt.WithEnv(ctx, envList(hc.Env, s.searchPath))
+			// 引擎常驻,所以 cwd 也必须每条同步(与 env 同一个理由):它的 cwd 是 daemon
+			// 启动时继承的那个,不会跟着会话的 `cd` 走。
+			ctx = winmgmt.WithDir(ctx, hc.Dir)
+		}
 		if code := winmgmt.Registry[args[0]](ctx, conn, args[1:], s.jsonOut, hc.Stdout, hc.Stderr); code != 0 {
 			return interp.ExitStatus(code)
 		}
@@ -542,66 +556,65 @@ func trapRemedy(sig string) string {
 	}
 }
 
-// rejectProcessSubstitution 在**解析之后、运行之前**挡住 `<(cmd)` / `>(cmd)`。
+// rejectUnsupportedSyntax 在**解析之后、运行之前**挡住 Windows 上会静默降级的语法。
+// 两个检查看的是同一棵树,原先各自 Walk 一遍纯属重复,这里合并成一次遍历;
+// 两个检查的职责与报错文案原样保留:
 //
-// 为什么必须提前:Windows 上 mvdan/sh 未实现进程替换,而且会把
-// `TODO: support process substitution on Windows` **打到 stdout** ——
-// 那是一句看起来像输出、实际是未实现标记的东西,正是最恶劣的失败形态。
-// 等运行到那一步才知道就晚了,所以这里走一遍 AST。
-func rejectProcessSubstitution(prog *syntax.File) error {
-	var found error
+//  1. 进程替换 `<(cmd)` / `>(cmd)` —— 为什么必须提前:Windows 上 mvdan/sh 未实现
+//     进程替换,而且会把 `TODO: support process substitution on Windows`
+//     **打到 stdout** —— 那是一句看起来像输出、实际是未实现标记的东西,正是最恶劣的
+//     失败形态。等运行到那一步才知道就晚了,所以这里走一遍 AST。
+//  2. 锚定参数展开 `${v/#前缀/替换}` 与 `${v/%后缀/替换}` —— 实测 mvdan/sh 把
+//     `#前缀` 当成字面去找,找不到就**原样输出未改动的值**、退出码为 0:
+//     语料扫描里 `v=prefix-x; echo ${v/#prefix/root}` 得到 `prefix-x`,而真 bash
+//     给 `root-x`。与 `<(cmd)` 同一类:不报错的失败比报错恶劣得多。
+//
+// 为什么安全(与原先两遍遍历逐点等价):进程替换报 DFS 首个,锚定展开也报 DFS 首个、
+// 且原先第二遍会下钻进 ProcSubst 的子树,这里照旧不剪枝;裁决顺序沿用原先 RunArgs
+// 的检查顺序 —— 有进程替换先报进程替换,否则报锚定展开。
+func rejectUnsupportedSyntax(prog *syntax.File) error {
+	var psErr, peErr error
 	syntax.Walk(prog, func(node syntax.Node) bool {
-		if found != nil {
+		if psErr != nil && peErr != nil {
 			return false
 		}
-		if ps, ok := node.(*syntax.ProcSubst); ok {
-			form := "<(命令)"
-			if ps.Op == syntax.CmdOut {
-				form = ">(命令)"
+		switch n := node.(type) {
+		case *syntax.ProcSubst:
+			if psErr == nil {
+				form := "<(命令)"
+				if n.Op == syntax.CmdOut {
+					form = ">(命令)"
+				}
+				psErr = errors.New(errs.Errorf("shell",
+					"这台机器上不支持进程替换 "+form+"(mvdan/sh 未实现,且会把一句 TODO 打到 stdout)",
+					"改用临时文件: 命令 > 临时文件,再对文件做下一步"))
 			}
-			found = errors.New(errs.Errorf("shell",
-				"这台机器上不支持进程替换 "+form+"(mvdan/sh 未实现,且会把一句 TODO 打到 stdout)",
-				"改用临时文件: 命令 > 临时文件,再对文件做下一步"))
-			return false
-		}
-		return true
-	})
-	return found
-}
-
-// rejectUnsupportedParamExpansion 拦住 mvdan/sh 没有实现、而且**会静默给错值**的参数展开。
-//
-// 当前只有一条:bash 4 的锚定替换 —— `${v/#前缀/替换}`(只替换开头)与
-// `${v/%后缀/替换}`(只替换结尾)。实测 mvdan/sh 把 `#前缀` 当成字面去找,
-// 找不到就**原样输出未改动的值**、退出码为 0:语料扫描里 `v=prefix-x; echo ${v/#prefix/root}`
-// 得到 `prefix-x`,而真 bash 给 `root-x`。
-//
-// 与 `<(cmd)` 同一类:不报错的失败比报错恶劣得多。所以拦在解析之后、运行之前。
-// 注意别误伤 mvdan/sh **确实支持**的邻居:`${v#pre}`(去前缀)、`${v%post}`(去后缀)、
-// `${v/x/y}`(普通替换)都不带这个锚定标记,不会命中这里。
-func rejectUnsupportedParamExpansion(prog *syntax.File) error {
-	var found error
-	syntax.Walk(prog, func(node syntax.Node) bool {
-		if found != nil {
-			return false
-		}
-		pe, ok := node.(*syntax.ParamExp)
-		if !ok || pe.Repl == nil {
+			// 刻意不在这里剪枝:锚定展开可能嵌在进程替换里(如 `cat <(${v/#a/b})`),
+			// 原先第二遍看得到它,这里也要看得到,「同时有两种坏语法」时报错对象才一致。
 			return true
-		}
-		switch wordHead(pe.Repl.Orig) {
-		case "#":
-			found = errors.New(errs.Errorf("shell",
-				"这台机器上不支持 ${变量/#前缀/替换} 这类锚定替换(mvdan/sh 未实现,而且会静默原样输出)",
-				`改用两步表达同一个意思: v=prefix-x; echo "root${v#prefix}"`))
-		case "%":
-			found = errors.New(errs.Errorf("shell",
-				"这台机器上不支持 ${变量/%后缀/替换} 这类锚定替换(mvdan/sh 未实现,而且会静默原样输出)",
-				`改用两步表达同一个意思: v=x-suffix; echo "${v%suffix}tail"`))
+		case *syntax.ParamExp:
+			// 注意别误伤 mvdan/sh **确实支持**的邻居:`${v#pre}`(去前缀)、
+			// `${v%post}`(去后缀)、`${v/x/y}`(普通替换)都不带这个锚定标记,
+			// 不会命中这里。
+			if peErr == nil && n.Repl != nil {
+				switch wordHead(n.Repl.Orig) {
+				case "#":
+					peErr = errors.New(errs.Errorf("shell",
+						"这台机器上不支持 ${变量/#前缀/替换} 这类锚定替换(mvdan/sh 未实现,而且会静默原样输出)",
+						`改用两步表达同一个意思: v=prefix-x; echo "root${v#prefix}"`))
+				case "%":
+					peErr = errors.New(errs.Errorf("shell",
+						"这台机器上不支持 ${变量/%后缀/替换} 这类锚定替换(mvdan/sh 未实现,而且会静默原样输出)",
+						`改用两步表达同一个意思: v=x-suffix; echo "${v%suffix}tail"`))
+				}
+			}
 		}
 		return true
 	})
-	return found
+	if psErr != nil {
+		return psErr
+	}
+	return peErr
 }
 
 // wordHead 取一个词开头的字面首字符(只处理以字面开头的常见写法)。
@@ -1102,15 +1115,15 @@ func (s *Session) RunArgs(ctx context.Context, script string, args []string, jso
 		s.closeStdin()
 	}()
 
-	prog, perr := syntax.NewParser().Parse(strings.NewReader(script), name)
+	// 复用会话的 parser(见 Session.parser 的注释):mvdan 文档明确 Parse 可反复
+	// 调用、开头必 reset(),每次传各自的 name,所以逐条命令复用行为零变化。
+	prog, perr := s.parser.Parse(strings.NewReader(script), name)
 	if perr != nil {
 		return "", 2, []string{perr.Error()}
 	}
 	// 解析之后、运行之前:拦住 Windows 上会静默降级的语法(进程替换、未实现的参数展开)。
-	if rerr := rejectProcessSubstitution(prog); rerr != nil {
-		return "", 2, []string{rerr.Error()}
-	}
-	if rerr := rejectUnsupportedParamExpansion(prog); rerr != nil {
+	// 一遍遍历同时做两个检查 —— 报错优先级与原先两遍遍历一致:先进程替换、后锚定展开。
+	if rerr := rejectUnsupportedSyntax(prog); rerr != nil {
 		return "", 2, []string{rerr.Error()}
 	}
 

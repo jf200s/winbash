@@ -201,3 +201,52 @@ func TestSupportedParamExpansionsStillWork(t *testing.T) {
 		}
 	}
 }
+
+// 单遍 Walk 合并(rejectUnsupportedSyntax)的回归:两种坏语法**同时出现**时,
+// 报错对象必须仍是进程替换 —— 这就是原先「两遍遍历、RunArgs 按序检查」的优先级。
+// 合并后若有人简化成「DFS 里先遇到谁就报谁」,第 1 条会红(锚定展开写在前面);
+// 若剪枝剪在 ProcSubst 上,第 3 条会暴露(锚定展开嵌在进程替换里,原先第二遍
+// 看得到它,但裁决顺序保证报的仍是进程替换)。
+func TestMergedSyntaxWalkKeepsProcSubstPrecedence(t *testing.T) {
+	for _, script := range []string{
+		`echo "${v/#prefix/root}"; diff <(echo a) <(echo a)`,
+		`diff <(echo a) <(echo a); echo "${v/#prefix/root}"`,
+		`diff <(echo "${v/#prefix/root}") <(echo a)`,
+	} {
+		s := NewSession()
+		out, exit, errsOut := s.Run(context.Background(), script, false)
+		joined := strings.Join(errsOut, "\n")
+		if exit != 2 {
+			t.Errorf("script %q: 语法拒绝固定退出码 2,got %d errs=%q", script, exit, joined)
+		}
+		if out != "" {
+			t.Errorf("script %q: 被拒的语法不该有 stdout,got %q", script, out)
+		}
+		if !strings.Contains(joined, "进程替换") {
+			t.Errorf("script %q: 应报进程替换(保持原先的检查优先级),got: %q", script, joined)
+		}
+	}
+}
+
+// parser 会话内复用的回归:mvdan 的约定是「Parse 可反复调用,开头 reset(),但不许并发」
+// (third_party/mvdan-sh/syntax/parser.go)。会话内的请求严格串行,复用是安全的;
+// 万一复用错了(解析状态跨 Run 泄漏),坏解析之后的正常命令会在这里红。
+func TestParserReuseAcrossRunsSurvivesFailedParses(t *testing.T) {
+	s := NewSession()
+
+	// 解析失败(引号不闭合):退出码 2。
+	if _, exit, _ := s.Run(context.Background(), `echo "unterminated`, false); exit != 2 {
+		t.Fatalf("解析失败应退出码 2,got %d", exit)
+	}
+	// 解析成功但被拦(进程替换):同样退出码 2 —— 这一条还会往 parser 里留下
+	// 一棵已经建好的 AST, reset() 必须把它清干净。
+	if _, exit, _ := s.Run(context.Background(), `diff <(echo a) <(echo a)`, false); exit != 2 {
+		t.Fatalf("被拒语法应退出码 2,got %d", exit)
+	}
+	// 同一会话继续跑正常命令(带展开、带位置参数的解析),必须一切如常。
+	s2 := "ok-$((1+2))"
+	out, exit, errs := s.RunArgs(context.Background(), "echo "+s2, []string{"prog"}, false)
+	if exit != 0 || strings.TrimSpace(out) != "ok-3" || len(errs) != 0 {
+		t.Fatalf("复用的 parser 跑下一条命令失败了: out=%q exit=%d errs=%v", out, exit, errs)
+	}
+}

@@ -36,6 +36,11 @@ import (
 type envKey struct{}
 
 // WithEnv 把 ① 层当前的环境变量(KEY=VALUE 列表)附到 ctx 上。
+//
+// 只有 `pwsh` 子命令会取这个值(svc/reg/ps/sys 走 conn.Run,不读 env)——
+// 所以 shell 包的 execHandler 只在命令名是 "pwsh" 时才附它
+// (见 internal/shell/shell.go 的 layerWinmgmt 分支):新增会读 env 的
+// ② 层命令时,两处必须同步改。
 func WithEnv(ctx context.Context, env []string) context.Context {
 	return context.WithValue(ctx, envKey{}, env)
 }
@@ -54,6 +59,9 @@ func envFrom(ctx context.Context) []string {
 type dirKey struct{}
 
 // WithDir 把 ① 层当前的工作目录附到 ctx 上。
+//
+// 同 WithEnv:只有 `pwsh` 子命令取这个值,调用侧(shell 包)按命令名收进了
+// pwsh 分支,两处注释互指。
 func WithDir(ctx context.Context, dir string) context.Context {
 	return context.WithValue(ctx, dirKey{}, dir)
 }
