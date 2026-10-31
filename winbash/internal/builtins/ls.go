@@ -24,7 +24,10 @@ import (
 func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int {
 	var (
 		long, all, human, dirOnly bool
-		paths                     []string
+		// -t 按 ModTime 新→旧排序;-r 逆序。「看最近改了哪些文件」
+		// (`ls -lt | head`、`ls -t *.go`)是 AI 最高频的动作之一。
+		sortByTime, reverse bool
+		paths               []string
 	)
 
 	// 逐字符解析,支持 -la 这类组合写法(bash 惯例)。
@@ -44,7 +47,7 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 		// 长开关整个报出来。拆成单字符会把 "--nope" 报成 "--",
 		// 使用者拿着这个提示没法定位问题。
 		if strings.HasPrefix(a, "--") {
-			remedy := "支持的参数: -l -a -h -1 -d"
+			remedy := "支持的参数: -l -a -h -1 -d -t -r"
 			if a == "--recursive" {
 				// ls 不做递归是对的(① 层的 ls 只列一层,语义可控),但"不认识的参数"
 				// 没说下一步 —— 递归列目录在 bash 里的标准解法是 find,直接给出来。
@@ -69,8 +72,16 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 				// 每行一个 —— 这本来就是我们的默认形态,所以接受它。
 				// 不接受反而更坏:`ls -1` 是极常见的写法,而它在这里的预期行为
 				// 恰好就是现状(给了 -l 时被 -l 压过,与 bash 一致)。
+			case 't':
+				// 按 ModTime 新→旧。并列 mtime 时按名字升序,与 GNU 一致
+				// (实测真 Git Bash coreutils 8.32,见 ls_sort_test.go)。
+				sortByTime = true
+			case 'r':
+				// 逆序。GNU 的 -r 逆转的是**整个比较器**而不只是最终列表 ——
+				// 所以 `-tr` 的并列条目名字也是倒的(实测同上),实现见 lsSort。
+				reverse = true
 			default:
-				remedy := "支持的参数: -l -a -h -1 -d"
+				remedy := "支持的参数: -l -a -h -1 -d -t -r"
 				if c == 'R' {
 					remedy = "ls 不递归;要递归列目录用 find: find . -name '*' (只看文件用 find . -type f)"
 				}
@@ -149,7 +160,9 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 			items = append(items, it)
 		}
 		// SliceStable:重复参数(如 `ls -d a a`)必须都留着,而排序只需可复现。
-		sort.SliceStable(items, func(i, j int) bool { return items[i].name < items[j].name })
+		// 排序键走 lsSort(默认按名;-dt 按 ModTime,-dr/-drt 整体逆转 —— 实测
+		// 真 GNU 对 -d 的操作数用同一套比较器)。
+		lsSort(items, sortByTime, reverse)
 
 		var widths lsWidths
 		if long {
@@ -162,6 +175,26 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 	}
 
 	code := errs.ExitOK
+
+	// GNU 把**所有非目录操作数当一组**排序后输出,且排在目录前面。`ls -t *.go`
+	// 靠的就是这个 —— glob 展开出的每个 .go 都是独立操作数,不攒成一组就没法按
+	// mtime 排。实测真 Git Bash coreutils 8.32(2026-10-31):
+	//
+	//	ls zfirst.txt alast.txt          → alast.txt zfirst.txt   (默认按名排序)
+	//	ls -t zfirst.txt alast.txt       → 新的在前
+	//	ls dirA f1.txt                   → 先 f1.txt,再 dirA 的内容
+	//
+	// 修之前文件操作数按参数原序逐个写出,`ls -t *.go` 静默不排 —— 正是要防的
+	// 「开关被吞了」形态。目录操作数仍按参数顺序展开;GNU 对多目录还会按名字排
+	// 目录并打 `目录名:` 表头,那是另一处既有差异,不在此处处理。
+	type dirJob struct {
+		abs     string
+		entries []os.DirEntry
+	}
+	var (
+		fileGroup []lsItem
+		dirJobs   []dirJob
+	)
 	for _, p := range paths {
 		abs, err := ResolvePath(cwd, p)
 		if err != nil {
@@ -181,9 +214,6 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 				code = errs.ExitError
 				continue
 			}
-			// 单个文件也要按长格式对齐 —— 此时"最大宽度"就是它自己,等价于不补齐。
-			// 传一个条目,复用同一套测量逻辑,免得两处格式串分叉。
-			//
 			// **名字用参数原文 `p`,不用 filepath.Base**。这条一度只在 `-d` 分支做对,
 			// 普通分支给的是 Base,于是同一个二进制里出现两种口径(实测 2026-10-18):
 			//
@@ -194,14 +224,31 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 			// 真 GNU 对**所有**操作数都输出参数原文。同一份 ls 里两种策略本身也是维护
 			// 风险 —— 下一个人很容易"统一"成错的那一边。
 			it := lsItem{name: p, info: info}
-			var widths lsWidths
 			if long {
 				it.links, it.exec = fileFacts(abs, info.IsDir())
-				widths = lsMeasure([]lsItem{it}, human)
 			}
-			writeLsEntry(out, it.name, it, long, human, widths)
+			fileGroup = append(fileGroup, it)
 			continue
 		}
+		dirJobs = append(dirJobs, dirJob{abs: abs, entries: entries})
+	}
+
+	// 非目录组:一组排序、一次测宽、一次输出。同组多个文件时数值列**跨组对齐**
+	// (GNU 把它们当同一份列表;修之前逐文件各测各的,等价于不补齐)。
+	// 列**文件**没有 total 行 —— total 是"目录里各条目占的块数",GNU 只在列目录时打。
+	if len(fileGroup) > 0 {
+		lsSort(fileGroup, sortByTime, reverse)
+		var widths lsWidths
+		if long {
+			widths = lsMeasure(fileGroup, human)
+		}
+		for _, it := range fileGroup {
+			writeLsEntry(out, it.name, it, long, human, widths)
+		}
+	}
+
+	for _, job := range dirJobs {
+		abs, entries := job.abs, job.entries
 
 		// 收集条目(名字 + 可选 info),再统一排序。
 		//
@@ -236,7 +283,10 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 			if !all && strings.HasPrefix(e.Name(), ".") {
 				continue
 			}
-			if !long {
+			// 短格式本来完全不取 info;但 **-t 要按 mtime 排**,那时短格式也得取
+			// (走 Info() 的缓存,不多花系统调用)。取不到的条目没法定位次序,
+			// 与长格式同款处理:报错、跳过、退出码非零。
+			if !long && !sortByTime {
 				items = append(items, lsItem{name: e.Name()})
 				continue
 			}
@@ -258,7 +308,7 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 				exec:  exec,
 			})
 		}
-		sort.Slice(items, func(i, j int) bool { return items[i].name < items[j].name })
+		lsSort(items, sortByTime, reverse)
 
 		// total 行。GNU `ls -l` 的第一行永远是它,且**只在列目录时**有
 		// (列单个文件时没有 —— 已在上面那条分支直接返回)。
@@ -290,7 +340,41 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 	return code
 }
 
-// lsItem 是待输出的一个条目。短格式时 info 为 nil(那时不该去取它)。
+// lsSort 对条目就地排序,三条路径(-d 的操作数、目录内容、文件操作数组)共用:
+//
+//   - 默认按名字升序(与 GNU 一致,不按参数原序);
+//
+//   - `-t`:先按 ModTime **新→旧**,并列 mtime 时按名字升序;
+//
+//   - `-r`:把**整个比较器**逆转,不是只把最终列表倒一遍 —— 所以 `-tr` 的并列
+//     条目名字是**倒序**的。实测真 Git Bash coreutils 8.32(2026-10-31):
+//
+//     ls -t  → new  t_alpha  t_mid  t_zeta  mid  old     (并列:名字升序)
+//     ls -tr → old  mid  t_zeta  t_mid  t_alpha  new     (并列:名字倒序)
+//
+// 用 SliceStable:-d 的重复参数(如 `ls -d a a`)比较结果相等,必须全部保留
+// 且次序可复现。
+func lsSort(items []lsItem, byTime, reverse bool) {
+	cmp := func(a, b lsItem) int {
+		// 新的在前:ModTime 大者排前面。info 为 nil 的条目只可能出现在
+		// 未开 -t 的短格式里,那时不会走这个分支。
+		if byTime && a.info != nil && b.info != nil {
+			if c := b.info.ModTime().Compare(a.info.ModTime()); c != 0 {
+				return c
+			}
+		}
+		return strings.Compare(a.name, b.name)
+	}
+	less := func(i, j int) bool { return cmp(items[i], items[j]) < 0 }
+	if reverse {
+		// 交换实参 = 取反比较结果(两个键的比较都是全序的,成立)。
+		less = func(i, j int) bool { return cmp(items[j], items[i]) < 0 }
+	}
+	sort.SliceStable(items, less)
+}
+
+// lsItem 是待输出的一个条目。短格式**且未开 -t**时 info 为 nil(writeLsEntry
+// 不碰它;开了 -t 短格式也要 info —— 排序键就是 ModTime)。
 //
 // links 在这里**预取一次**而不是等输出时再问:linkCount 要 os.Open,
 // 而输出前还要先扫一遍算列宽。若两处各问一次,`ls -l` 一个大目录就会把
@@ -298,7 +382,7 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 // 3000 项的微基准里,多一遍 open 就是多一遍)。
 type lsItem struct {
 	name  string
-	info  os.FileInfo // 短格式时为 nil,writeLsEntry 不会碰它
+	info  os.FileInfo // 短格式且未开 -t 时为 nil,writeLsEntry 不会碰它
 	links int         // 长格式时预取的硬链接数;短格式为 0,不会被用到
 	// exec 表示这个文件是**可执行形态**(MZ / `#!` 头,或 `.exe` 扩展名),
 	// 由 fileFacts 在同一次 open 里判定。权限串里的 x 位由它决定,见 msysMode。
