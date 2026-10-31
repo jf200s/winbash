@@ -171,6 +171,66 @@ func TestStdinNoneGivesImmediateEOF(t *testing.T) {
 	}
 }
 
+// ★ 同一 daemon 上**先流式 stdin、后无 stdin** 的序列回归。
+//
+// 单请求测试各管各的:TestStdinStreamIsForwardedToScript 与
+// TestStdinNoneGivesImmediateEOF 各自 startDaemon 起独立 daemon,从未在同一条
+// 会话上先 stream 再 none。而 stdin 的收尾时序恰恰要跨请求才验得出问题:
+// runJob 在 Run 返回**之后**才调 stopStdin(daemon.go:821-822),stopStdin 用
+// deadline 唤醒卡在 conn.Read 的喂入 goroutine、等它退出后再清 deadline
+// (daemon.go:949-951)。谁要是动了这个顺序(提前 stop、不等喂入 goroutine 退出、
+// 忘清 deadline),单请求测试大概率仍绿,只有同一 daemon 的第二条请求才暴露 ——
+// 典型形态就是第二条的 stderr 里冒出 `read |0: file already closed` 一类的收尾
+// 残留(AGENTS.md §4「端到端要专门构造同一 daemon 上先 A 后 B 的序列」点名的形态)。
+//
+// 所以这里在同一 ep 上连发两条:第一条喂 payload 断言内容到达;紧接着第二条
+// StdinNone,断言 cat 立刻拿到 EOF、echo 正常走到、且错误里没有收尾残留。
+func TestStdinStreamThenNoneOnSameDaemon(t *testing.T) {
+	ep := startDaemon(t, DefaultReadTimeout)
+	_, token := readEndpointFile(t, ep)
+
+	// 第一条:流式喂入,内容必须原样到达。
+	resp, err := rawRequestWithStdin(t, ep, ipc.Request{
+		Proto:     ipc.ProtoVersion,
+		Token:     token,
+		Script:    "cat",
+		StdinMode: ipc.StdinStream,
+		StdinLen:  ipc.StdinUntilEOF,
+	}, []byte("seq-payload\n"))
+	if err != nil {
+		t.Fatalf("第一条(流式)没拿到响应: %v", err)
+	}
+	if !resp.OK {
+		t.Fatalf("第一条(流式)失败: exit=%d errs=%v", resp.Exit, resp.Errors)
+	}
+	if got := string(resp.Out); !strings.Contains(got, "seq-payload") {
+		t.Fatalf("第一条没收到 stdin: out=%q", got)
+	}
+
+	// 第二条:**同一 ep**、无 stdin。cat 必须立刻拿到 EOF(rawRequest 的 5s
+	// deadline 在挂住时会先报错),echo 必须走到,且不得带回上一条收尾的残留错误。
+	resp2, err := rawRequest(t, ep, ipc.Request{
+		Proto:     ipc.ProtoVersion,
+		Token:     token,
+		Script:    "cat; echo '[eof]'",
+		StdinMode: ipc.StdinNone,
+	})
+	if err != nil {
+		t.Fatalf("第二条(无 stdin)没拿到响应(挂住或断连): %v", err)
+	}
+	if !resp2.OK {
+		t.Fatalf("第二条失败: exit=%d errs=%v", resp2.Exit, resp2.Errors)
+	}
+	if got := string(resp2.Out); !strings.Contains(got, "[eof]") {
+		t.Fatalf("第二条 cat 之后没走到 echo,out=%q", got)
+	}
+	errText := strings.Join(resp2.Errors, " ")
+	if strings.Contains(errText, "already closed") {
+		t.Fatalf("第二条带回上一条收尾的残留错误(errs=%v)—— "+
+			"第一条的 stdin 收尾污染了同一 daemon 上的后续请求", resp2.Errors)
+	}
+}
+
 // sendRaw 发一帧请求并读响应,任何失败都以 error 返回(**不用 t.Fatalf**)。
 //
 // 为什么单独一个:下面那条测试要在 goroutine 里并发发请求,而 t.Fatalf 在非测试
