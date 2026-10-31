@@ -1,0 +1,9 @@
+{
+  "apiVersion": "reasonix.io/plugin/v2",
+  "name": "delegation-discipline",
+  "version": "0.1.0",
+  "description": "Portable delegation and delivery discipline: split by cohesion, isolate writers in worktrees, require receipts, and verify delegated work yourself.",
+  "contributes": {
+    "skills": ["skills"]
+  }
+}
