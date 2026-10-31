@@ -16,6 +16,24 @@ var psColumns = []string{"PID", "Name", "MemoryBytes"}
 
 const psUsage = "用法: ps [名称或PID] [--header]"
 
+// psClassicFlags 把经典 ps(BSD / System V)的旗标映射到 winbash 的等价写法。
+//
+// 这些旗标在 winbash 的 ps 里没有对应语义,但绝不能静默落到名称过滤里:
+// 过滤是子串匹配,`ps aux` / `ps -ef` 的 aux/ef 会被当成进程名去匹配,
+// 匹配不到就给**空列表 + exit 0** —— 看起来像「一切正常,只是没有进程」,
+// 而使用者(AI)下一步的动作恰恰建立在这个假象上。`ps aux | grep …` 是
+// 全人类的肌肉记忆,这正是「静默做错事」最典型的形态。所以一律响亮拒绝
+// (exit 2 + 三行式错误),remedy 给出等价写法,风格同 ls -R 的指路。
+var psClassicFlags = map[string]string{
+	"aux": "列全部进程直接裸写 ps;按名过滤写 ps <名称>(例如 ps pwsh);按 PID 过滤直接写数字(例如 ps 1234)",
+	"-ef": "列全部进程直接裸写 ps;按名过滤写 ps <名称>(例如 ps pwsh);按 PID 过滤直接写数字(例如 ps 1234)",
+	"-e":  "列全部进程直接裸写 ps",
+	"-f":  "winbash 的 ps 固定输出 PID / Name / MemoryBytes 三列,没有全格式;列全部进程直接裸写 ps",
+	"-l":  "winbash 的 ps 固定输出 PID / Name / MemoryBytes 三列,没有长格式;列全部进程直接裸写 ps",
+	"-u":  "没有按用户过滤;按名过滤写 ps <名称>(例如 ps pwsh),按 PID 过滤直接写数字(例如 ps 1234)",
+	"-p":  "按 PID 过滤直接写数字: ps 1234",
+}
+
 // psProjection 把进程对象压成三列。
 //
 // WorkingSet64 是 int64 原生值,直接交给 ConvertTo-Json 就是 JSON 数字 ——
@@ -28,6 +46,9 @@ const psProjection = " | ForEach-Object { [ordered]@{ PID = $_.Id; Name = [strin
 // 名字沿用 bash 的 `ps` 而不是新造 `procs`:它与 bash 的 ps 语义本来就吻合
 // (列出进程),AIN 不必多记一个词。无参数列全部;给参数则按名称(子串、
 // 不区分大小写)或 PID(纯数字、精确)过滤。
+//
+// 经典 ps 的旗标(aux / -ef / -e / -f / -l / -u / -p)与其它以 - 开头的
+// 参数一律响亮拒绝(见 psClassicFlags),绝不静默当名字过滤。
 func Ps(ctx context.Context, conn *pwsh.Conn, argv []string, jsonOut bool, out, errw io.Writer) int {
 	var (
 		pos        []string
@@ -39,6 +60,24 @@ func Ps(ctx context.Context, conn *pwsh.Conn, argv []string, jsonOut bool, out, 
 			withHeader = true
 		case strings.HasPrefix(a, "--"):
 			fmt.Fprintln(errw, errs.Errorf("ps", "不认识的参数: "+a, psUsage))
+			return errs.ExitUsage
+		case strings.HasPrefix(a, "-"):
+			// 以单个 - 开头的一律不是过滤条件。经典旗标(-ef/-e/-f/-l/-u/-p)
+			// 给专门的等价写法;其余(如 ps -z)同样响亮拒绝 —— 进程名过滤
+			// 是子串匹配,把 "-z" 当子串几乎必然匹配不到,等于静默空结果。
+			remedy, classic := psClassicFlags[a]
+			problem := "不认识的参数: " + a
+			if classic {
+				problem = "经典 ps 旗标 " + a + " 在这里不可用"
+			} else {
+				remedy = psUsage
+			}
+			fmt.Fprintln(errw, errs.Errorf("ps", problem, remedy))
+			return errs.ExitUsage
+		case a == "aux":
+			// `ps aux` 是不带破折号的经典写法(BSD 惯例连 - 都省了),肌肉记忆
+			// 指向的与 `ps -aux` 是同一件事,同样拒绝而不是当名字过滤。
+			fmt.Fprintln(errw, errs.Errorf("ps", "经典 ps 旗标 aux 在这里不可用", psClassicFlags["aux"]))
 			return errs.ExitUsage
 		default:
 			pos = append(pos, a)

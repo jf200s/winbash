@@ -172,7 +172,7 @@ BRE 这一条是修过的:**早先默认按整串字面匹配**,于是这几个�
 |---|---|
 | `svc` | `list [--running\|--stopped] [--header]` · `status <名称>` · `start\|stop\|restart <名称>` |
 | `reg` | `get <键> [值名] [--header]` · `set <键> <值名> <数据> [--type T]` · `del <键> [值名]` · `keys <键>` |
-| `ps` | `[名称或PID] [--header]` |
+| `ps` | `[名称或PID] [--header]`;经典旗标(`aux` / `-ef` / `-e` / `-f` / `-l` / `-u` / `-p`)与其它 `-` 开头参数**响亮拒绝**并给等价写法 |
 | `sys` | `[os\|cpu\|mem\|disk] [--header]` |
 | `pwsh` | `-c '<脚本>'` · `-Command '<脚本>'` · `<脚本文件.ps1>`(可带 `-NoProfile` / `-NoLogo` / `-NonInteractive`) |
 
