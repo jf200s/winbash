@@ -286,6 +286,14 @@ func (s *Session) callGuard(ctx context.Context, args []string) ([]string, error
 		return guarded, err
 	}
 
+	// kill:mvdan/sh 把它列进内建名表却没有实现 —— dispatch 落到 default 分支恒
+	// failf(2, "unsupported builtin"),而内建不走 ExecHandler,③ 层 Git Bash 自带的
+	// kill.exe 根本轮不到。killGuard 把它翻译成 Windows 语义(taskkill)。细则见
+	// killguard.go 顶上的注释。
+	if rew, ok := killGuard(ctx, args); ok {
+		return rew, nil
+	}
+
 	// `command -v X [X...]`:mvdan/sh 的原逻辑只查**进程 PATH** 与它自己的内建表 ——
 	// 于是对 winbash 自己的内建(`ls`)和只在 Git Bash usr\bin 里的工具(`sed`)都会说
 	// "没有"。AI 常写 `command -v X >/dev/null && …` 做存在性判断,这一误判是**静默**的。

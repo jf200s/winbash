@@ -119,6 +119,17 @@ winbash: client: daemon 没有协议版本(它是旧版),与本端(5)不兼容
 | `grep` | `[-i -n -v -c -l -r -E -F -q -A N -B N -C N -m N -o -w -x -e P] PATTERN [文件...]`;无文件 = 读 stdin,`-` 也是 stdin |
 | `which` | `[-a\|--all] [--layers] 名字 [名字...]`;认识下面**四层**,①/② 层报名字,③ 层报绝对路径。`-a` 列出**所有**匹配位置(按 PATH 顺序)。`--layers` 是**诊断**开关:逐行报出 ①② 层各命中与否、③ 层的每个目录分别是否命中,全都没有时给一行「结论 所有层都没有」并以 `1` 退出 —— 它回答的是「为什么没落到」而不是「落到哪」,所以不打印最终位置。不认识的开关**响亮拒绝**(`exit 2`)而不是当名字搜 |
 
+`kill` 不在这张表里,但同样被接管了(2026-10-31 起)。它挂在 mvdan/sh 的**内建名表**上 ——
+内建不走 `ExecHandler`,四层路由根本轮不到它,而上游又没有实现,原先任何形式都报
+`unsupported builtin`。winbash 在 CallHandler 层把它翻译成 Windows 语义(Windows 没有
+信号,只有两档力度):`kill <pid>...` 逐个执行 `taskkill /PID`(优雅尝试,成功静默);
+`kill -9 <pid>` / `-KILL` 加 `/F` 强杀。`kill -l` 列出 POSIX 1–15 信号名对照表(注明
+Windows 无信号,这只是名字到 taskkill 语义的映射),`kill -l 9` 给 `KILL`。`%1` 这类
+作业号与 `-s` 等其它旗标一律**响亮拒绝**并给替代写法(查 PID 用 `ps`)。两点要知道:
+优雅信号只有**带窗口**的程序收得到,控制台程序(如 `ping`)要用 `kill -9`;失败时该
+命令 `rc=1` 且脚本继续(与真 bash 一致,`kill $PID || echo gone` 可用)。细则与回归见
+[已知差异与限制.md](已知差异与限制.md) 的 `kill` 行(`internal/shell/killguard.go`)。
+
 GNU grep 的两个高频选项 `--include` / `--exclude` **不支持**(① 层只有上表那些开关)。它们常被
 写在 PATTERN **之后**(`grep -rn x --include='*.go' .`),而真 grep 靠 getopt 的 **permutation**
 把选项挪到前面 —— 我们不做置换,所以这类写法里的 `--include` 会被当成**文件名**。修之前它的
