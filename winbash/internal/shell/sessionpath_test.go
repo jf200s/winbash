@@ -242,3 +242,58 @@ func TestSyncSearchPathOnlyRebuildsOnRealChange(t *testing.T) {
 		t.Fatalf("重派生结果不含新目录: %q", after.search)
 	}
 }
+
+// 疑似 MSYS 写法的判定表:盘符冒号(下标 1)与 UNC 不算;`/` 开头、冒号在下标 0
+// 或下标 ≥2 都算 —— 这些是 bash 习惯写法在 Windows PATH 里留下的全部痕迹形态。
+// 相对条目不归这个判定管(它的语义本身就存疑,见实现注释)。
+func TestSuspiciousPathEntryClassification(t *testing.T) {
+	cases := []struct {
+		entry string
+		want  bool
+	}{
+		{"C:\\tools", false},
+		{"C:", false},
+		{"\\\\srv\\share", false},
+		{"", false},
+		{"/tmp", true},
+		{"/x:C:\\a", true},
+		{":C:\\a", true},
+		{"C:\\a:C:\\b", true},
+		{"relative\\dir", false},
+	}
+	for _, c := range cases {
+		if got := suspiciousPathEntry(c.entry); got != c.want {
+			t.Errorf("suspiciousPathEntry(%q) = %v, 期望 %v", c.entry, got, c.want)
+		}
+	}
+}
+
+// 用户 2026-10-31 踩过的原坑:export PATH=/tmp:$PATH(MSYS 习惯)静默失效 ——
+// 127 不崩不报错。export 本身照旧执行(行为不变),但响应 errs 里要点一句并点名
+// 首个可疑条目;改回 Windows 形式(; 分隔、盘符)后,警告随新快照消失。
+func TestSessionPATHMSYSSyntaxWarnsAndRecovers(t *testing.T) {
+	s := NewSession()
+	defer s.Close()
+
+	// 坏形式:警告点名 /tmp,脚本照常跑、退出码不变。注意脚本里要有一条**过
+	// execHandler 的命令**(ls 这类 winbash 路由的;echo/export 是 mvdan 自己的
+	// 内建,不进 execHandler,sync 没机会跑)—— 这与「定位只发生在过路由的命令上」
+	// 是同一条边界。
+	_, exit, errs := s.Run(context.Background(), `export PATH=/tmp:$PATH && ls .`, false)
+	if exit != 0 {
+		t.Fatalf("MSYS 形式的 export 不该改变脚本执行: exit=%d", exit)
+	}
+	joined := strings.Join(errs, "\n")
+	if !strings.Contains(joined, "MSYS") || !strings.Contains(joined, "/tmp") {
+		t.Fatalf("应当有点法警告并点名 /tmp, got %v", errs)
+	}
+
+	// 改回干净值(不继承坏条目 —— $PATH 会话继承会把 /tmp: 那段又带回来,那不是
+	// 干净值):新快照不带可疑标记,警告消失。
+	_, _, errs = s.Run(context.Background(), `export PATH="C:/tools"; ls .`, false)
+	for _, e := range errs {
+		if strings.Contains(e, "MSYS") {
+			t.Fatalf("改回干净形式后不该再有写法警告: %v", errs)
+		}
+	}
+}

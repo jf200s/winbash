@@ -97,11 +97,14 @@ type Session struct {
 //
 // source 是 interp **变量**里当前的 PATH 值(会话初始 = 进程 PATH;之后跟着
 // 会话里的 `export PATH` / `PATH=…` 走);search 是 BuildSearchPath(source) 的结果
-// —— Git Bash 的 usr\bin 恒在最前,后面是 source。两个字段合成一个不可变整体,
-// 见 Session.path 上为什么必须整体换、不能原地改。
+// —— Git Bash 的 usr\bin 恒在最前,后面是 source。suspicious 记录 source 里**首个**
+// 疑似 MSYS/POSIX 写法的条目(见 firstSuspiciousPathEntry),空 = 没有;RunArgs
+// 收尾据此追加指路警告。两个字段合成一个不可变整体,见 Session.path 上为什么
+// 必须整体换、不能原地改。
 type pathSnapshot struct {
-	source string
-	search string
+	source     string
+	search     string
+	suspicious string
 }
 
 // syncSearchPath 让 ③ 层的搜索路径跟上会话里 PATH 变量的最新值。
@@ -139,7 +142,48 @@ func (s *Session) syncSearchPath(env expand.Environ) {
 		return
 	}
 	val := v.String()
-	s.path.Store(&pathSnapshot{source: val, search: BuildSearchPath(val)})
+	s.path.Store(&pathSnapshot{source: val, search: BuildSearchPath(val), suspicious: firstSuspiciousPathEntry(val)})
+}
+
+// suspiciousPathEntry 判断一个 PATH 条目是不是疑似 MSYS/POSIX 写法。
+//
+// Windows 的 PATH 条目只有两种合法形态:盘符形式(`C:\x`,冒号在**下标 1**)与
+// UNC(`\\srv\share`,无冒号);分隔符是 `;`。所以条目以 `/` 开头(MSYS 的
+// `/c/...` 形式),或冒号出现在盘符位置之外(`:C:\a`、`C:\a:C:\b`、`/x:$PATH`
+// 这类**用 `:` 拼接**的痕迹),都说明这份 PATH 是拿 bash 习惯写的 —— 那些条目在
+// os.Stat 下永不命中,③ 层定位会静默 127,不崩不报错。AI 与 Unix 背景的人
+// 天长日久会写,值得在响应里点一句(走不走的 warning 由 RunArgs 决定,这里只判定)。
+// 盘符冒号(`C:` 下标 1)与无冒号条目(空串、相对、纯名字)不算。
+func suspiciousPathEntry(e string) bool {
+	if e == "" {
+		return false
+	}
+	if strings.HasPrefix(e, "/") {
+		return true
+	}
+	i := strings.IndexByte(e, ':')
+	switch {
+	case i < 0:
+		return false
+	case i == 1:
+		// 盘符冒号是合法开头,但它**之后**再出现冒号(C:\a:C:\b)就是
+		// 「Windows 形式之间用 : 拼接」的痕迹,一样是坏条目。
+		return strings.IndexByte(e[i+1:], ':') >= 0
+	default:
+		// 下标 0(空前缀的 : 拼接)或下标 ≥2(/x:$PATH 形态)都算。
+		return true
+	}
+}
+
+// firstSuspiciousPathEntry 返回 PATH 值里首个疑似 MSYS 写法的条目,没有则空串。
+// 按源串里原样返回,警告里点名给使用者看。
+func firstSuspiciousPathEntry(p string) string {
+	for _, e := range strings.Split(p, ";") {
+		if suspiciousPathEntry(e) {
+			return e
+		}
+	}
+	return ""
 }
 
 // searchPath 返回当前生效的搜索路径(usr\bin 前置 + 最新的会话 PATH)。
@@ -1292,6 +1336,15 @@ func (s *Session) RunArgs(ctx context.Context, script string, args []string, jso
 	if hasBg {
 		errs = append(errs, backgroundJobWarning)
 	}
+	// PATH 写法警告(2026-10-31):会话 PATH 是 Windows 形式(`;` 分隔、盘符形式),
+	// 拿 MSYS 习惯写的 `export PATH=/x:$PATH` 会静默失效(条目永不命中,③ 层定位
+	// 127,不崩不报错)。快照里记着当前 PATH 的首个可疑条目,有就追加一行指路 ——
+	// 与上面的后台警告同一通道、同一成本,不改退出码。会话初始快照刻意不算可疑
+	// (进程 PATH 本来就是 Windows 形式),警告只针对**会话里改出来**的坏值;改回
+	// 干净值后新快照不带标记,警告自然消失。
+	if sus := s.path.Load().suspicious; sus != "" {
+		errs = append(errs, pathSyntaxWarning(sus))
+	}
 	return s.outBuf.String(), exit, errs
 }
 
@@ -1299,6 +1352,13 @@ func (s *Session) RunArgs(ctx context.Context, script string, args []string, jso
 // 指路常驻方案(`--detach`)。它进响应的 Errors 通道(非致命提示),不是错误。
 const backgroundJobWarning = "警告: `cmd &` 的后台任务会随本次请求结束被取消(输出与副作用一起消失);" +
 	"要脱离会话常驻,用 winbash --detach -c '…'"
+
+// pathSyntaxWarning 是会话 PATH 疑似 MSYS 写法时的固定一行,点名首个可疑条目。
+// 同样走响应的 Errors 通道,不是错误、不改退出码。
+func pathSyntaxWarning(entry string) string {
+	return "警告: PATH 里疑似混入了 MSYS/POSIX 写法的条目(「" + entry + "」,用 : 分隔或以 / 开头);" +
+		"Windows 的 PATH 用 ; 分隔、盘符形式(如 C:\\tools),否则 ③ 层定位不到它"
+}
 
 // nonEmptyLines 把 stderr 拆成非空行,用于 Response.Errors。
 func nonEmptyLines(s string) []string {

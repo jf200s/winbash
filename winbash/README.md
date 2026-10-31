@@ -561,7 +561,7 @@ go test ./internal/shell/ -run '^$' -bench BenchmarkSessionRun -benchtime=200x
 **会话里的 `export PATH` 即时生效**(2026-10-31):命令定位(③ 层)与子进程 / ② 层拿到的
 PATH 跟着**重派生**,Git Bash 的 `usr\bin` 恒在最前 —— `xargs` 等「子进程再 exec」的场景
 不受影响。两个形式细节:会话 PATH 是 **Windows 形式**(`;` 分隔),拼接新目录写
-`export PATH="C:/tools;$PATH"`(冒号形式 `/x:$PATH` 会把第一个真实目录并进坏条目);
+`export PATH="C:/tools;$PATH"`(冒号形式 `/x:$PATH` 会把第一个真实目录并进坏条目 —— 此时响应里会追加一行点名可疑条目的警告);
 `unset PATH` 刻意保守 —— 定位落回进程继承的 PATH,不会变盲。细则见
 [已知差异与限制.md](已知差异与限制.md)。
 
