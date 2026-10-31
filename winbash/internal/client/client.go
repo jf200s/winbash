@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -713,6 +714,17 @@ func ensureDaemonExcept(endpoint, deadAddr string, idle time.Duration) (endpoint
 // --endpoint 上的测试不会互相挡。
 func startLockPath(endpoint string) string { return endpoint + ".lock" }
 
+// parseStartLock 解析锁文件的内容:写入处(acquireStartLock 建锁时)留下的两行
+// 「pid\n纳秒时间戳」。除了 pid 还要带时间戳,是因为接管者重建的锁 pid 可能相同
+// (同一测试进程里先后 acquire 就是同 pid),时间戳行才是"这是我写下那把"的凭据。
+func parseStartLock(b []byte) (pid, stamp int64, ok bool) {
+	pidLine, rest, _ := strings.Cut(string(b), "\n")
+	stampLine, _, _ := strings.Cut(rest, "\n")
+	p, err1 := strconv.ParseInt(pidLine, 10, 64)
+	s, err2 := strconv.ParseInt(stampLine, 10, 64)
+	return p, s, err1 == nil && err2 == nil
+}
+
 // staleLockBudget 是判定「这把锁是陈旧残留」的时长。
 //
 // 必须**明显大于** startupBudget(20s):持锁者正常工作时最长就是花这么久等 daemon 起来,
@@ -736,10 +748,22 @@ func acquireStartLock(endpoint string) (release func(), alreadyUp bool, err erro
 	for {
 		f, oerr := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if oerr == nil {
-			// 写 pid 与时间戳只为事后排查"这把锁是谁留下的",判定陈旧看的是 mtime。
-			_, _ = fmt.Fprintf(f, "%d\n%d\n", os.Getpid(), time.Now().UnixNano())
+			pid, stamp := int64(os.Getpid()), time.Now().UnixNano()
+			// 写 pid 与时间戳:除了事后排查"这把锁是谁留下的",release 还要靠
+			// 回读这两行确认锁还在自己手里。
+			_, _ = fmt.Fprintf(f, "%d\n%d\n", pid, stamp)
 			_ = f.Close()
-			return func() { _ = os.Remove(path) }, false, nil
+			return func() {
+				// 删之前回读:持锁期间本进程可能被暂停超过 staleLockBudget,锁已被
+				// 别人接管重建 —— 那再删就是拔掉接管者的锁,给第三个进程并发
+				// spawn 开窗。只有内容仍是自己写下的那两行(pid + 时间戳)才删;
+				// 读不到或格式不认识时保守不删,宁可留一把待接管的陈锁,不误删活锁。
+				if b, rerr := os.ReadFile(path); rerr == nil {
+					if p, s, ok := parseStartLock(b); ok && p == pid && s == stamp {
+						_ = os.Remove(path)
+					}
+				}
+			}, false, nil
 		}
 		if !os.IsExist(oerr) {
 			return nil, false, fmt.Errorf("client: 建启动锁 %s 失败: %w", path, oerr)

@@ -99,6 +99,42 @@ func TestAcquireStartLock(t *testing.T) {
 			t.Fatalf("接管者的 release 应当删掉锁文件: %v", serr)
 		}
 	})
+
+	t.Run("锁被接管后,原持锁者的 release 不删接管者的锁", func(t *testing.T) {
+		ep := filepath.Join(t.TempDir(), "wb.port")
+		lockPath := startLockPath(ep)
+		release1, alreadyUp, err := acquireStartLock(ep)
+		if err != nil {
+			t.Fatalf("第一次抢锁不该失败: %v", err)
+		}
+		if release1 == nil || alreadyUp {
+			t.Fatalf("第一次应当抢到锁: release==nil:%v alreadyUp=%v", release1 == nil, alreadyUp)
+		}
+		// 把锁的 mtime 拨过陈旧线:模拟原持锁者被暂停超过 staleLockBudget,
+		// 不用真的等 30s(上面「陈旧锁被接管」子测试同款手法)。
+		old := time.Now().Add(-staleLockBudget - time.Minute)
+		if err := os.Chtimes(lockPath, old, old); err != nil {
+			t.Fatal(err)
+		}
+		release2, alreadyUp, err := acquireStartLock(ep)
+		if err != nil {
+			t.Fatalf("陈旧锁应当被第二次 acquire 接管: %v", err)
+		}
+		if release2 == nil || alreadyUp {
+			t.Fatalf("第二次应当接管成功: release==nil:%v alreadyUp=%v", release2 == nil, alreadyUp)
+		}
+		// 此刻锁文件已是接管者重建的那把。同一测试进程 pid 相同,release1 靠
+		// 时间戳行认出"这不是我写下的锁" —— 绝不能删,否则第三个进程就能并发 spawn。
+		release1()
+		if _, serr := os.Stat(lockPath); serr != nil {
+			t.Fatalf("被接管后,原持锁者的 release 不该删锁文件: %v", serr)
+		}
+		// 接管者自己的 release 语义不变:照删。
+		release2()
+		if _, serr := os.Stat(lockPath); !os.IsNotExist(serr) {
+			t.Fatalf("接管者的 release 应当删掉自己的锁: %v", serr)
+		}
+	})
 }
 
 // alreadyUp 也不许信死地址:等锁期间持锁者交上来的端口文件若是 deadAddr 本尊,
