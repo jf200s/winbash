@@ -236,7 +236,10 @@ func (s *Session) execHandler(ctx context.Context, args []string) error {
 	// 走 ctx 而不是改 Builtin 的形状 —— Registry 里只有一种形状是它的价值所在。
 	ctx = builtins.WithSearchPath(ctx, s.searchPath)
 
-	switch classify(args[0], s.searchPath) {
+	// locate 一次判定 + (裸名字)定位,(层, 绝对路径)一起带走 —— 判层与下面的
+	// runExternal 共享同一次 PATH 扫描,不再各扫一遍(见 locate 顶上的注释)。
+	lay, abs := locate(args[0], s.searchPath)
+	switch lay {
 	case layerBuiltin:
 		if code := builtins.Registry[args[0]](ctx, hc.Dir, args[1:], hc.Stdout, hc.Stderr); code != 0 {
 			return interp.ExitStatus(code)
@@ -275,7 +278,9 @@ func (s *Session) execHandler(ctx context.Context, args []string) error {
 	// **不用 interp.DefaultExecHandler**(R3 决定):它内部走 interp.LookPath,
 	// 读的是**进程 PATH**,不受我们构造的 searchPath 控制 —— 两者接不上,
 	// 而 Global Constraints 不允许改环境变量。
-	return s.runExternal(ctx, args, hc)
+	// locate 的结果(绝对路径 / 是否命中)一起带下去,runExternal 对裸名字
+	// 直接采用,不再对同一个 searchPath 扫第二遍。
+	return s.runExternal(ctx, args, hc, abs, lay == layerPath)
 }
 
 // callGuard 是所有简单命令在执行前都会经过的一道窄门。
@@ -413,8 +418,12 @@ func (s *Session) needsOurWhich(name string) bool {
 		return false
 	}
 	// 进程 PATH 里没有,但我们的搜索路径(Git Bash 的 usr\bin + 真 PATH)里有。
-	_, found := builtins.Which(name, s.searchPath)
-	return found
+	// 走 locate 单入口,与判层/执行共享同一次扫描(以及负缓存);对这里的判定
+	// 语义无影响 —— locate 调的就是同一个 Which,miss 也照样答"不归我们管"。
+	if lay, _ := locate(name, s.searchPath); lay == layerPath {
+		return true
+	}
+	return false
 }
 
 // splitEchoFlags 把 `echo -en` 这类**组合开关**拆成 `-e -n`。
@@ -672,7 +681,12 @@ func (t *tailBuffer) String() string {
 }
 
 // runExternal 是 ③ 层(命中真实 PATH)与 ④ 层(哪个都没有)的实现。
-func (s *Session) runExternal(ctx context.Context, args []string, hc interp.HandlerContext) error {
+//
+// preAbs / preOK 是 execHandler 从 locate 带下来的定位结果:裸名字(不含 / 或 \)
+// 直接采用,不再对同一个 searchPath 扫第二遍 —— 这是判层与执行共享同一次扫描的
+// 接缝。路径写法忽略这两个值:locate 那边的 stat 基准是**进程 cwd**,这里要按
+// 会话 cwd 重新解析后再定位(就是下面这段)。
+func (s *Session) runExternal(ctx context.Context, args []string, hc interp.HandlerContext, preAbs string, preOK bool) error {
 	// args[0] 有三种形态:裸名字(sed)、自带路径的相对写法(./t.sh)、自带路径的
 	// 绝对写法(/c/x/y.sh、C:\x\y.exe)。Which 对"自带路径"直接 os.Stat,而那个 stat
 	// 的基准是**进程** cwd(daemon 启动时那个目录),**不是**会话 cwd(hc.Dir ——
@@ -682,6 +696,8 @@ func (s *Session) runExternal(ctx context.Context, args []string, hc interp.Hand
 	// 「找不到这个命令」,而文案还把人引向"命令名写错了"(实测 exit 127)。
 	// 所以先按会话 cwd 解析成 Windows 绝对路径,再交给 Which。
 	target := args[0]
+	var abs string
+	var ok bool
 	if strings.ContainsAny(target, `/\`) {
 		// ResolveShellPath 负责 MSYS 挂载表(/c、/tmp、/usr/bin …);剩下的相对路径
 		// 按会话 cwd 拼成绝对路径。
@@ -689,8 +705,11 @@ func (s *Session) runExternal(ctx context.Context, args []string, hc interp.Hand
 		if !filepath.IsAbs(target) {
 			target = filepath.Join(hc.Dir, target)
 		}
+		abs, ok = builtins.Which(target, s.searchPath)
+	} else {
+		// 裸名字:locate 那一次扫描的结果直接带走(含负缓存判出的 miss)。
+		abs, ok = preAbs, preOK
 	}
-	abs, ok := builtins.Which(target, s.searchPath)
 	if !ok {
 		// ④ 层:明确报错 + 下一步。不是静默失败,也不是让 mvdan/sh 丢一句
 		// "command not found" 了事 —— 那句话没告诉使用者接下来该做什么。
