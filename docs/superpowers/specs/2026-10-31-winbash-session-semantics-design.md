@@ -98,6 +98,8 @@ winbash -c 'echo W'                                 →  W                  (rc=
 
 ---
 
+> **决议(2026-10-31):维持现状(A),本节其余方案记为「被咬到再立项」。** 用户拍板:EXIT trap 每条命令收尾触发不是缺陷,是 `bash -c` 的语义,而且是唯一自洽的那种 —— winbash 的每次请求本来就是一次 Run/一个脚本生命周期,「退出」对应的就是这条命令的收尾。差异表对应行转为决议记录;钉现状的 `TestExitTrapFiresOnEveryPersistentCommand` 判据继续有效。
+
 ## 2. 分叉②:会话内 `export PATH` 对定位与子进程静默无效
 
 ### 2.1 现状与证据
