@@ -110,6 +110,12 @@ func TestAcquireStartLock(t *testing.T) {
 		if release1 == nil || alreadyUp {
 			t.Fatalf("第一次应当抢到锁: release==nil:%v alreadyUp=%v", release1 == nil, alreadyUp)
 		}
+		// 两次 acquire 之间必须拉开超过 Windows 壁钟的计时粒度(粗可到 ~15.6ms):
+		// 同一进程 pid 必然相同,而接管者重建锁时写的 stamp 来自 time.Now() ——
+		// 两次调用若落进同一个计时 tick,UnixNano() 相等,重建的锁内容就与原锁
+		// 逐字节相同,release1 的回读比对会误判「还是我写下的锁」而把它删掉。
+		// CI runner 上实测撞过一次(本机恰好始终跨 tick,没暴露)。
+		time.Sleep(30 * time.Millisecond)
 		// 把锁的 mtime 拨过陈旧线:模拟原持锁者被暂停超过 staleLockBudget,
 		// 不用真的等 30s(上面「陈旧锁被接管」子测试同款手法)。
 		old := time.Now().Add(-staleLockBudget - time.Minute)
