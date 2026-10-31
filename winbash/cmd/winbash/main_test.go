@@ -271,6 +271,36 @@ func TestSessionEnvVarDoesNotTriggerUsageErrors(t *testing.T) {
 	}
 }
 
+// --detach 的用法守卫:只对「执行脚本」这条路有意义,且必须与 -c/--script 同用
+// (2026-10-31 会话语义决议)。与 --fresh/--session 的组合守卫同一原则:组合不合法
+// 就响亮拒绝,不静默忽略。
+//
+// 本包跑在 go test 进程里,os.Executable() 是 winbash.test —— 合法组合
+// (`--detach -c '…'`)真的会去拉子进程,所以**只在这里测用法错误**,行为本身由
+// e2e 的 TestDetachSpawnsIndependentProcess(真 exe)覆盖。涉管理开关的组合都刻意
+// 配了坏端点:万一守卫退化,--serve 会在目录端点上秒败、--stop/--status 连不上也
+// 很快返回 1 —— 用例照样红,不会假绿,也不会挂住一个前台 daemon。
+func TestDetachUsageGuards(t *testing.T) {
+	combos := [][]string{
+		{"--detach"},                                                          // 裸 --detach:没有脚本
+		{"--detach", "ls", "-l"},                                              // 位置参数不算:脚本文本得写在 -c 后
+		{"--detach", "--serve", "--endpoint", t.TempDir()},                    // 管理开关同给(目录当端点:守卫退化也秒失败)
+		{"--detach", "--stop", "--endpoint", tmpEndpoint(t)},                  // 同上
+		{"--detach", "--status", "--endpoint", tmpEndpoint(t)},                // 同上
+		{"--detach", "-c", "echo hi", "--stop", "--endpoint", tmpEndpoint(t)}, // -c 与管理开关同给(既有守卫,也要继续拦)
+		{"--detach", "-c", ""},                                                // 空脚本:不让它变成"父进程报成功、日志里报用法错误"
+	}
+	for _, c := range combos {
+		code, out, errOut := runCLI(t, c...)
+		if code != 2 {
+			t.Errorf("%v: code=%d want 2 (组合不合法不能静默放过) out=%q stderr=%q", c, code, out, errOut)
+		}
+		if !strings.Contains(errOut, "--detach") && !strings.Contains(errOut, "没有要执行的脚本") {
+			t.Errorf("%v: stderr 应当点名 --detach 或空脚本, got %q", c, errOut)
+		}
+	}
+}
+
 // run 的主路径:真拉起一个 daemon(端点指向临时目录),跑一条命令。
 func TestEchoRunsThroughARealDaemon(t *testing.T) {
 	ep := tmpEndpoint(t)
