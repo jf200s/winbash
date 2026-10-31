@@ -17,6 +17,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -766,7 +767,13 @@ func (d *daemon) runJob(e *sessionEntry, j job) {
 		defer func() { _ = execSess.Close() }()
 	}
 
-	if req.Cwd != "" {
+	// 目录相同就跳过 cd,为什么安全:归一化(Windows 大小写不敏感 + 分隔符统一)相等时,
+	// `cd 目标` 是语义无操作 —— 目录不变,PWD 也在每次 Run 开头按 r.Dir 重设
+	// (mvdan interp/api.go 的 Runner.Run),唯一可观察的差别是 OLDPWD 不再被这条
+	// 仪式性的 cd 改写成"当前目录"。比较**只会判成不同、不会判错成相同**:
+	// 拿不准的形状(POSIX 形式、相对路径、短名与长名混写)归一化后必不相等,
+	// 一律照旧走完整 cd 路径 —— 这里只会少做、不会做错。
+	if req.Cwd != "" && !sameDir(req.Cwd, execSess.Dir()) {
 		// client 传来 cwd 时先切过去。失败**不致命**(继续在旧目录执行),但绝不能
 		// 静默 —— 原先这里丢掉了退出码,于是"cd 没成功"与"根本没请求切目录"在输出上
 		// 完全一样,而使用者以为自己在目标目录里。把它作为一条错误行带回去。
@@ -1029,6 +1036,18 @@ func restrictEndpointFile(endpoint string) {
 // shellQuote 把一段文本变成安全的单引号 shell 字面量。
 func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// sameDir 判断两个目录是不是同一个 —— 只用于「能不能跳过 cd」的比较,不碰文件系统。
+//
+// 归一化规则:先 Clean(吃掉 `.`、`..` 与结尾分隔符),再把分隔符统一成 `/`
+// (client 传来的 cwd 与会话的 Dir 可能是 `\`、`/` 混写),最后按 Windows 的
+// 习惯忽略大小写。刻意**不**做短名展开或真实路径解析:那要付系统调用的钱,
+// 而判错的方向也是安全的 —— 把相同的判成不同只是照旧多执行一次 cd,
+// 把不同的判成相同才会错,而两条不同的真实路径在这里不可能折算成同一个字符串
+// (Windows 同一目录下不允许只有大小写之差的两项)。
+func sameDir(a, b string) bool {
+	return strings.EqualFold(filepath.ToSlash(filepath.Clean(a)), filepath.ToSlash(filepath.Clean(b)))
 }
 
 // removeIfOwned 只在端口文件里**还是自己的地址**时才删除它。
