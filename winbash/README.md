@@ -46,8 +46,8 @@ go build -o winbash.exe ./cmd/winbash
 
 | 参数 | 说明 |
 |---|---|
-| `-c` / `--script` | 要执行的脚本(也可以直接写位置参数:`winbash ls -l`)。**-c 后面的位置参数**按真 bash 语义绑成 $0/$1…(`winbash -c 'echo $0 $1' foo bar` 输出 `foo bar`,与 `bash -c` 及脚本文件路径的绑法一致;修之前它们被静默扔掉)。参数按参数传,引号与空格原样保留 |
-| `--json` / `-j` | 输出类型化 JSON 数组。**是整次调用的开关,写在 `-c` 之前** |
+| `-c` / `--script` | 要执行的脚本(也可以直接写位置参数:`winbash ls -l`)。**-c 后面的位置参数**按真 bash 语义绑成 $0/$1…(`winbash -c 'echo $0 $1' foo bar` 输出 `foo bar`,与 `bash -c` 及脚本文件路径的绑法一致;修之前它们被静默扔掉)。参数按参数传,引号与空格原样保留。**与 `--serve`/`--stop`/`--status` 不能同用**(`exit 2`)—— 管理开关只用于 daemon 管理,不会顺带执行脚本 |
+| `--json` / `-j` | 输出类型化 JSON 数组。**是整次调用的开关,写在 `-c` 之前**。**与 `--serve`/`--stop`/`--status` 不能同用**(`exit 2`)—— 管理开关只用于 daemon 管理,`--status` 的输出也不是 JSON |
 | `--serve` | 前台运行 daemon |
 | `--stop` / `--status` | 停掉 / 查看 daemon(都不会把它拉起来)。两者都有 **5 s 上限**(`client.manageTimeout`),但那是**最后的保险**,不是常态:并发化之后它们**不再排队** —— op 分派在会话队列**之前**(见 `daemon.handleConn`),所以 daemon 正被一条长命令占着时它们仍会**立刻**返回真状态。5 s 只在 daemon 卡在关停这类极端情况下才兑现(端到端测试 `TestManageCommandsDoNotQueueBehindLongCommand` 钉着「忙时立刻返回」)。**`--stop` 的执行语义**:先把监听关掉、端口文件删掉(client 收到 OK 时 daemon 已经"消失"),再给正在跑的命令 **5 s 宽限**(`daemon.stopGrace`)让它收尾,到点仍在跑的会被取消 |
 | `--endpoint` | 端口文件路径,默认 `%TEMP%\winbash-<用户名>.port`(按用户名区分,同机多用户不互踩)。文件里是**两行**:地址 + 随机 token |
