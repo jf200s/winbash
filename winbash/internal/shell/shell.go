@@ -649,8 +649,8 @@ func trapRemedy(sig string) string {
 }
 
 // rejectUnsupportedSyntax 在**解析之后、运行之前**挡住 Windows 上会静默降级的语法。
-// 两个检查看的是同一棵树,原先各自 Walk 一遍纯属重复,这里合并成一次遍历;
-// 两个检查的职责与报错文案原样保留:
+// 三个关注点看的是同一棵树,原先各自 Walk 一遍纯属重复,这里合并成一次遍历;
+// 前两个检查的职责与报错文案原样保留:
 //
 //  1. 进程替换 `<(cmd)` / `>(cmd)` —— 为什么必须提前:Windows 上 mvdan/sh 未实现
 //     进程替换,而且会把 `TODO: support process substitution on Windows`
@@ -660,17 +660,31 @@ func trapRemedy(sig string) string {
 //     `#前缀` 当成字面去找,找不到就**原样输出未改动的值**、退出码为 0:
 //     语料扫描里 `v=prefix-x; echo ${v/#prefix/root}` 得到 `prefix-x`,而真 bash
 //     给 `root-x`。与 `<(cmd)` 同一类:不报错的失败比报错恶劣得多。
+//  3. **收集性信息**(不报错、不剪枝):脚本里是否有后台任务(`cmd &`)。它是
+//     2026-10-31 会话语义决议的输入:后台 job 随请求结束被取消(差异表已记账),
+//     RunArgs 据此在响应 errors 里追加一行**指路 `--detach`** 的警告 —— 只报存在
+//     与否,整个脚本至多一行,不是错误、不改退出码。
 //
 // 为什么安全(与原先两遍遍历逐点等价):进程替换报 DFS 首个,锚定展开也报 DFS 首个、
 // 且原先第二遍会下钻进 ProcSubst 的子树,这里照旧不剪枝;裁决顺序沿用原先 RunArgs
 // 的检查顺序 —— 有进程替换先报进程替换,否则报锚定展开。
-func rejectUnsupportedSyntax(prog *syntax.File) error {
+// 返回的 hasBackground 只在 err == nil 时可信:两个错误都命中后遍历会提前收摊,
+// 但那时脚本已被整体拒绝,警告无从谈起。
+func rejectUnsupportedSyntax(prog *syntax.File) (hasBackground bool, err error) {
 	var psErr, peErr error
 	syntax.Walk(prog, func(node syntax.Node) bool {
 		if psErr != nil && peErr != nil {
 			return false
 		}
 		switch n := node.(type) {
+		case *syntax.Stmt:
+			// `cmd &` 在 mvdan 的 AST 里不是 BinaryCmd,而是 Stmt 的 Background 字段
+			// (syntax/nodes.go:「Background bool // stmt &」—— 实测探针确认:
+			// `nohup cmd &`、`( … ) &`、`a | b &`、`a & b`、`if …; then x & fi`
+			// 全部落在这一处;`a && b` 是 AndExpr,不置 Background,不会误伤)。
+			if n.Background {
+				hasBackground = true
+			}
 		case *syntax.ProcSubst:
 			if psErr == nil {
 				form := "<(命令)"
@@ -704,9 +718,9 @@ func rejectUnsupportedSyntax(prog *syntax.File) error {
 		return true
 	})
 	if psErr != nil {
-		return psErr
+		return hasBackground, psErr
 	}
-	return peErr
+	return hasBackground, peErr
 }
 
 // wordHead 取一个词开头的字面首字符(只处理以字面开头的常见写法)。
@@ -1229,8 +1243,10 @@ func (s *Session) RunArgs(ctx context.Context, script string, args []string, jso
 		return "", 2, []string{perr.Error()}
 	}
 	// 解析之后、运行之前:拦住 Windows 上会静默降级的语法(进程替换、未实现的参数展开)。
-	// 一遍遍历同时做两个检查 —— 报错优先级与原先两遍遍历一致:先进程替换、后锚定展开。
-	if rerr := rejectUnsupportedSyntax(prog); rerr != nil {
+	// 一遍遍历同时做两个检查并收集「有没有后台任务」—— 报错优先级与原先两遍遍历一致:
+	// 先进程替换、后锚定展开;后台任务只是收集性信息,与这两个报错无关。
+	hasBg, rerr := rejectUnsupportedSyntax(prog)
+	if rerr != nil {
 		return "", 2, []string{rerr.Error()}
 	}
 
@@ -1267,8 +1283,22 @@ func (s *Session) RunArgs(ctx context.Context, script string, args []string, jso
 			errs = append(errs, runErr.Error())
 		}
 	}
+	// 后台任务警告(2026-10-31 会话语义决议):`&` 的行为不变 —— 后台 job 仍随本次
+	// 请求结束被取消(差异表已记账、e2e 已钉),但脚本里**有**后台任务时追加一行指路
+	// `--detach` 的警告,把「静默数据丢失」变成「看得见的取舍」。走 errs(即响应的
+	// Errors 通道,与 daemon 的 note、stdin 源端读错误同一先例)而不改退出码 ——
+	// 对照组「脚本存活期间的后台 job 正常」是真实合法用法,不能因为警告而失败。
+	// 整个脚本只警告一次:hasBg 是布尔,`a & b & c` 也只追加一行。
+	if hasBg {
+		errs = append(errs, backgroundJobWarning)
+	}
 	return s.outBuf.String(), exit, errs
 }
+
+// backgroundJobWarning 是脚本含后台任务时的固定一行。措辞即决议原文:行为不变 +
+// 指路常驻方案(`--detach`)。它进响应的 Errors 通道(非致命提示),不是错误。
+const backgroundJobWarning = "警告: `cmd &` 的后台任务会随本次请求结束被取消(输出与副作用一起消失);" +
+	"要脱离会话常驻,用 winbash --detach -c '…'"
 
 // nonEmptyLines 把 stderr 拆成非空行,用于 Response.Errors。
 func nonEmptyLines(s string) []string {

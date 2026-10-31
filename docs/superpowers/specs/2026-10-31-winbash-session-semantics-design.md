@@ -190,6 +190,8 @@ winbash -c 'env PATH=/nonexistent-aabbcc no-such-xyz'      ← 唯一漏网:env.
 3. **A→B 的账已经立好**(差异表:77 写明了反转预案),B 的目标语义如 §3.2 所列三道坎的答案:绑会话、输出响亮丢弃、Close/`--stop` 收割。
 4. **C 否决**:对照用法真实存在,拒绝它得不偿失。
 
+**决议(2026-10-31):--detach + & 警告,本节其余方案作废。** 用户拍板不走 B(放活),改走双轨:`winbash --detach -c '…'` 新增显式脱离入口(拉脱离子进程 + 日志文件 + 回 pid,跨请求后台任务的正式答案);`cmd &` 行为维持现状(本节 a/b/c 的钉子原样有效),但脚本含后台任务时 shell 层追加一行指路 `--detach` 的警告(检测并进 `rejectUnsupportedSyntax` 的单遍 Walk,`cmd &` 是 `*syntax.Stmt` 的 `Background` 字段 —— 探针实测,不是想象中的 `BinaryCmd`;整个脚本至多一行、不改退出码)。§3.2 的 B 选项(放活)与 §3.3 的推荐随之作废;a/b 若哪天要反转,判据不变 —— 先改差异表再改测试。落地回归:`internal/shell/backgroundwarn_test.go`、e2e `TestBackgroundJobDiesWithTheRequest`(警告恰一次)与 `TestDetachSpawnsIndependentProcess`。
+
 ---
 
 ## 4. 若按推荐落地:分批实施顺序

@@ -1117,9 +1117,13 @@ func TestStreamStdinOnCommandThatIgnoresItStaysQuiet(t *testing.T) {
 // **孤儿进程语义**不同(`bash -c '( sleep 2; cmd ) &'` 返回后后台进程照常存活),
 // 而 winbash 对外承诺会话跨调用常驻,两者放在一起就是静默数据丢失。
 //
-// **这是钉现状防漂移**:放活后台进程,还是响亮拒绝 `&`,是协议级设计,单独立项
-// (见 winbash/已知差异与限制.md 的「cmd & 后台 job」行)。哪天实现了「后台 job
-// 存活」的语义,a/b 两条断言必须反转、c 保留 —— 先改差异表,再改这里。
+// **2026-10-31 决议**:行为维持现状(后台 job 仍随请求结束被取消),新增一条指路
+// `--detach` 的警告(shell 层在脚本含后台任务时向响应 errors 追加一行,整个脚本
+// 一次)—— 本测试随之把「警告出现且恰一次」加进 a/c 的断言;b 的脚本没有 `&`,
+// 顺带钉「没有后台任务就没有警告」。
+//
+// **这仍是钉现状防漂移**:哪天实现了「后台 job 存活」的语义,a/b 两条断言必须
+// 反转、c 保留,警告一并撤掉 —— 先改差异表,再改这里。
 //
 // 为什么必须端到端:取消长在「两条请求之间」—— runJob 返回的那个瞬间,包内测试
 // 看不见(与 TestFreshSessionIsIsolated 同一个理由)。
@@ -1134,7 +1138,9 @@ func TestBackgroundJobDiesWithTheRequest(t *testing.T) {
 
 	marker := filepath.Join(t.TempDir(), "bg.marker")
 
-	// a. 后台 job 随请求立即返回:rc=0、只有 FIRST-DONE、不等后台 job。
+	// a. 后台 job 随请求立即返回:rc=0、stdout 只有 FIRST-DONE、不等后台 job;
+	//    同时警告恰好一行(指向 --detach)。runWinbash 把 stdout/stderr 合并收,
+	//    所以断言用 Contains/Count 而不是整串相等。
 	//    计时判据给足两端余量:后台 sleep 2s,正常请求开销 ~15ms,即使慢机器放大
 	//    10 倍也远够不着 1.5s;而"等了后台 job"的实现会 ≥2s,两头都不会误判。
 	bgScript := "( sleep 2; echo BG > " + shellPathArg(marker) + "; echo LATE ) & echo FIRST-DONE"
@@ -1144,8 +1150,14 @@ func TestBackgroundJobDiesWithTheRequest(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("后台 job 的请求应当立即返回 rc=0: exit=%d out=%q", code, out)
 	}
-	if got := strings.TrimSpace(out); got != "FIRST-DONE" {
-		t.Fatalf("输出 = %q,期望只有 FIRST-DONE", got)
+	if !strings.Contains(out, "FIRST-DONE") {
+		t.Fatalf("输出 = %q,期望含 FIRST-DONE", out)
+	}
+	if got := strings.Count(out, "警告: `cmd &`"); got != 1 {
+		t.Errorf("脚本含后台任务时应恰一条指路警告,got %d 次: %q", got, out)
+	}
+	if !strings.Contains(out, "winbash --detach") {
+		t.Errorf("警告应指路 winbash --detach,实际: %q", out)
 	}
 	if elapsed >= 1500*time.Millisecond {
 		t.Errorf("第一条请求花了 %s —— 它等了后台 job,与「& 立即返回」的现状不符",
@@ -1154,7 +1166,8 @@ func TestBackgroundJobDiesWithTheRequest(t *testing.T) {
 
 	// b. 给足 2 倍余量(后台 job 需要 2s,这里等 4s)之后,断言副作用消失了。
 	//    在 winbash 里查是顺带钉「后续调用的输出干净」;宿主侧 stat 是独立见证,
-	//    不依赖 winbash 自己的 [ -e ]。
+	//    不依赖 winbash 自己的 [ -e ]。本条脚本没有 `&` —— 输出必须保持干净,
+	//    顺带钉住「没有后台任务就没有警告」。
 	out2, code2 := runWinbash(t, exe, endpoint, "-c",
 		"sleep 4; if [ -e "+shellPathArg(marker)+" ]; then echo MARKER-EXISTS; else echo MARKER-ABSENT; fi")
 	if code2 != 0 {
@@ -1165,7 +1178,7 @@ func TestBackgroundJobDiesWithTheRequest(t *testing.T) {
 			t.Fatalf("后台 job 的副作用(写出 %s)在请求结束之后出现了 —— 后台 job 活过了请求。"+
 				"若这是你改的语义,请先反转本测试 a/b 的判据并更新差异表,再合代码", marker)
 		}
-		t.Fatalf("第二条请求的输出 = %q,期望恰为 MARKER-ABSENT", got)
+		t.Fatalf("第二条请求的输出 = %q,期望恰为 MARKER-ABSENT(它没有后台任务,不该有警告)", got)
 	}
 	if _, err := os.Stat(marker); err == nil {
 		t.Errorf("宿主侧也看得到 %s —— 后台 job 的副作用活过了请求", marker)
@@ -1173,12 +1186,103 @@ func TestBackgroundJobDiesWithTheRequest(t *testing.T) {
 
 	// c. 对照组:脚本存活期间,后台 job 的输出与副作用都正常。
 	//    LATE 最迟 ~0.3s 出现,脚本再等 2s —— 6 倍余量,慢机器也不会假红。
+	//    警告在这里也要出现(它同样含 `&`):警告是「指路」,不是「拒绝」——
+	//    对照组这条合法用法必须照常工作、退出码不变。
 	out3, code3 := runWinbash(t, exe, endpoint, "-c", "( sleep 0.3; echo LATE ) & echo NOW; sleep 2")
 	if code3 != 0 {
 		t.Fatalf("对照组失败 exit=%d out=%q", code3, out3)
 	}
 	if !strings.Contains(out3, "NOW") || !strings.Contains(out3, "LATE") {
 		t.Errorf("对照组应当同时打出 NOW 与 LATE(脚本存活期间后台 job 正常),实际: %q", out3)
+	}
+	if got := strings.Count(out3, "警告: `cmd &`"); got != 1 {
+		t.Errorf("对照组也该恰一条指路警告(行为不变、只指路),got %d 次: %q", got, out3)
+	}
+}
+
+// TestDetachSpawnsIndependentProcess 钉住 2026-10-31 决议的另一半:--detach 真的
+// 拉起一个**脱离**的子进程跑完脚本 —— 父进程立即返回(不等脚本)、输出含 pid 与
+// 日志完整路径,随后(脚本 sleep 0.3 之后)marker 文件出现、日志里有脚本的 stdout。
+//
+// 对照 TestBackgroundJobDiesWithTheRequest:那边 `cmd &` 的副作用随请求消失,这边
+// 同样「后台化」的意图用 --detach 表达,副作用活过请求 —— 这就是两者唯一的分工。
+//
+// 清理纪律:marker 在 t.TempDir() 里自动回收;日志文件落在 %TEMP%(--detach 的
+// 约定位置),测试解析出真实路径后显式删除;子进程只跑 sleep 0.3 + echo,在断言
+// marker 之前就自然退出,不会有残留进程。daemon 用本测试自己的独立 endpoint,
+// t.Cleanup 的 stopAndWait 只停它。
+func TestDetachSpawnsIndependentProcess(t *testing.T) {
+	exe := buildWinbash(t)
+	endpoint := benchEndpoint(t)
+	t.Cleanup(func() { stopAndWait(t, exe, endpoint) })
+
+	if out, code := runWinbash(t, exe, endpoint, "-c", "echo warm"); code != 0 {
+		t.Fatalf("预热失败 exit=%d out=%q", code, out)
+	}
+
+	marker := filepath.Join(t.TempDir(), "detach.marker")
+	script := "echo DETACHED-START; sleep 0.3; echo BG > " + shellPathArg(marker)
+
+	start := time.Now()
+	out, code := runWinbash(t, exe, endpoint, "--detach", "-c", script)
+	elapsed := time.Since(start)
+	if code != 0 {
+		t.Fatalf("--detach 应当 exit 0: exit=%d out=%q", code, out)
+	}
+	// 父进程不等脚本(脚本 sleep 0.3,它连 daemon 都不碰):进程拉起是毫秒级,
+	// 给 10 倍余量也不会误判;"等了脚本"的实现会 ≥0.3s。
+	if elapsed >= 1500*time.Millisecond {
+		t.Errorf("--detach 父进程花了 %s —— 它等了脚本,不该等", elapsed.Round(time.Millisecond))
+	}
+	if !strings.Contains(out, "已脱离启动") {
+		t.Fatalf("--detach 的输出应当报告脱离启动,实际: %q", out)
+	}
+	// 解析 pid 与日志路径(格式:winbash: 已脱离启动,pid=12345,日志: C:\…\xxx.log)。
+	const pidMarker = "pid="
+	const logMarker = "日志: "
+	pi := strings.Index(out, pidMarker)
+	li := strings.Index(out, logMarker)
+	if pi < 0 || li < 0 {
+		t.Fatalf("输出应含 pid 与日志路径,实际: %q", out)
+	}
+	pidStr := out[pi+len(pidMarker):]
+	if cm := strings.IndexAny(pidStr, ",\r\n"); cm >= 0 {
+		pidStr = pidStr[:cm]
+	}
+	if pid, err := strconv.Atoi(pidStr); err != nil || pid <= 0 {
+		t.Errorf("pid 解析失败: %q (%v)", pidStr, err)
+	}
+	logPath := strings.TrimSpace(out[li+len(logMarker):])
+	if !filepath.IsAbs(logPath) {
+		t.Errorf("日志路径应是绝对路径: %q", logPath)
+	}
+	t.Cleanup(func() { _ = os.Remove(logPath) })
+	if _, err := os.Stat(logPath); err != nil {
+		t.Errorf("--detach 报告的日志文件应当已建好: %v", err)
+	}
+
+	// marker 在脚本 sleep 0.3 之后写出:轮询最多 10s(50 倍余量,慢机器也不会假红)。
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("10s 内 marker(%s)没出现 —— 脱离进程没有活过父进程的返回", marker)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if data, err := os.ReadFile(marker); err != nil || strings.TrimSpace(string(data)) != "BG" {
+		t.Errorf("marker 内容 = %q (%v),期望 BG", string(data), err)
+	}
+
+	// 日志里有子进程的 stdout(脚本第一句 echo)。
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("读日志失败: %v", err)
+	}
+	if !strings.Contains(string(logData), "DETACHED-START") {
+		t.Errorf("日志应当含脚本的 stdout(DETACHED-START),实际: %q", string(logData))
 	}
 }
 
