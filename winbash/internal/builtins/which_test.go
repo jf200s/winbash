@@ -274,3 +274,53 @@ func TestWhichLayersReportsEveryLayer(t *testing.T) {
 		}
 	})
 }
+
+// ★ `--` 之后全是名字(照 POSIX 惯例,与 ls/cat/grep 的 -- 对齐)。
+//
+// 修之前 case "--" 只有注释没有状态:-- 本身被消费掉,但后面的 -a 仍走 flag 分支
+// (被当成开关)、-x 仍走 default 被拒 —— `which -- -a` 最终报「需要至少一个名字」
+// (exit 2)。修之后 -- 之后的参数全部当名字;名字找不到时的行为照旧
+// (报「找不到: 名字」、exit 1),不因 -- 改变。
+func TestWhichCmdDoubleDashMakesEverythingAfterItAName(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "probe-dd.exe"), []byte("MZ"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithSearchPath(context.Background(), dir)
+
+	// -- 之后的 -a 按名字搜:目录里没有叫 -a 的可执行文件,应报「找不到: -a」
+	// 且 exit 1 —— 关键是不能再把 -a 当开关消费掉(否则是「需要至少一个名字」exit 2)。
+	var out, errw bytes.Buffer
+	code := WhichCmd(ctx, "", []string{"--", "-a"}, &out, &errw)
+	if code != errs.ExitError {
+		t.Fatalf("-- 之后的 -a 应当按名字搜, got code=%d stderr=%q", code, errw.String())
+	}
+	if !strings.Contains(errw.String(), "找不到: -a") {
+		t.Fatalf("应当按名字 -a 报找不到, got %q", errw.String())
+	}
+
+	// 名字在 -- 之后照常找得到。
+	out.Reset()
+	errw.Reset()
+	if code := WhichCmd(ctx, "", []string{"--", "probe-dd"}, &out, &errw); code != errs.ExitOK {
+		t.Fatalf("exit=%d stderr=%q", code, errw.String())
+	}
+	if !strings.Contains(out.String(), "probe-dd.exe") {
+		t.Fatalf("-- 之后的名字应当命中, got %q", out.String())
+	}
+
+	// 实际场景:有一个名字就叫 -a 的命令。开关在前、名字在 -- 之后 ——
+	// `which -a -- -a` 的第一个 -a 是开关(列所有位置),-- 之后的 -a 是名字。
+	exeA := filepath.Join(dir, "-a.exe")
+	if err := os.WriteFile(exeA, []byte("MZ"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out.Reset()
+	errw.Reset()
+	if code := WhichCmd(ctx, "", []string{"-a", "--", "-a"}, &out, &errw); code != errs.ExitOK {
+		t.Fatalf("exit=%d stderr=%q", code, errw.String())
+	}
+	if !strings.Contains(out.String(), exeA) {
+		t.Fatalf("应当找到名为 -a 的可执行文件, got %q", out.String())
+	}
+}

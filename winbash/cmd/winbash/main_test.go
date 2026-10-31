@@ -194,6 +194,41 @@ func TestFreshWithControlFlagsIsAUsageError(t *testing.T) {
 	}
 }
 
+// 脚本(-c / --script / 位置参数)与 --json/-j 都只对「执行脚本」这条路有意义;
+// --serve/--stop/--status 只用于 daemon 管理。同给时报用法错误,而不是静默只走管理
+// 开关 —— 修之前 `-c 'echo hi' --status` 只回状态、脚本从不执行且无任何提示,
+// `--json --status` 同样把 --json 静默吞掉。与 --fresh/--session 的组合守卫同一原则。
+//
+// 组合里凡涉 --stop/--status 的都指向**不存在的**临时端点:守卫在任何连接尝试之前
+// 就退出 2,不会碰真实 daemon;若守卫退化,--stop/--status 会在那种端点上返回 1,
+// 用例照样红,不会假绿。--serve 那条用**目录**当端点(TestServeFailsFastOnBadEndpoint
+// 的做法):万一守卫退化也不会挂住一个前台 daemon。
+func TestScriptAndJSONWithControlFlagsAreAUsageError(t *testing.T) {
+	combos := [][]string{
+		{"-c", "echo hi", "--status"},                                   // 修之前:只回状态,脚本不执行、无提示
+		{"--script", "echo hi", "--stop", "--endpoint", tmpEndpoint(t)}, // --script 与 -c 同变量,也要算
+		{"--endpoint", tmpEndpoint(t), "--stop", "echo", "hi"},          // 位置参数(写在 flag 之后)+ --stop
+		{"--serve", "--endpoint", t.TempDir(), "echo", "hi"},            // 位置参数 + --serve
+		{"--json", "--status", "--endpoint", tmpEndpoint(t)},            // 修之前:--json 被静默吞掉
+		{"-j", "--stop", "--endpoint", tmpEndpoint(t)},                  // -j 与 --json 同变量,也要算
+	}
+	for _, c := range combos {
+		code, _, errOut := runCLI(t, c...)
+		if code != 2 {
+			t.Errorf("%v: code=%d want 2 (组合不合法不能静默放过)", c, code)
+		}
+		if !strings.Contains(errOut, "daemon 管理") {
+			t.Errorf("%v: stderr 应当说明管理开关只用于 daemon 管理, got %q", c, errOut)
+		}
+	}
+
+	// 单独给管理开关不被误伤:在**不存在的**临时端点上 --status 返回 1(连不上),
+	// 不是 2 —— 证明新守卫只拦「同给」,没有把合法的单用打成用法错误。
+	if code, _, errOut := runCLI(t, "--status", "--endpoint", tmpEndpoint(t)); code == 2 {
+		t.Errorf("单独 --status 不该是用法错误, stderr=%q", errOut)
+	}
+}
+
 // --session 的默认值来自 WINBASH_SESSION_NAME,而那个变量是给**执行脚本**那条路用的。
 // 所以互斥校验的判据必须是「用户显式给了 flag」,不能是「值非空」——
 // 按值判会让一个环境变量把 --status / --stop / --serve 全部打成 exit 2。

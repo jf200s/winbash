@@ -124,6 +124,21 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 
+	// 脚本(-c / --script / 位置参数)与 --json/-j 都只对「执行脚本」这条路有意义。
+	// 与管理开关同给时报用法错误,而不是静默只走管理动作 —— 修之前
+	// `winbash -c 'echo hi' --status` 只回状态、脚本从不执行,且无任何提示;
+	// `--json --status` 同样把 --json 静默吞掉。与上面 --fresh/--session 的守卫同一原则:
+	// --serve/--stop/--status 只用于 daemon 管理,组合不合法就响亮拒绝。
+	scriptGiven := explicit["c"] || explicit["script"] || len(fs.Args()) > 0
+	if scriptGiven && (serve || stop || status) {
+		fmt.Fprintln(stderr, "winbash: -c / 位置参数是要执行的脚本;--serve/--stop/--status 只用于 daemon 管理,不能同用")
+		return 2
+	}
+	if (explicit["json"] || explicit["j"]) && (serve || stop || status) {
+		fmt.Fprintln(stderr, "winbash: --json/-j 只用于执行脚本的输出;--serve/--stop/--status 只用于 daemon 管理,不能同用")
+		return 2
+	}
+
 	// --serve / --stop / --status 是三个**互斥**的管理动作,必须三选一。
 	//
 	// 不校验的后果不是"忽略一个"那么轻 —— 它们按 if 顺序取第一个,而 `if serve` 在最前,

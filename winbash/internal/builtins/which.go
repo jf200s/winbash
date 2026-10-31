@@ -182,8 +182,17 @@ func WhichCmd(ctx context.Context, cwd string, argv []string, out, errw io.Write
 	//   - 一个都没找到时非零,否则 0(-a 与否都一样)。
 	all := false
 	layers := false
+	// `--` 之后全是名字(照 POSIX 惯例)。必须**置位**而不只是空 case:空 case 只把
+	// `--` 本身消费掉,后面的 -a 仍走 flag 分支、-x 仍被拒 —— 实测 `which -- -a`
+	// 会报「需要至少一个名字」(exit 2)。照 ls 的 operandsOnly 写法,-- 之后的
+	// 参数全部当名字;名字找不到时的行为照旧(报「找不到」、exit 1)。
+	operandsOnly := false
 	filtered := make([]string, 0, len(argv))
 	for _, a := range argv {
+		if operandsOnly {
+			filtered = append(filtered, a)
+			continue
+		}
 		switch a {
 		case "-a", "--all":
 			all = true
@@ -196,7 +205,7 @@ func WhichCmd(ctx context.Context, cwd string, argv []string, out, errw io.Write
 			// 那件事没有 GNU 对应物,所以不塞进默认输出,单开一个开关。
 			layers = true
 		case "--":
-			// `--` 之后全是名字(照 POSIX 惯例)。
+			operandsOnly = true
 		default:
 			// 其它以 - 开头的参数照旧响亮拒绝 —— 不静默当名字(项目底线)。
 			if strings.HasPrefix(a, "-") && a != "-" {
