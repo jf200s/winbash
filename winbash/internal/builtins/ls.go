@@ -29,9 +29,16 @@ func Ls(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int
 
 	// 逐字符解析,支持 -la 这类组合写法(bash 惯例)。
 	// 不认识的开关一律报错 —— 静默忽略一个 flag,使用者会以为它生效了。
+	// 惯例的 `--` 分隔符消费掉并停止开关解析,其后全部当操作数 ——
+	// 与 cat/grep/which 对齐,这样 `ls -- -a`(列名为 -a 的文件)才表达得出来。
+	operandsOnly := false
 	for _, a := range argv {
-		if a == "-" || !strings.HasPrefix(a, "-") {
+		if operandsOnly || a == "-" || !strings.HasPrefix(a, "-") {
 			paths = append(paths, a)
+			continue
+		}
+		if a == "--" {
+			operandsOnly = true
 			continue
 		}
 		// 长开关整个报出来。拆成单字符会把 "--nope" 报成 "--",

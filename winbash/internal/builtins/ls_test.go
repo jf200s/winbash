@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"winbash/internal/errs"
 )
 
 func TestLsDefaultIsOneNamePerLine(t *testing.T) {
@@ -472,6 +474,54 @@ func TestLsFileArgumentKeepsVerbatimText(t *testing.T) {
 //
 // 根因是 ResolvePath 把 `""` 当 cwd(那个分支是为 `cd ""` 不改目录服务的)。
 // 修法是**只收窄 ls 自己的口径**,不动 ResolvePath —— 它对 cd 是对的。
+// ★ `--` 是惯例的"停止开关解析"分隔符,其后全部当操作数 —— 与 cat/grep/which 对齐。
+//
+// 修之前 ls 是四个内建里独一份不认 `--` 的:`ls --` 整个被拒收,
+// `ls -- -a`(列名为 -a 的文件)无法表达。
+//
+// `-a` 用例里同时放一个点文件 `.hidden`:若 `-a` 被误当成开关而不是操作数,
+// 输出会连 `.hidden` 一起列出来 —— 一个用例同时钉住两个方向。
+func TestLsDashDashStopsFlagParsing(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "-a"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".hidden"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// `ls --` 本身:等价于不带参数,正常列出目录(点文件仍不列)。
+	out, errw, code := lsIn(t, dir, "--")
+	if code != 0 {
+		t.Fatalf("ls --: code=%d errw=%q", code, errw)
+	}
+	if got := strings.TrimSpace(out); got != "-a" {
+		t.Fatalf("ls -- 应当正常列出目录且不列点文件, got %q (errw=%q)", got, errw)
+	}
+
+	// `ls -- -a`:`-a` 是操作数,只列名为 -a 的文件,不当开关。
+	out, errw, code = lsIn(t, dir, "--", "-a")
+	if code != 0 {
+		t.Fatalf("ls -- -a: code=%d errw=%q", code, errw)
+	}
+	if got := strings.TrimSpace(out); got != "-a" {
+		t.Fatalf("ls -- -a 应当只列名为 -a 的文件(`-a` 不得被当开关,否则会连 .hidden 一起列), "+
+			"got %q (errw=%q)", got, errw)
+	}
+}
+
+// `--foo` 这类未知长开关照旧拒绝(exit=2 的用法错误),错误信息要点名它。
+func TestLsDashDashFooStillUsageError(t *testing.T) {
+	var errw bytes.Buffer
+	code := Ls(context.Background(), t.TempDir(), []string{"--foo"}, io.Discard, &errw)
+	if code != errs.ExitUsage {
+		t.Fatalf("ls --foo 应当 exit=2(用法错误), got %d", code)
+	}
+	if !strings.Contains(errw.String(), "--foo") {
+		t.Fatalf("错误信息要点名 --foo: %q", errw.String())
+	}
+}
+
 func TestLsRejectsEmptyPathArgument(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("x"), 0o644); err != nil {
