@@ -229,4 +229,4 @@ winbash -c 'env PATH=/nonexistent-aabbcc no-such-xyz'      ← 唯一漏网:env.
 - 所有探针用独立 `--endpoint "$TEMP/wb-semprobe-$$.port"`,用毕 `--stop` 并删端口文件;未触碰默认端点。
 - 探针输出原文见 §1.1、§2.1 各代码块。
 - ③ 未重复手测(按 e2e 钉子为准):`go test ./cmd/winbash -run TestBackgroundJobDiesWithTheRequest -count=1` → PASS(7.4s)。
-- feat/locate-cache(84d75d8)截至本文**未合并** main(`git log main..feat/locate-cache` 仅此一笔);其负缓存键设计引用自该提交的 `winbash/internal/shell/locate.go`。
+- feat/locate-cache(3b076d7)截至本文**未合并** main(`git log main..feat/locate-cache` 仅此一笔);其负缓存键设计引用自该提交的 `winbash/internal/shell/locate.go`。
