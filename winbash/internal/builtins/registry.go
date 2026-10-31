@@ -74,6 +74,11 @@ func grepBuiltin(ctx context.Context, cwd string, argv []string, out, errw io.Wr
 // wrapper 脚本,而 Windows 的 CreateProcess 执行不了无扩展名的文件 —— 找到了也跑不起来。
 // 映射到我们自己的 grep 既省一次 spawn,又是同一套方言处理(含 Perl 简写的显式拒收)。
 //
+// 前置的 -E / -F 算**显式**方言:egrep 再给 -F、fgrep 再给 -E 都会撞上
+// conflicting matchers(实测 GNU 一致,exit 2)。fgrep 单独再给 -F 没问题
+// (同一个方言给两遍),而且它**有真语义**——修之前 fgrep 的 -F 前置进 parse
+// 后被静默丢掉,fixed-string 从未生效过。
+//
 // 来源:oils spec 的 `spec/pipeline.test.sh`(`echo a | egrep '[0-9]+'`)。
 func egrepBuiltin(ctx context.Context, cwd string, argv []string, out, errw io.Writer) int {
 	return Grep(ctx, cwd, append([]string{"-E"}, argv...), interp.HandlerCtx(ctx).Stdin, out, errw)
