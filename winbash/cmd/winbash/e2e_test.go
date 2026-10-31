@@ -1142,3 +1142,102 @@ func TestBackgroundJobDiesWithTheRequest(t *testing.T) {
 		t.Errorf("对照组应当同时打出 NOW 与 LATE(脚本存活期间后台 job 正常),实际: %q", out3)
 	}
 }
+
+// ---- kill 内建的端到端(两条都只杀**测试自己拉起**的进程) ----
+//
+// 为什么第一条要用 PowerShell 拉起(而不是像第二条那样直接 exec.Command):
+// 优雅 kill 翻译成 `taskkill /PID`(不带 /F),它给目标进程的**顶层窗口**发 WM_CLOSE ——
+// go test 直接 exec 出来的控制台进程没有窗口,taskkill 会拒绝(「只能强行终止」,rc=1;
+// 2026-10-31 实测 inherit console / CREATE_NO_WINDOW / DETACHED_PROCESS 三种方式全部如此)。
+// Start-Process -WindowStyle Hidden 给了它一个隐藏窗口,优雅路径才走得通 —— 这也正是
+// 「控制台程序要用 kill -9」这条文档与 remedy 的来源。
+
+// spawnHiddenWindowProcess 用隐藏窗口拉起 `cmd /c ping -n 30 127.0.0.1`,返回它的 PID,
+// 并注册强杀兜底(t.Cleanup)—— 测试无论从哪条路径退出,都不留 30 秒的 ping。
+func spawnHiddenWindowProcess(t *testing.T) int {
+	t.Helper()
+	ps := "$p = Start-Process -FilePath cmd -ArgumentList '/c','ping -n 30 127.0.0.1' -WindowStyle Hidden -PassThru; Write-Output $p.Id"
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", ps)
+	var out bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &out
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("拉起带隐藏窗口的子进程失败: %v\n%s", err, out.String())
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(out.String()))
+	if err != nil {
+		t.Fatalf("拿不到子进程 PID: %q", out.String())
+	}
+	t.Cleanup(func() {
+		exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid)).Run()
+	})
+	return pid
+}
+
+// windowsProcessAlive 用 tasklist 判 Windows 进程是否还在(与实现同机所见一致)。
+func windowsProcessAlive(pid int) bool {
+	out, err := exec.Command("tasklist", "/FI", fmt.Sprintf("PID eq %d", pid), "/FO", "CSV", "/NH").Output()
+	return err == nil && strings.HasPrefix(string(out), "\"")
+}
+
+// waitForProcessGone 轮询等进程消失:WM_CLOSE / 强杀到 tasklist 看不见有毫秒级时差,
+// 钉时间会 flaky,钉「最终消失」才是本测试要的事实。
+func waitForProcessGone(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if !windowsProcessAlive(pid) {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("进程 %d 在 5 秒后仍然存活", pid)
+}
+
+func TestKillBuiltinGracefullyTerminatesWindowedProcess(t *testing.T) {
+	exe := buildWinbash(t)
+	endpoint := benchEndpoint(t)
+	t.Cleanup(func() { runWinbash(t, exe, endpoint, "--stop") })
+
+	pid := spawnHiddenWindowProcess(t)
+	if !windowsProcessAlive(pid) {
+		t.Fatalf("子进程 %d 没起来,后面的断言无效", pid)
+	}
+
+	out, code := runWinbash(t, exe, endpoint, "-c", fmt.Sprintf("kill %d", pid))
+	if code != 0 {
+		t.Fatalf("kill %d 失败 exit=%d out=%q", pid, code, out)
+	}
+	if out != "" {
+		t.Fatalf("成功时必须静默(对齐 bash),却有输出: %q", out)
+	}
+	waitForProcessGone(t, pid)
+}
+
+func TestKillDash9ForceKillsConsoleProcess(t *testing.T) {
+	exe := buildWinbash(t)
+	endpoint := benchEndpoint(t)
+	t.Cleanup(func() { runWinbash(t, exe, endpoint, "--stop") })
+
+	// 直接 exec 的控制台进程:没有窗口,优雅 taskkill 收不了,只有 -9 能杀
+	// (这正是本条存在的意义 —— 与上一条合成「两种力度各有实证」)。
+	cmd := exec.Command("cmd", "/c", "ping", "-n", "30", "127.0.0.1")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("拉起子进程失败: %v", err)
+	}
+	pid := cmd.Process.Pid
+	t.Cleanup(func() {
+		exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid)).Run()
+	})
+	if !windowsProcessAlive(pid) {
+		t.Fatalf("子进程 %d 没起来,后面的断言无效", pid)
+	}
+
+	out, code := runWinbash(t, exe, endpoint, "-c", fmt.Sprintf("kill -9 %d", pid))
+	if code != 0 {
+		t.Fatalf("kill -9 %d 失败 exit=%d out=%q", pid, code, out)
+	}
+	if out != "" {
+		t.Fatalf("成功时必须静默(对齐 bash),却有输出: %q", out)
+	}
+	waitForProcessGone(t, pid)
+}
