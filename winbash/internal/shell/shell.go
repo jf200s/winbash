@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"mvdan.cc/sh/v3/expand"
@@ -68,10 +69,16 @@ type Session struct {
 	// 不保证并发安全,见 Session 的说明),不会撞上"不能并发"那一条。
 	parser *syntax.Parser
 
-	// searchPath 是 ③ 层要用的搜索路径:真实 PATH + Git Bash 的 usr\bin。
-	// 它在构造时算一次,存下来 —— 进程环境不动(Global Constraints),
-	// 所以这条路径只活在 Session 里。
-	searchPath string
+	// path 是搜索路径的**不可变快照**(source → search 的派生关系),走 atomic.Pointer
+	// 而不是两个裸 string 字段。为什么要原子:
+	//   1. execHandler 会在**并发** goroutine 上被调 —— 管道两段(`sed a | sed b`)
+	//      与后台命令(`cmd &`)各自起一个 interp 子 runner,但共享这同一个 Session
+	//      (execHandler 闭包是构造期装好的那一个)。快照让「读侧」一次 atomic load
+	//      拿到自洽的一对,「写侧」整体换一个指针 —— 换成裸字段的双写就是 data race,
+	//      与 switchWriter 上锁是同一类问题。
+	//   2. 快照**内容**永远不可变:PATH 变了不是原地改字段,而是换一个新快照。
+	//      所以读者拿到的任何值都满足「search == BuildSearchPath(source)」这条不变式。
+	path atomic.Pointer[pathSnapshot]
 
 	// stdin 是本次 Run 的输入源(管道读端),Run 结束即关。见 SetStdinBytes。
 	stdin *os.File
@@ -84,6 +91,61 @@ type Session struct {
 	// 兜底这一下是幂等的(os.File.Close 二次调用只返回 ErrClosed),为的是
 	// 调用方异常路径漏关时不会 fd/goroutine 泄漏。
 	stdinW *os.File
+}
+
+// pathSnapshot 是搜索路径的一对自洽取值:派生用的 PATH 原值,与派生的结果。
+//
+// source 是 interp **变量**里当前的 PATH 值(会话初始 = 进程 PATH;之后跟着
+// 会话里的 `export PATH` / `PATH=…` 走);search 是 BuildSearchPath(source) 的结果
+// —— Git Bash 的 usr\bin 恒在最前,后面是 source。两个字段合成一个不可变整体,
+// 见 Session.path 上为什么必须整体换、不能原地改。
+type pathSnapshot struct {
+	source string
+	search string
+}
+
+// syncSearchPath 让 ③ 层的搜索路径跟上会话里 PATH 变量的最新值。
+//
+// 为什么要有它:searchPath 原本在 Session 构造期从进程 PATH 一次性固化,会话里
+// `export PATH=…` 之后,定位(locate / Which)与子进程环境(envList 给子进程的
+// PATH)读的都是那份固化值 —— export 对它们**静默无效**。修法不是把固化值扔掉,
+// 而是**重派生**:每次执行外部命令前对着变量里的 PATH 比一次,变了就重新走一遍
+// BuildSearchPath(usr\bin 仍然前置)。这样 classify/locate 与 envList 自动跟着变
+// —— 它们本来就只读 s.searchPath(),一处更新全局生效。
+//
+// 为什么在这里读 env(= execHandler 传进来的 hc.Env),而不是 runner.Vars:
+// mvdan 的 Runner.Vars 只在每次 Run **收尾**时从 writeEnv 同步一次
+// (interp/api.go 的 `maps.Insert(r.Vars, r.writeEnv.Each)`),Run 期间它是
+// 上一条请求的旧快照(第一次 Run 之前甚至是空的)。同一条请求里
+// `export PATH="…;$PATH" && mytool`,到 mytool 时 Vars 里根本没有新值。
+// 而 hc.Env 是 mvdan 给每个 handler 现挂的实时视图
+// (interp/runner.go:`Env: &overlayEnviron{parent: r.writeEnv}`),export 落进
+// writeEnv 的那一刻它就看得到 —— 包括逐命令前缀 `PATH=/x cmd` 的临时值与
+// 函数内的局部改写(后者随函数返回自动还原,这里的派生也跟着还原)。
+//
+// 为什么便宜(每条外部命令都过这里):PATH 没变的常态下只有一次 env.Get 的一次
+// map 探测 + 一次字符串比较,不碰文件系统;BuildSearchPath(内部有 os.Stat)只在
+// PATH **真的变了**时才跑 —— 那是一次 export 的代价,不是每条命令的代价。
+//
+// 边界(刻意保守,各有一条测试钉住):
+//   - PATH 变量没设(unset 且环境里本来就没有):保持现有 searchPath 不动。
+//     PATH 没了不该把定位也弄瞎 —— 与其让 ③ 层全盲,不如沿用上一份路径。
+//   - `unset PATH`(环境里有继承值,mvdan 的 unset 删掉覆盖层后 Get 会落回
+//     继承值):表现为「回到会话初始的 PATH」,派生跟着回到初始 searchPath。
+func (s *Session) syncSearchPath(env expand.Environ) {
+	cur := s.path.Load()
+	v := env.Get("PATH")
+	if !v.IsSet() || v.String() == cur.source {
+		return
+	}
+	val := v.String()
+	s.path.Store(&pathSnapshot{source: val, search: BuildSearchPath(val)})
+}
+
+// searchPath 返回当前生效的搜索路径(usr\bin 前置 + 最新的会话 PATH)。
+// 见 pathSnapshot 与 syncSearchPath。
+func (s *Session) searchPath() string {
+	return s.path.Load().search
 }
 
 // switchWriter 是一个输出目标可替换的 io.Writer。
@@ -132,11 +194,16 @@ func NewSession() *Session {
 	}
 
 	s := &Session{
-		stdout:     &switchWriter{},
-		stderr:     &switchWriter{},
-		parser:     syntax.NewParser(),
-		searchPath: BuildSearchPath(os.Getenv("PATH")),
+		stdout: &switchWriter{},
+		stderr: &switchWriter{},
+		parser: syntax.NewParser(),
 	}
+	// 初始快照:source 与构造 searchPath 用的是**同一个**值(os.Getenv("PATH"),
+	// 与传给 interp 的初始环境里那份 PATH 相同 —— kept 只滤掉了 EnvNested),
+	// 不变式「search == BuildSearchPath(source)」从第一条命令起就成立。
+	// 就算哪天两者失了同步,首次 sync 也会按变量值重派生,自愈。
+	initSrc := os.Getenv("PATH")
+	s.path.Store(&pathSnapshot{source: initSrc, search: BuildSearchPath(initSrc)})
 
 	// 滤掉继承来的嵌套标记。daemon 是 client 用 os/exec 拉起来的,而**嵌套里的**
 	// client 拉起的 daemon 会带着这个标记启动 —— 若它进了 ① 层环境,标记就会经 daemon
@@ -232,13 +299,21 @@ func (s *Session) execHandler(ctx context.Context, args []string) error {
 	}
 	hc := interp.HandlerCtx(ctx)
 
+	// 先让搜索路径跟上会话里最新的 PATH 变量(细则见 syncSearchPath)。放在入口、
+	// 在下面所有读者之前:locate 判层、envList(③ 层子进程与 ② 层 pwsh 的 env)、
+	// which 的 WithSearchPath 吃的都是同一条 s.searchPath()。每条外部命令都过
+	// execHandler,所以同一条请求里 `export PATH="…;$PATH" && mytool` 立刻生效;
+	// ② 层命令(svc/reg/ps/sys)虽不查 PATH,但给 pwsh 的 env 出自 envList,也
+	// 由这一次调用一并覆盖 —— 不需要它们各自再过一遍。
+	s.syncSearchPath(hc.Env)
+
 	// 把会话的搜索路径交给 ① 层(目前只有 `which` 需要它)。
 	// 走 ctx 而不是改 Builtin 的形状 —— Registry 里只有一种形状是它的价值所在。
-	ctx = builtins.WithSearchPath(ctx, s.searchPath)
+	ctx = builtins.WithSearchPath(ctx, s.searchPath())
 
 	// locate 一次判定 + (裸名字)定位,(层, 绝对路径)一起带走 —— 判层与下面的
 	// runExternal 共享同一次 PATH 扫描,不再各扫一遍(见 locate 顶上的注释)。
-	lay, abs := locate(args[0], s.searchPath)
+	lay, abs := locate(args[0], s.searchPath())
 	switch lay {
 	case layerBuiltin:
 		if code := builtins.Registry[args[0]](ctx, hc.Dir, args[1:], hc.Stdout, hc.Stderr); code != 0 {
@@ -263,7 +338,7 @@ func (s *Session) execHandler(ctx context.Context, args []string) error {
 		// 分支后行为零变化。代价是 shell 包硬编码了 "pwsh" 这个名字:将来 ② 层若有
 		// 新命令要读 env/dir,必须同步这里(两条注释互指)。
 		if args[0] == "pwsh" {
-			ctx = winmgmt.WithEnv(ctx, envList(hc.Env, s.searchPath))
+			ctx = winmgmt.WithEnv(ctx, envList(hc.Env, s.searchPath()))
 			// 引擎常驻,所以 cwd 也必须每条同步(与 env 同一个理由):它的 cwd 是 daemon
 			// 启动时继承的那个,不会跟着会话的 `cd` 走。
 			ctx = winmgmt.WithDir(ctx, hc.Dir)
@@ -420,7 +495,7 @@ func (s *Session) needsOurWhich(name string) bool {
 	// 进程 PATH 里没有,但我们的搜索路径(Git Bash 的 usr\bin + 真 PATH)里有。
 	// 走 locate 单入口,与判层/执行共享同一次扫描(以及负缓存);对这里的判定
 	// 语义无影响 —— locate 调的就是同一个 Which,miss 也照样答"不归我们管"。
-	if lay, _ := locate(name, s.searchPath); lay == layerPath {
+	if lay, _ := locate(name, s.searchPath()); lay == layerPath {
 		return true
 	}
 	return false
@@ -705,7 +780,7 @@ func (s *Session) runExternal(ctx context.Context, args []string, hc interp.Hand
 		if !filepath.IsAbs(target) {
 			target = filepath.Join(hc.Dir, target)
 		}
-		abs, ok = builtins.Which(target, s.searchPath)
+		abs, ok = builtins.Which(target, s.searchPath())
 	} else {
 		// 裸名字:locate 那一次扫描的结果直接带走(含负缓存判出的 miss)。
 		abs, ok = preAbs, preOK
@@ -744,7 +819,7 @@ func (s *Session) runExternal(ctx context.Context, args []string, hc interp.Hand
 			// Node 生态挡在门外。所以先试**翻译**:认出「垫片在调哪个 node 脚本」
 			// 就直接 exec 那个脚本,使用者传来的参数一个字节都不经过 cmd。
 			// 认不出来才保持原来的拒绝(不猜)。
-			if call, ok := resolveNodeShim(abs, s.searchPath); ok {
+			if call, ok := resolveNodeShim(abs, s.searchPath()); ok {
 				argv0 = call.Prog
 				leading = call.Args
 			} else if cmdShellFallbackEnabled(os.Getenv) {
@@ -813,7 +888,7 @@ func (s *Session) runExternal(ctx context.Context, args []string, hc interp.Hand
 	cmd.Stdin = hc.Stdin
 	cmd.Stdout = hc.Stdout
 	cmd.Stderr = tail
-	cmd.Env = envList(hc.Env, s.searchPath)
+	cmd.Env = envList(hc.Env, s.searchPath())
 
 	err := cmd.Run()
 	if err == nil {
@@ -852,14 +927,19 @@ func (s *Session) runExternal(ctx context.Context, args []string, hc interp.Hand
 // 否则「在 winbash 里导出变量再跑 git」会是**静默无效**的,而那正是本项目要消灭的失败形态。
 // 只带导出过的变量,与 POSIX 的语义一致(局部变量不给子进程)。
 //
-// PATH 必须换成 searchPath:③ 层用 searchPath **定位**命令,而子进程若拿到进程 PATH,
-// 就会出现「定位用一条路径、执行用另一条」的分裂。实测后果:
+// PATH 必须换成 searchPath(会话当前生效的那条,见 syncSearchPath):③ 层用
+// searchPath **定位**命令,而子进程若拿到进程 PATH,就会出现「定位用一条路径、
+// 执行用另一条」的分裂。实测后果:
 //
 //	`xargs -n1 echo`  →  /usr/bin/xargs: echo: No such file or directory
 //	`ls | xargs -n1 echo | wc -l`  →  0(静默!应当是列数)
 //
 // 因为 xargs 要 exec 的 `echo` 只在 Git Bash 的 usr\bin 里。
 // 这**不是**改进程环境:改的只是我们派生的子进程的 cmd.Env(Global Constraints 管的是前者)。
+//
+// searchPath 是**活的**(syncSearchPath 跟着会话里的 `export PATH` 重派生),但
+// usr\bin 恒在最前 —— 所以「子进程的 PATH 里必须有 usr\bin」这条底线(xargs 等
+// 「子进程再 exec」靠它活着)在会话改过 PATH 之后依然成立。
 //
 // 另外补两条:`MSYS=noglob`(理由见 msysWithNoGlob)与 EnvNested(理由见其文档)。
 func envList(env expand.Environ, searchPath string) []string {

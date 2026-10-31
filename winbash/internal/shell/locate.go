@@ -77,8 +77,9 @@ func locate(cmd, searchPath string) (layer, string) {
 //
 // 盲区(已知差异与限制.md 有同名条目):**会话中途**往 PATH 目录里装了新工具,
 // 之前 miss 过的名字会一直判 ④ 到进程结束 —— 刻意的取舍,不是 bug。键含完整
-// searchPath:未来 PATH 动态化时改 PATH 即换键,缓存天然失效;会话语义专项设计里
-// 的 export PATH 方案接的正是这一点。
+// searchPath:PATH **变**(会话内 `export PATH`,searchPath 随之重派生,见
+// shell.go 的 syncSearchPath)即换键,缓存天然失效 —— 当初设计时埋对了;但
+// 「PATH 串不变、只往目录里装新文件」不换键,盲区仍在。
 //
 // 不设上限与 msysBinaryCache 同一先例:键空间是「实际打错过」的名字,人打字量级,
 // 撑不满一个常驻进程的内存。

@@ -150,6 +150,8 @@ winbash -c 'env PATH=/nonexistent-aabbcc no-such-xyz'      ← 唯一漏网:env.
 2. README ③ 层段(243-261 一带)补一句同义说明 + `env` 前缀的逃生口。
 3. shell.go ④ 层报错(shell.go:674-679)加 D1 文案;`internal/shell` 补单测:`export PATH=…` 后 (a) `ls` 仍命中、(b) `env` 子进程 PATH 首项仍是 usr\bin、(c) ④ 层报错含新文案;(d) 对照:未改 PATH 时报错不含新文案。**无需 e2e**(行为全在单请求内)。
 
+> **决议(2026-10-31):重派生 searchPath 方案落地,本节其余方案作废。** 用户拍板不走 D(补账 + 改文案),直接修:每条外部命令进 execHandler 时对一次 interp 变量里的 PATH(实时源是 `hc.Env`,`runner.Vars` 在 Run 中途是旧快照),变了就重走 `BuildSearchPath` —— usr\bin 恒前置,xargs 取舍不破。上文 §2.4 按 D 写的落地清单未执行。实现:`internal/shell/shell.go` 的 `syncSearchPath`(原子快照,管道两段/后台命令并发安全);回归:`internal/shell/sessionpath_test.go` + `cmd/winbash/e2e_test.go` 的 `TestSessionPATHExportTakesEffectAcrossProcesses`;已知差异表对应行已改为「已修」。
+
 ---
 
 ## 3. 分叉③:后台 job(`cmd &`)随请求结束被取消

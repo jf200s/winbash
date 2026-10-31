@@ -460,6 +460,45 @@ func TestSessionsRunInParallel(t *testing.T) {
 	}
 }
 
+// TestSessionPATHExportTakesEffectAcrossProcesses 钉住会话内 `export PATH` 即时生效
+// (决议 2026-10-31:重派生 searchPath,见会话语义专项设计 §2)。
+//
+// 原复现(审计):同一条请求里建工具 + export PATH + 执行,报 127 —— 定位吃的是
+// 构造期固化的 searchPath。修后应当执行;并且 export 的效果要**跨 client 进程**留在
+// 同一个 daemon 会话里 —— 这两条正好对应 e2e 的两个请求。
+func TestSessionPATHExportTakesEffectAcrossProcesses(t *testing.T) {
+	exe := buildWinbash(t)
+	endpoint := benchEndpoint(t)
+	t.Cleanup(func() { runWinbash(t, exe, endpoint, "--stop") })
+
+	runOrFail := func(args ...string) string {
+		t.Helper()
+		out, code := runWinbash(t, exe, endpoint, args...)
+		if code != 0 {
+			t.Fatalf("%v 失败 exit=%d out=%q", args, code, out)
+		}
+		return strings.TrimSpace(out)
+	}
+
+	// 工具用无扩展名 shebang 脚本(usr\bin 里 c_rehash 那一类):内容为文本的
+	// "mytool.exe" 不是 PE 镜像,即使定位到了也执行不了 —— 别把两件事混进一条测试。
+	bindir := filepath.Join(t.TempDir(), "bin")
+
+	// 请求 1:建工具 + export + 同一条请求内执行(原先在这里 127)。
+	out := runOrFail("--session", "wbpath1", "-c", fmt.Sprintf(
+		`mkdir -p '%[1]s' && printf '#!/bin/sh\necho e2e-probe-ok\n' > '%[1]s/wb-e2e-probe-tool' && export PATH="%[1]s;$PATH" && wb-e2e-probe-tool`,
+		bindir))
+	if out != "e2e-probe-ok" {
+		t.Errorf("会话内 export PATH 后工具没跑起来: out=%q", out)
+	}
+
+	// 请求 2:另一个 client 进程、同一个会话 —— export 的效果必须留着。
+	out = runOrFail("--session", "wbpath1", "-c", "wb-e2e-probe-tool")
+	if out != "e2e-probe-ok" {
+		t.Errorf("export PATH 没有跨请求生效: out=%q", out)
+	}
+}
+
 // TestSameSessionKeepsStateAndStaysSerial 钉住「同一会话内仍然串行且状态持久」。
 //
 // 这是并行的**代价边界**:状态只在会话内连续。两条一起断言,因为它们是同一件事的
