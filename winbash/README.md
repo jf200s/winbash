@@ -9,19 +9,20 @@ bash 语法 + pwsh 能力的常驻 shell,给在 Windows 上干活的 AI 用。
 
 ## 快速开始
 
-**已加入用户 PATH**(本机 2026-10-17 配置:把 `winbash\` 目录追加进 `HKCU\Environment` 的 `Path`,
-没有安装器、没有服务、没有注册表项),所以直接写命令名:
+**从源码构建** —— 新 clone 没有 `winbash.exe`(构建产物不进库),需要 Go 工具链:
 
 ```powershell
-winbash -c 'ls | grep go'
-winbash -c 'svc list --running'
-winbash --json -c 'sys mem'
+cd winbash
+$env:GOPROXY = 'https://goproxy.cn,direct'   # 必须(海外网络可省):proxy.golang.org 在国内不通
+go build -o winbash.exe ./cmd/winbash
 ```
 
-**未配置的机器**(或想卸掉)用全路径 —— 路径含中文,记得引号;卸载就是从**用户 PATH** 里删掉 `D:\work\中文 目录\winbash` 这一条:
+构建产物就在 `winbash\` 下,直接跑:
 
 ```powershell
-& 'D:\work\中文 目录\winbash\winbash.exe' -c 'ls | grep go'
+.\winbash.exe -c 'ls | grep go'          # bash 语义,但 ls/grep 是我们自己的实现
+.\winbash.exe -c 'svc list --running'    # Windows 服务,不用切到 pwsh 语法
+.\winbash.exe --json -c 'sys mem'        # 类型化 JSON 输出
 ```
 
 - 第一次调用会自动拉起常驻 daemon,之后每条命令:**冷启动 63 ms / 已热 15 ms**
@@ -32,9 +33,14 @@ winbash --json -c 'sys mem'
 - daemon 空闲 30 分钟后自行退出,不留僵尸进程;也可以显式管理:
 
 ```powershell
-winbash.exe --status    # pid / cwd / 地址 / 引擎状态 + sessions=N running=M 与各具名会话的明细
-winbash.exe --stop      # 停掉 daemon(不会为了停掉它而先把它拉起来)
+.\winbash.exe --status    # pid / cwd / 地址 / 引擎状态 + sessions=N running=M 与各具名会话的明细
+.\winbash.exe --stop      # 停掉 daemon(不会为了停掉它而先把它拉起来)
 ```
+
+想把 `winbash` 当命令名用,把 `winbash\` 目录加进用户 `PATH` 即可 —— 没有安装器、没有服务、
+没有注册表项,卸载就是从 `PATH` 里删掉那一条。(**本机附注**:作者机器 2026-10-17 已这么配
+—— 把 `winbash\` 追加进了 `HKCU\Environment` 的用户 `Path`,所以那台机器上直接写命令名就能跑;
+这是本机配置,不是开箱状态。)
 
 ## 命令行
 
