@@ -77,7 +77,7 @@ func startDaemon(t *testing.T, ep string) {
 // 端口文件名靠它才合法。
 func TestSanitizeKeepsOnlySafeCharacters(t *testing.T) {
 	cases := []struct{ in, want string }{
-		{"Test User", "HELLO_F"},
+		{"Test User", "Test_User"},
 		{"a-b_c9", "a-b_c9"},
 		{"张三", "__"},    // 非 ASCII 每个 rune 换一个下划线
 		{"", "default"}, // 全空时给个兜底,而不是空文件名
