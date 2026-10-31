@@ -12,6 +12,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"winbash/internal/errs"
 )
@@ -31,7 +33,7 @@ import (
 func Grep(ctx context.Context, cwd string, argv []string, in io.Reader, out, errw io.Writer) int {
 	opts, patterns, files, aerr := parseGrepArgs(argv)
 	if aerr != nil {
-		remedy := "用法: grep [-i -n -v -c -l -r -E -F -q -A N -B N -C N -o -w -e P] PATTERN [文件...]"
+		remedy := "用法: grep [-i -n -v -c -l -r -E -F -q -A N -B N -C N -m N -o -w -x -e P] PATTERN [文件...]"
 		if ue, ok := aerr.(*usageErr); ok {
 			// 带针对性指路的错误(例如 GNU 的 --include):通用那句「用法:」对它
 			// 没有任何帮助,使用者还得再花一轮问"那该怎么写"。
@@ -158,6 +160,13 @@ type grepOpts struct {
 
 	onlyMatching bool // -o:只输出命中段
 	wordRegexp   bool // -w:命中段必须整个落在词边界内
+	wholeLine    bool // -x:模式必须命中**整行**(实测 GNU -x 'x*' 对 abc 不命中、对空行命中)
+
+	// maxCount 是 -m N 的上限,按**选中行**数计(与 -o 无关 —— 实测 -m1 -o 对
+	// 一行里三个 a 照样给 3 段)。-1 = 无上限,也是默认值:GNU 对负数同样不设限
+	// (strtoumax 把 -1 回绕成极大值,实测 -m -1 给全部命中)。-c 的计数同样封顶;
+	// -m 0 时 GNU 连 -c 的计数行都不给(实测无输出、exit 1)。
+	maxCount int
 
 	afterN  int // -A:命中行之后跟几行上下文
 	beforeN int // -B:命中行之前带几行上下文(-C 两者都设,-A/-B 显式给过的维度优先)
@@ -180,7 +189,7 @@ type grepOpts struct {
 // -E 与 -F 同时给出时按 GNU 响亮拒绝(conflicting matchers,exit 2)—— 实测
 // GNU 对 -FE / -EF / -E -F / -F -E 一律如此,静默选一个方言是"静默做错事"。
 func parseGrepArgs(argv []string) (*grepOpts, []string, []string, error) {
-	opts := &grepOpts{}
+	opts := &grepOpts{maxCount: -1} // -1 = 没给 -m,即不设上限
 	i := 0
 	sawDashDash := false
 	sawExtended, sawFixed := false, false
@@ -231,6 +240,27 @@ func parseGrepArgs(argv []string) (*grepOpts, []string, []string, error) {
 				opts.onlyMatching = true
 			case 'w':
 				opts.wordRegexp = true
+			case 'x':
+				opts.wholeLine = true
+			case 'm':
+				val, ok := takeFlagValue(argv, &i, a, j)
+				if !ok {
+					return nil, nil, nil, fmt.Errorf("开关 -m 需要一个参数(最大命中数)")
+				}
+				n, nerr := strconv.Atoi(val)
+				if nerr != nil {
+					// 措辞对齐 GNU(实测:`grep -m 2x` 与 `-m ''` 都给
+					// `grep: invalid max count`、exit 2,消息里不带值)。
+					return nil, nil, nil, &usageErr{
+						problem: "invalid max count",
+						remedy:  "-m 后面要跟非负整数,可以直接附着(-m2)也可以隔开(-m 2);不设上限就不要给 -m",
+					}
+				}
+				if n < 0 {
+					// 实测 GNU:-m -1 照常跑、不设上限(strtoumax 把负数回绕成极大值)。
+					n = -1
+				}
+				opts.maxCount = n
 			case 'A', 'B', 'C':
 				val, ok := takeFlagValue(argv, &i, a, j)
 				if !ok {
@@ -263,7 +293,7 @@ func parseGrepArgs(argv []string) (*grepOpts, []string, []string, error) {
 				// 不认识的开关必须报错:静默忽略会让使用者以为它生效了。
 				return nil, nil, nil, fmt.Errorf("不认识的参数: -%c", c)
 			}
-			if c == 'A' || c == 'B' || c == 'C' || c == 'e' {
+			if c == 'A' || c == 'B' || c == 'C' || c == 'e' || c == 'm' {
 				break // 带值开关吃掉了 token 里剩余的字符(或下一个参数)
 			}
 		}
@@ -473,7 +503,7 @@ func compileGrep(patterns []string, opts *grepOpts) (*grepMatcher, string, strin
 		for i, p := range patterns {
 			lits[i] = []byte(p)
 		}
-		return &grepMatcher{lits: lits, wordRegexp: opts.wordRegexp}, "", ""
+		return &grepMatcher{lits: lits, wordRegexp: opts.wordRegexp, wholeLine: opts.wholeLine}, "", ""
 	}
 
 	translated := make([]string, len(patterns))
@@ -538,7 +568,7 @@ func compileGrep(patterns []string, opts *grepOpts) (*grepMatcher, string, strin
 		}
 		r = rr
 	}
-	return &grepMatcher{re: r, wordRegexp: opts.wordRegexp}, "", ""
+	return &grepMatcher{re: r, wordRegexp: opts.wordRegexp, wholeLine: opts.wholeLine}, "", ""
 }
 
 // grepMatcher 把三种方言(-F 字面 / BRE / ERE)折成同一个问法:
@@ -550,10 +580,29 @@ type grepMatcher struct {
 	re         *regexp.Regexp // -E / BRE(已翻译)的编译结果;-F 时为 nil
 	lits       [][]byte       // -F:模式原文就是字面量(提前转好的字节切片)
 	wordRegexp bool           // -w:只认两侧都是词边界的命中段
+	wholeLine  bool           // -x:只认覆盖整行的命中
 }
 
-// matchLine 报告这一行是否命中(考虑 -w;不考虑 -v,反转在调用方做)。
+// matchLine 报告这一行是否命中(考虑 -x 与 -w;不考虑 -v,反转在调用方做)。
+//
+// -x(整行匹配)不靠给模式包 ^...$ 锚点,而是检查"是否存在覆盖整行的命中":
+// POSIX 的最左最长语义保证 —— 只要存在整行命中,它就是 FindIndex 给的那个
+// (更靠左的位置不存在,同起点下最长也不可能越过行尾)。实测口径:`-x 'x*'`
+// 对 abc 不命中、对空行命中;空模式只命中空行。`-w` 与 `-x` 叠加不用另设卡:
+// 整行命中的两端必然是行首/行尾,天然是词边界(GNU 同)。
 func (m *grepMatcher) matchLine(content []byte) bool {
+	if m.wholeLine {
+		if m.re != nil {
+			loc := m.re.FindIndex(content)
+			return loc != nil && loc[0] == 0 && loc[1] == len(content)
+		}
+		for _, l := range m.lits {
+			if bytes.Equal(content, l) {
+				return true // -x -F:整行字面相等(实测 -x -F 'a.c' 不命中 abc)
+			}
+		}
+		return false
+	}
 	if !m.wordRegexp {
 		if m.re != nil {
 			return m.re.Match(content)
@@ -625,20 +674,28 @@ func (m *grepMatcher) findAll(content []byte) [][]int {
 }
 
 // wordBounded 报告 content[s:e] 这个命中段两侧是否都是词边界
-// (行首/行尾、或紧邻非词字符)。词字符 = 字母、数字、下划线(实测 GNU:
-// `_` 算词字符,`abc_def` 不被 `-w abc` 命中)。
+// (行首/行尾、或紧邻非词字符)。词字符 = 字母、数字、下划线,按 rune 解码后用
+// unicode 包判定 —— GNU 在 UTF-8 locale 下把非 ASCII 字母/数字也算词字符
+// (实测:`-w '中'` 不命中 `中文` —— 右邻的「文」挡住了词尾边界;旧的 byte
+// 判定会把这类行错放进来)。非 UTF-8 序列按 RuneError 落到"非词字符"一侧。
 func wordBounded(content []byte, s, e int) bool {
-	if s > 0 && isWordByte(content[s-1]) {
+	if s > 0 && isWordRuneBefore(content, s) {
 		return false
 	}
-	if e < len(content) && isWordByte(content[e]) {
+	if e < len(content) && isWordRuneAfter(content, e) {
 		return false
 	}
 	return true
 }
 
-func isWordByte(b byte) bool {
-	return b == '_' || ('a' <= b && b <= 'z') || ('A' <= b && b <= 'Z') || ('0' <= b && b <= '9')
+func isWordRuneBefore(content []byte, s int) bool {
+	r, _ := utf8.DecodeLastRune(content[:s])
+	return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
+}
+
+func isWordRuneAfter(content []byte, e int) bool {
+	r, _ := utf8.DecodeRune(content[e:])
+	return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r)
 }
 
 // classEnd 返回从 start(必须指向 `[`)开始的字符类的**闭合 `]` 之后**那个下标。
@@ -861,6 +918,12 @@ func grepStream(r io.Reader, m *grepMatcher, opts *grepOpts, label string, showN
 			if opts.invert {
 				hit = !hit
 			}
+			if hit && opts.maxCount >= 0 && res.lines >= opts.maxCount {
+				// -m 上限已到:GNU 到此停止读入 —— 这一行不选中、不计数、不输出,
+				// 连作为 -A 上下文都不出现(实测 -m1 -A1 对 a1,a2,a3 只给 a1:
+				// 第二行的 a2 虽命中,却被整个跳过,而不是当作上一组的上下文)。
+				break
+			}
 
 			if hit {
 				// 匹配到了,而且这行里有 NUL —— 说明"命中"可能只是二进制噪声
@@ -894,9 +957,16 @@ func grepStream(r io.Reader, m *grepMatcher, opts *grepOpts, label string, showN
 					}
 					if opts.onlyMatching {
 						// -o:只输出命中段(按行内位置序、跳过空段),前缀与整行同款。
-						for _, loc := range m.findAll(content) {
-							writeGrepLine(out, label, showName, lineNo, opts, content[loc[0]:loc[1]], false)
+						// -x -o 的例外:命中段就是整行(实测 GNU -x -o 'abc' 对 abc
+						// 给一段整行,不重复、不带行内其他段)。
+						if opts.wholeLine {
+							writeGrepLine(out, label, showName, lineNo, opts, content, false)
 							lastEmitted = lineNo
+						} else {
+							for _, loc := range m.findAll(content) {
+								writeGrepLine(out, label, showName, lineNo, opts, content[loc[0]:loc[1]], false)
+								lastEmitted = lineNo
+							}
 						}
 					} else {
 						emitLine(lineNo, content, false)
@@ -913,6 +983,13 @@ func grepStream(r io.Reader, m *grepMatcher, opts *grepOpts, label string, showN
 				if !opts.count && !opts.onlyMatching {
 					emitLine(lineNo, content, true)
 				}
+			}
+
+			if opts.maxCount >= 0 && res.lines >= opts.maxCount && afterPending == 0 {
+				// -m 上限已到且 -A 的尾随上下文已经吐完:停止读入。实测 GNU 对
+				// -m1 -A2 的 a1,x1,a2,x2,a3 只给 a1,x1 —— 第二条上下文行根本不读,
+				// 并不是"读完上下文再停"。
+				break
 			}
 
 			// 维护 -B 缓冲:命中行自身也算后面命中的前文。
@@ -932,7 +1009,9 @@ func grepStream(r io.Reader, m *grepMatcher, opts *grepOpts, label string, showN
 		}
 	}
 
-	if opts.count {
+	// -c 打计数;-m 0 是唯一的例外:GNU 连计数行都不给(实测 -m 0 -c 无输出、
+	// exit 1,不管文件里有没有命中)。
+	if opts.count && opts.maxCount != 0 {
 		writeGrepCount(out, label, showName, res.lines)
 	}
 	return res, binary, nil

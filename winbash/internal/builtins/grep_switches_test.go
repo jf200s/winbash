@@ -454,3 +454,215 @@ func TestGrepDashEWithFixedStrings(t *testing.T) {
 		t.Fatalf("-F -e: code=%d out=%q(两个字面量都按字面)", code, out)
 	}
 }
+
+// ─── 7. -x 整行匹配(2026-10-31 实测补齐)─────────────────────────────────────
+//
+// 期望值取自本机真 Git Bash 的 grep(GNU grep 3.0,C.UTF-8),同上纪律。
+// 口径:模式被隐式锚定到**整行**;部分命中一律不算;-o 下唯一的命中段就是整行;
+// -F 时等价于"整行字面相等";-v/-c/-n/-m 照常叠加。
+func TestGrepWholeLine(t *testing.T) {
+	cases := []struct {
+		name  string
+		argv  []string
+		input string
+		want  string
+	}{
+		{"部分命中不算(实测 xabc/abcx/ab c 都不中)", []string{"-x", "abc"}, "abc\nxabc\nabcx\nab c\n", "abc\n"},
+		{"-x -F 整行字面相等(实测 abc 不中 a.c 的整行)", []string{"-x", "-F", "a.c"}, "a.c\nabc\nxa.c\n", "a.c\n"},
+		{"-x -v(实测)", []string{"-x", "-v", "abc"}, "abc\nxabc\n", "xabc\n"},
+		{"-x -c(实测 2)", []string{"-x", "-c", "abc"}, "abc\nxabc\nabc\n", "2\n"},
+		{"-x -o 命中段就是整行(实测一段 abc)", []string{"-x", "-o", "abc"}, "abc\n", "abc\n"},
+		{"-x -o 部分命中无输出(实测 b* 不跨整行、rc=1)", []string{"-x", "-o", "-E", "b*"}, "abc\n", ""},
+		{"-x -o -E 'a*' 对 aaa 给整行(实测)", []string{"-x", "-o", "-E", "a*"}, "aaa\n", "aaa\n"},
+		{"-x -E 正则整行(实测 ab+ 中 ab、不中 abbc/ab*)", []string{"-x", "-E", "ab+"}, "ab\nabbc\nab*\n", "ab\n"},
+		{"-x -n(实测 1:abc)", []string{"-n", "-x", "abc"}, "abc\nxabc\n", "1:abc\n"},
+		{"-x 空模式只中空行(实测)", []string{"-x", ""}, "abc\n\n", "\n"},
+		{"-x -E 'x*' 对空行命中(实测)", []string{"-x", "-E", "x*"}, "\n", "\n"},
+		{"-x -E 'x*' 对 abc 不中(实测 rc=1)", []string{"-x", "-E", "x*"}, "abc\n", ""},
+		{"-x -w 叠加:整行命中自带词边界(实测)", []string{"-x", "-w", "abc"}, "abc\nxabc\n", "abc\n"},
+		{"-x -c -v(实测 1)", []string{"-x", "-c", "-v", "abc"}, "abc\nxabc\nabc\n", "1\n"},
+		{"-x -m 1 组合(实测)", []string{"-x", "-m", "1", "abc"}, "abc\nxabc\nabc\n", "abc\n"},
+	}
+	for _, c := range cases {
+		out, code := runGrepStdin(t, c.argv, c.input)
+		wantCode := 0
+		if c.want == "" {
+			wantCode = 1 // GNU 实测:无命中 exit 1
+		}
+		if code != wantCode || out != c.want {
+			t.Errorf("%s: code=%d got %q want %q(rc=%d)", c.name, code, out, c.want, wantCode)
+		}
+	}
+}
+
+// -x 多文件:-c 每文件独立计数(实测 f1:1 / f2:1)。
+func TestGrepWholeLineMultiFile(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "f1.txt"), []byte("abc\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "f2.txt"), []byte("xabc\nabc\n"), 0o644)
+
+	var out bytes.Buffer
+	code := Grep(context.Background(), dir, []string{"-x", "-c", "abc", "f1.txt", "f2.txt"},
+		strings.NewReader(""), &out, nil)
+	if code != 0 {
+		t.Fatalf("code=%d", code)
+	}
+	want := "f1.txt:1\nf2.txt:1\n"
+	if out.String() != want {
+		t.Fatalf("got %q want %q(实测 GNU -x -c 多文件)", out.String(), want)
+	}
+}
+
+// ─── 8. -m 次数上限(2026-10-31 实测补齐)─────────────────────────────────────
+//
+// 期望值取自本机真 Git Bash 的 grep(同上纪律)。关键口径(全部实测):
+//
+//   - -m N 按**选中行**数封顶 —— 即使 -o 也按行算:-m1 -o 对一行里三个 a 给 3 段,
+//     对两行给前 1 行的全部段;
+//   - -c 的计数同样封顶;-m 0 时连 -c 的计数行都不给(无输出、exit 1);
+//   - 负数不设上限(GNU 的 strtoumax 把 -1 回绕成极大值,实测 -m -1 给全部命中);
+//   - 多个 -m 后者胜;
+//   - 到顶后 GNU 停止读入:尾随 -A 上下文只吐"到顶后已读到"的行,且到顶后
+//     本应选中的行整个跳过 —— 不输出、也不当作上一组的上下文
+//     (实测 -m1 -A1 对 a1,a2,a3 只给 a1;-m1 -A2 对 a1,x1,a2,… 只给 a1,x1)。
+func TestGrepMaxCount(t *testing.T) {
+	cases := []struct {
+		name     string
+		argv     []string
+		input    string
+		want     string
+		wantCode int // -1 = 按 want 推(want 空 → 1);默认 -1;-q 命中时显式给 0
+	}{
+		{"-m2 附着", []string{"-m2", "a"}, "a\nb\na\n", "a\na\n", -1},
+		{"-m 2 隔开", []string{"-m", "2", "a"}, "a\nb\na\nb\na\n", "a\na\n", -1},
+		{"-m 2 -c 计数封顶", []string{"-m", "2", "-c", "a"}, "a\nb\na\nb\na\n", "2\n", -1},
+		{"-m 0 无输出 rc=1", []string{"-m", "0", "a"}, "a\nb\na\n", "", -1},
+		{"-m 0 -c 连计数都不给(实测)", []string{"-m", "0", "-c", "a"}, "a\nb\na\n", "", -1},
+		{"-m 0 -v 无输出 rc=1(实测)", []string{"-m", "0", "-v", "a"}, "a\nb\na\n", "", -1},
+		{"-m -1 不设上限(GNU 负数回绕,实测)", []string{"-m", "-1", "a"}, "a\nb\na\n", "a\na\n", -1},
+		{"多个 -m 后者胜(实测)", []string{"-m", "2", "-m", "1", "a"}, "a\na\na\n", "a\n", -1},
+		{"-m 1 -o 按行封顶,行内段全给(实测 3 段)", []string{"-m", "1", "-o", "a"}, "a a a\nz\n", "a\na\na\n", -1},
+		{"-m 2 -o 两行 8 段(实测)", []string{"-m", "2", "-o", "a"}, "aa aa\nz\naa aa\n",
+			"a\na\na\na\na\na\na\na\n", -1},
+		{"-m 2 -v 封顶(实测 b,b)", []string{"-m", "2", "-v", "a"}, "a\nb\na\nb\na\n", "b\nb\n", -1},
+		{"-m 2 -v -c(实测 2)", []string{"-m", "2", "-v", "-c", "a"}, "a\nb\na\nb\na\n", "2\n", -1},
+		{"-m 1 无上下文(实测只给第一行)", []string{"-m", "1", "a"}, "a1\nx1\na2\nx2\na3\n", "a1\n", -1},
+		{"-m 1 -A1:到顶后的命中行不输出也不作上下文(实测 a1,x1)", []string{"-m", "1", "-A1", "a"},
+			"a1\nx1\na2\nx2\na3\n", "a1\nx1\n", -1},
+		{"-m 1 -A1 相邻:第二条根本不读(实测只给 a1)", []string{"-m", "1", "-A1", "a"},
+			"a1\na2\na3\n", "a1\n", -1},
+		{"-m 1 -A2:第二条上下文行不读(实测 a1,x1)", []string{"-m", "1", "-A2", "a"},
+			"a1\nx1\na2\nx2\na3\n", "a1\nx1\n", -1},
+		{"-m 1 -C1(实测 x0,a1,x1)", []string{"-m", "1", "-C1", "a"}, "x0\na1\nx1\na2\nx2\n", "x0\na1\nx1\n", -1},
+		{"-m 2 -A1 -o 隔空组照样补 --(实测 a,--,a)", []string{"-m", "2", "-A1", "-o", "a"},
+			"a\nx\nx\nx\na\nx\nx\nx\na\n", "a\n--\na\n", -1},
+		{"-m 1 -c(实测 1)", []string{"-m", "1", "-c", "a"}, "a1\nx1\na2\n", "1\n", -1},
+		{"-m 2 -q 无输出 rc=0(实测)", []string{"-m", "2", "-q", "a"}, "a\na\n", "", 0},
+	}
+	for _, c := range cases {
+		out, code := runGrepStdin(t, c.argv, c.input)
+		wantCode := c.wantCode
+		if wantCode == -1 {
+			if c.want == "" {
+				wantCode = 1 // GNU 实测:没有行被选中 exit 1(-m 0 连 -c 也如此)
+			} else {
+				wantCode = 0
+			}
+		}
+		if code != wantCode || out != c.want {
+			t.Errorf("%s: code=%d got %q want %q(rc=%d)", c.name, code, out, c.want, wantCode)
+		}
+	}
+}
+
+// -m 非法值:实测 GNU 是 `invalid max count`(消息里**不带**值)、exit 2;
+// 缺参数 exit 2。多文件时每文件独立计数(实测各 1)。
+func TestGrepMaxCountInvalidAndMultiFile(t *testing.T) {
+	for _, argv := range [][]string{{"-m", "2x", "a"}, {"-m", "", "a"}, {"-m", "a", "f"}} {
+		_, errw, code := runGrepErr(t, argv, "a\n")
+		if code != errs.ExitUsage {
+			t.Errorf("%v: code=%d want 2(实测 invalid max count)", argv, code)
+		}
+		if !strings.Contains(errw, "invalid max count") {
+			t.Errorf("%v: 错误要对齐 GNU 的 invalid max count 措辞: %q", argv, errw)
+		}
+	}
+	// 缺参数:exit 2(与 -A/-e 缺参数同款措辞)。
+	_, _, code := runGrepErr(t, []string{"-m"}, "a\n")
+	if code != errs.ExitUsage {
+		t.Errorf("-m 缺参: code=%d want 2", code)
+	}
+
+	// 多文件:每文件独立计数、独立封顶(实测 f1:1 / f2:1)。
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "f1.txt"), []byte("a\na\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "f2.txt"), []byte("a\n"), 0o644)
+
+	var out bytes.Buffer
+	code = Grep(context.Background(), dir, []string{"-m", "1", "-c", "a", "f1.txt", "f2.txt"},
+		strings.NewReader(""), &out, nil)
+	if code != 0 {
+		t.Fatalf("code=%d", code)
+	}
+	if want := "f1.txt:1\nf2.txt:1\n"; out.String() != want {
+		t.Fatalf("got %q want %q(实测每文件独立)", out.String(), want)
+	}
+
+	// -l 在第一次命中就返回,-m 不改变它(实测两个名字都在)。
+	out.Reset()
+	code = Grep(context.Background(), dir, []string{"-m", "2", "-l", "a", "f1.txt", "f2.txt"},
+		strings.NewReader(""), &out, nil)
+	if code != 0 || out.String() != "f1.txt\nf2.txt\n" {
+		t.Fatalf("-m 2 -l: code=%d out=%q(实测)", code, out.String())
+	}
+}
+
+// ─── 9. -w 词边界的 Unicode 判定(2026-10-31 实测改齐)────────────────────────
+//
+// 词字符 = 字母/数字/下划线,按 rune 解码用 unicode 包判定 —— GNU 在 UTF-8
+// locale 下把非 ASCII 字母/数字也算词字符(旧实现按 ASCII byte 判,`-w '中'`
+// 会错放 `中文`)。以下期望值全部来自真 Git Bash grep 实测:
+//
+//	-w '中'   对 `中文`   → 不命中(右邻的「文」是词字符,挡住词尾边界)
+//	-w '中文' 对 `中文`   → 命中(整词)
+//	-w '文'   对 `文中`   → 不命中(右邻的「中」挡住;两边一致)
+//	-w '中文' 对 `中文中` → 不命中(右邻挡住)
+//	-w 'α'    对 `α٣`     → 不命中(阿拉伯-印度数字 ٣ 是 Nd 类,挡右界)
+//	-w 'α'    对 `α³`     → 命中(上标 ³ 是 No 类,不算词字符)
+//	-w 'àn'   对 `àn`     → 命中(á 是字母,但在**行首侧**,不夹在中间)
+//
+// GNU 的词边界检查有一条未复刻的不对称(见 已知差异与限制.md):命中段**左**
+// 邻是非 ASCII 字符时它不拦(实测 `-w '文'` 命中 `中文`、`-w 'β'` 命中 `αβ`)。
+// 我们按对称 Unicode 判、这类行不命中 —— 因此这一批用例**不进** golden。
+func TestGrepWholeWordUnicode(t *testing.T) {
+	cases := []struct {
+		name  string
+		argv  []string
+		input string
+		want  string
+	}{
+		{"-w 中 对 中文:右邻词字符挡住(旧 ASCII 判定会错放)", []string{"-w", "中"}, "中文\n", ""},
+		{"-w 中文 对 中文:整词命中", []string{"-w", "中文"}, "中文\n", "中文\n"},
+		{"-w 中 对 '中 中':两侧独立词(实测)", []string{"-w", "中"}, "中 中\n", "中 中\n"},
+		{"-o -w 中 对 '中 中'(实测两段)", []string{"-o", "-w", "中"}, "中 中\n", "中\n中\n"},
+		{"-o -w 中 对 '中,中文'(实测只给逗号前那个)", []string{"-o", "-w", "中"}, "中,中文\n", "中\n"},
+		{"-w 文 对 文中:右邻挡住(实测两边一致)", []string{"-w", "文"}, "文中\n", ""},
+		{"-w 中文 对 中文中:右邻挡住(实测)", []string{"-w", "中文"}, "中文中\n", ""},
+		{"-F -w 中 对 中文(实测 rc=1)", []string{"-F", "-w", "中"}, "中文\n", ""},
+		{"-w α 对 α٣:Nd 数字挡右界(实测)", []string{"-w", "α"}, "α٣\n", ""},
+		{"-w α 对 α³:No 类不算词字符(实测)", []string{"-w", "α"}, "α³\n", "α³\n"},
+		{"-w àn 对 àn:带音符字母成整词(实测)", []string{"-w", "àn"}, "àn\n", "àn\n"},
+		{"ASCII 回归:abc_def 不被 -w abc 命中", []string{"-w", "abc"}, "abc_def\n", ""},
+		{"ASCII 回归:abc1 不被 -w abc 命中", []string{"-w", "abc"}, "abc1\n", ""},
+	}
+	for _, c := range cases {
+		out, code := runGrepStdin(t, c.argv, c.input)
+		wantCode := 0
+		if c.want == "" {
+			wantCode = 1
+		}
+		if code != wantCode || out != c.want {
+			t.Errorf("%s: code=%d got %q want %q(rc=%d)", c.name, code, out, c.want, wantCode)
+		}
+	}
+}
