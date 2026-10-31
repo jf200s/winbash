@@ -1,8 +1,14 @@
 package pwsh
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
+	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -182,5 +188,135 @@ func TestPwshRunHonorsContextDeadline(t *testing.T) {
 	_, err := c.Run(context.Background(), "42")
 	if err == nil {
 		t.Fatal("session should be marked dead after a timeout")
+	}
+}
+
+// Pid 是给 --status 与排错用的:必须暴露 pwsh 子进程的真实 pid,而不是 0。
+func TestPwshPidIsTheChildProcessPid(t *testing.T) {
+	c := startConn(t)
+	if got := c.Pid(); got <= 0 {
+		t.Fatalf("Pid() = %d, want the child's pid", got)
+	}
+}
+
+// Calls 是状态展示的计数来源。Start 的握手 ping 走同一条 call 路径,
+// 也算一次请求 —— 所以新会话从 1 起步,每次 Run 再 +1。这是账本的真实口径,
+// 在这里钉死,免得有人按「只数业务调用」的直觉误改断言。
+func TestPwshCallsCountsHandshakeAndEveryRequest(t *testing.T) {
+	c := startConn(t)
+	if got := c.Calls(); got != 1 {
+		t.Fatalf("fresh session Calls() = %d, want 1 (the handshake ping)", got)
+	}
+	if _, err := c.Run(context.Background(), "1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Run(context.Background(), "2"); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.Calls(); got != 3 {
+		t.Fatalf("Calls() = %d, want 3 (handshake + 2 runs)", got)
+	}
+}
+
+// 失效是单向的:活着的会话 Dead 必须是 false;Close 之后必须变成 true,
+// 让调用方(② 层的 psEngine)能据此重建而不是接着用。
+func TestPwshDeadFlipsOnlyAfterClose(t *testing.T) {
+	c := startConn(t)
+	if c.Dead() {
+		t.Fatal("fresh session reported dead")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !c.Dead() {
+		t.Fatal("closed session still reported alive")
+	}
+}
+
+// 协议是 4 字节小端长度 + 载荷(包注释与 pwshx 共用的约定)。把字节布局直接钉住:
+// 端序搞反或改格式会在这里被抓住,而不是等到跨进程才失步。
+func TestWireFrameIsLittleEndianLengthPlusBody(t *testing.T) {
+	var buf bytes.Buffer
+	if err := writeFrame(&buf, []byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	got := buf.Bytes()
+	if len(got) != 6 {
+		t.Fatalf("frame is %d bytes, want 4-byte header + 2-byte body", len(got))
+	}
+	if got[0] != 2 || got[1] != 0 || got[2] != 0 || got[3] != 0 {
+		t.Fatalf("length prefix is not little-endian 2: %v", got[:4])
+	}
+	body, err := readFrame(bufio.NewReader(&buf))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "hi" {
+		t.Fatalf("readFrame recovered %q, want %q", body, "hi")
+	}
+}
+
+// 0 长度或超上限的帧长说明对端已经失步(脚本往主机流写了东西),必须报错 ——
+// 绝不能把垃圾字节当 JSON 解析。长度虚报(要 10 字节只来 3 字节)同理,
+// 且按 io.ReadFull 的语义应得到 ErrUnexpectedEOF。
+func TestReadFrameRejectsGarbageFrames(t *testing.T) {
+	frame := func(n uint32, body ...byte) *bytes.Buffer {
+		var b bytes.Buffer
+		var hdr [4]byte
+		binary.LittleEndian.PutUint32(hdr[:], n)
+		b.Write(hdr[:])
+		b.Write(body)
+		return &b
+	}
+	if _, err := readFrame(bufio.NewReader(frame(0))); err == nil {
+		t.Fatal("zero-length frame must be rejected")
+	}
+	if _, err := readFrame(bufio.NewReader(frame(maxFrameBytes + 1))); err == nil {
+		t.Fatal("over-limit frame must be rejected")
+	}
+	if _, err := readFrame(bufio.NewReader(frame(10, 'a', 'b', 'c'))); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("truncated frame must be ErrUnexpectedEOF, got %v", err)
+	}
+}
+
+// tailBuffer 的存在理由:留排错线索但不吃内存 —— 超过 limit 的旧内容必须被丢掉,
+// 只留最后 limit 字节。hint 把多行 stderr 折成一行附在错误信息里;
+// 没有内容时必须给空串,不能往错误里塞无意义的空提示。
+func TestTailBufferKeepsOnlyLastBytesAndHintJoinsLines(t *testing.T) {
+	tail := &tailBuffer{limit: 8}
+	if _, err := tail.Write([]byte("abcdefghij")); err != nil {
+		t.Fatal(err)
+	}
+	if got := tail.buf.String(); got != "cdefghij" {
+		t.Fatalf("kept %q, want the last 8 bytes %q", got, "cdefghij")
+	}
+
+	if hint := (&tailBuffer{limit: 8}).hint(); hint != "" {
+		t.Fatalf("empty stderr must not produce a hint, got %q", hint)
+	}
+
+	full := &tailBuffer{limit: stderrKeep}
+	if _, err := full.Write([]byte("line one\nline two\n")); err != nil {
+		t.Fatal(err)
+	}
+	hint := full.hint()
+	if !strings.HasPrefix(hint, "\n         pwsh stderr: ") {
+		t.Fatalf("hint must be prefixed for error-message appending, got %q", hint)
+	}
+	if !strings.Contains(hint, "line one | line two") {
+		t.Fatalf("hint must join stderr lines with \" | \", got %q", hint)
+	}
+}
+
+// 「找不到解释器」是 Windows 上最典型的翻车形态:PATH 里没有 pwsh 时,
+// 必须按候选路径找到本机安装;全都落空才退回裸名字 "pwsh.exe"(让 exec 报自己的错)。
+func TestFindPwshFindsKnownInstallsWhenPathMisses(t *testing.T) {
+	t.Setenv("PATH", "")
+	p := findPwsh()
+	if p == "" {
+		t.Fatal("findPwsh returned an empty path")
+	}
+	if _, err := os.Stat(p); err != nil && p != "pwsh.exe" {
+		t.Fatalf("findPwsh returned %q, which is neither an existing file nor the fallback name", p)
 	}
 }

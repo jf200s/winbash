@@ -1,6 +1,9 @@
 package output
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestFormatBytesIsPlainNumberByDefault(t *testing.T) {
 	if got := FormatBytes(86488064, false); got != "86488064" {
@@ -50,5 +53,74 @@ func TestJSONArrayDegradesUnserializableValueInsteadOfFailing(t *testing.T) {
 	}
 	if got == "" || got[0] != '[' {
 		t.Fatalf("got %q", got)
+	}
+}
+
+// human 模式是给人看的另一套合同:单位阶梯 K→M→G→T→P、固定一位小数、
+// 不足 1K 带 B 后缀。超过 P 没有更大的单位,钳在最大档 —— "1024.0P"
+// 仍是个可解析的数,总比溢出或换形状强。
+func TestFormatBytesHumanUsesUnitLadder(t *testing.T) {
+	cases := []struct {
+		n    int64
+		want string
+	}{
+		{0, "0B"},
+		{512, "512B"},
+		{1023, "1023B"},
+		{1024, "1.0K"},
+		{1536, "1.5K"},
+		{1 << 20, "1.0M"},
+		{86488064, "82.5M"}, // 本仓库的常驻数字:86,488 K
+		{1 << 30, "1.0G"},
+		{1 << 40, "1.0T"},
+		{1 << 50, "1.0P"},
+		{1 << 60, "1024.0P"}, // 无 E 档,钳在 P
+	}
+	for _, c := range cases {
+		if got := FormatBytes(c.n, true); got != c.want {
+			t.Errorf("FormatBytes(%d, true) = %q, want %q", c.n, got, c.want)
+		}
+	}
+}
+
+// 空输入必须还是数组形状("[]"),不能退化成 "null" —— AI 的解析器依赖形状稳定。
+func TestJSONArrayEmptyInputIsStillAnArray(t *testing.T) {
+	got, err := JSONArray(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "[]" {
+		t.Fatalf("got %q, want []", got)
+	}
+}
+
+// 一个坏元素只降级它自己:条数与顺序都不能变,前后好元素原样保留。
+// 这是逐个 Marshal(而不是 Marshal 整个切片)买到的性质,值得钉住。
+func TestJSONArrayBadElementOnlyDegradesItself(t *testing.T) {
+	got, err := JSONArray([]any{
+		map[string]any{"Id": 1},
+		unserializable{},
+		map[string]any{"Id": 2},
+	})
+	if err != nil {
+		t.Fatalf("must degrade the bad element, not fail: %v", err)
+	}
+	var arr []any
+	if err := json.Unmarshal([]byte(got), &arr); err != nil {
+		t.Fatalf("out is not a JSON array: %v (%q)", err, got)
+	}
+	if len(arr) != 3 {
+		t.Fatalf("want 3 elements, got %d: %s", len(arr), got)
+	}
+	first, ok := arr[0].(map[string]any)
+	if !ok || first["Id"] != float64(1) {
+		t.Fatalf("good element before the bad one was altered: %s", got)
+	}
+	if _, ok := arr[1].(string); !ok {
+		t.Fatalf("bad element must degrade to its string form, got %T: %s", arr[1], got)
+	}
+	last, ok := arr[2].(map[string]any)
+	if !ok || last["Id"] != float64(2) {
+		t.Fatalf("good element after the bad one was altered: %s", got)
 	}
 }
