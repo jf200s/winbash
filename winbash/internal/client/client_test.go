@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"winbash/internal/ipc"
+	"winbash/internal/shell"
 )
 
 // 本文件补的是"凭据读取"与"陈旧端口文件的删除条件"这两段 —— 纯文件级、不需要 daemon。
@@ -349,3 +350,33 @@ func TestRecordingReaderIgnoresEOF(t *testing.T) {
 type errReader struct{ err error }
 
 func (e errReader) Read([]byte) (int, error) { return 0, e.err }
+
+// daemonEnv 的环境摘除:WINBASH_SESSION_NAME 若原样传给 daemon,daemon 一拿到就会
+// 撞上「--session 只用于执行脚本」的互斥校验 exit 2,连 --stop 都跟着废(见
+// spawnDaemon 注释里的实测)。这里钉三件事:大写摘、**小写也摘**(Windows 环境变量
+// 名大小写不敏感,比对折大写)、PATH 与普通变量原样保留 —— 其中特意放了一个
+// WINBASH_SESSION 同族变量,防「按前缀一刀切」的写法被当成等价实现。
+func TestDaemonEnvDropsSessionNameCaseInsensitively(t *testing.T) {
+	got := daemonEnv([]string{
+		"WINBASH_SESSION_NAME=build",
+		"winbash_session_name=build",
+		`PATH=C:\Windows;C:\Go\bin`,
+		shell.EnvNested + "=1", // 同族但不摘:嵌套过滤是 daemon 内 shell.NewSession 的事
+		"WINBASH_SESSION_TIMEOUT=5m",
+		`HOME=C:\Users\tester`,
+	})
+	want := []string{
+		`PATH=C:\Windows;C:\Go\bin`,
+		shell.EnvNested + "=1",
+		"WINBASH_SESSION_TIMEOUT=5m",
+		`HOME=C:\Users\tester`,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("daemonEnv 产出 %d 项,期望 %d: got %q", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("daemonEnv[%d] = %q,期望 %q(顺序与内容都应原样保留)", i, got[i], want[i])
+		}
+	}
+}

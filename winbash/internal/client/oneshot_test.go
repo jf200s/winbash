@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"winbash/internal/ipc"
+	"winbash/internal/shell"
 )
 
 // 这个文件补的是 oneShot / exchange 里的**接线**:谓词写对不等于接对了,
@@ -538,5 +539,32 @@ func TestOneShotResendsOnAliveDaemonWithoutSpawn(t *testing.T) {
 	}
 	if !strings.Contains(string(b), fd.addr) || !strings.Contains(string(b), "fake-token") {
 		t.Fatalf("端口文件内容 = %q,期望原样的 addr + fake-token", string(b))
+	}
+}
+
+// ⑤ 旧 daemon 响应识别:响应 Proto=0(旧 daemon 不写这个字段)时 RunTimeout 必须
+// 响亮报错,而不是把旧语义的响应当成功往下走 —— 这条接线在 client.go 的 oneShot
+// 之后、CheckProto 之前,误删它门禁不会红:旧 daemon + 新 client 会静默按旧协议跑。
+// 判据走 RunTimeout 而不是直调 oneShot(oneShot 本来就不查版本),措辞合同在
+// ipc.CheckProto(got==0 分支)。
+func TestRunTimeoutRejectsOldDaemonResponse(t *testing.T) {
+	t.Setenv(shell.EnvNested, "") // 钉在非嵌套路径:真进了会话会走 runLocal,碰不到这条接线
+
+	fd := startFakeDaemon(t, func(conn net.Conn, seq int) {
+		defer conn.Close()
+		readRequest(t, conn)
+		// Proto 故意留零值 —— 那正是「旧 daemon」在线上的唯一特征。
+		reply(t, conn, ipc.Response{OK: true, Exit: 0, Out: []byte("hi")})
+	})
+
+	resp, err := RunTimeout(fd.endpoint, "echo hi", "", false, 5*time.Second, 0)
+	if err == nil {
+		t.Fatalf("旧 daemon 的响应必须被拒绝,实际拿到了 resp.Out=%q", resp.Out)
+	}
+	if !strings.Contains(err.Error(), "没有协议版本") {
+		t.Fatalf("错误文案应当来自 CheckProto 的 got==0 分支, got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "--stop") {
+		t.Fatalf("错误文案应当指路 --stop(否则使用者不知道怎么摆脱旧 daemon), got %q", err.Error())
 	}
 }
