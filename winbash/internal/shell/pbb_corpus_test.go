@@ -123,12 +123,16 @@ type pbbGolden struct {
 	Name string   `json:"name"`
 	Out  []string `json:"out"`
 	Exit int      `json:"exit"`
-	// ErrNonEmpty 记"真 bash 有没有往 stderr 写东西"(不记内容:两侧措辞本来就不同,
-	// winbash 用中文三行式)。这是判据的一部分 —— 回应 §四 特别点出 `printf '%.0s'`
-	// 那条"打了 stderr 但退出码仍是 0"最需要盯住,而只看 exit/stdout 正好漏掉它。
-	ErrNonEmpty bool   `json:"err_non_empty,omitempty"`
-	Known       string `json:"known,omitempty"`
-	Source      string `json:"source,omitempty"`
+	// Errs 是真 bash 的 stderr 逐行原文,与 winbash 的 errs **逐字**比较
+	// (独立复审 2026-10-15 §3.4 的建议;中间曾被降级成 err_non_empty 布尔,
+	// 只比"有没有"—— 那样报错文案改掉、字段丢掉测试照样绿)。
+	// 本语料 46 条真 bash 全部无 stderr,所以逐字比较目前钉的是
+	// "winbash 也不许冒出 stderr";哪天真 bash 会写 stderr 的条目进来了,
+	// 逐字比较就连措辞一起钉 —— 措辞对不上的条目该进 known(措辞差异也是差异)。
+	// 若生成侧遇到含绝对路径这类不稳定内容的 stderr,先归一化再入库(§3.4 同款建议)。
+	Errs   []string `json:"errs"`
+	Known  string   `json:"known,omitempty"`
+	Source string   `json:"source,omitempty"`
 }
 
 // TestPbbCorpusMatchesRealBash 拿 pure-bash-bible 的用法压 ① 层,期望值来自真 Git Bash。
@@ -155,7 +159,7 @@ func TestPbbCorpusMatchesRealBash(t *testing.T) {
 			gotOut := pbbLines(out)
 
 			same := exit == want.Exit && slices.Equal(gotOut, want.Out) &&
-				(len(errs) > 0) == want.ErrNonEmpty
+				slices.Equal(errs, want.Errs)
 
 			if c.known != "" {
 				// 已知差异:断言"差异**仍然**存在"——哪天它自己一致了就该删掉这条,
@@ -168,11 +172,8 @@ func TestPbbCorpusMatchesRealBash(t *testing.T) {
 			}
 
 			if !same {
-				t.Errorf("与真 bash 不一致\n  script : %s\n  winbash: exit=%d out=%q\n  真bash : exit=%d out=%q\n  来源   : %s",
-					c.script, exit, gotOut, want.Exit, want.Out, c.section)
-				if len(errs) > 0 {
-					t.Errorf("winbash stderr: %s", strings.Join(errs, " / "))
-				}
+				t.Errorf("与真 bash 不一致\n  script : %s\n  winbash: exit=%d out=%q errs=%q\n  真bash : exit=%d out=%q errs=%q\n  来源   : %s",
+					c.script, exit, gotOut, errs, want.Exit, want.Out, want.Errs, c.section)
 			}
 		})
 	}
@@ -206,12 +207,12 @@ func TestUpdatePbbCorpus(t *testing.T) {
 		}
 
 		rec := pbbGolden{
-			Name:        c.name,
-			Out:         pbbLines(out.String()),
-			Exit:        code,
-			ErrNonEmpty: errb.Len() > 0,
-			Known:       c.known,
-			Source:      c.section,
+			Name:   c.name,
+			Out:    pbbLines(out.String()),
+			Exit:   code,
+			Errs:   pbbLines(errb.String()),
+			Known:  c.known,
+			Source: c.section,
 		}
 		line, err := json.Marshal(rec)
 		if err != nil {
