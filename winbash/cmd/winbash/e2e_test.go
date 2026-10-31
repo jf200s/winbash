@@ -1059,3 +1059,86 @@ func TestStreamStdinOnCommandThatIgnoresItStaysQuiet(t *testing.T) {
 		t.Fatalf("不读 stdin 的正常命令不该有 stderr, got %q", stderr.String())
 	}
 }
+
+// TestBackgroundJobDiesWithTheRequest 钉住**现状**:后台 job 随请求结束被取消。
+//
+// 这是记账,不是对"正确行为"的背书。现状(独立复核员实测证实):
+//
+//	a. 同一 daemon 上,`( sleep 2; echo BG > marker ) & echo FIRST-DONE` **立即返回
+//	   rc=0**,只打 FIRST-DONE —— `&` 没有被等待;
+//	b. 但后台 job 连同它的副作用(写 marker)一起**静默消失**:给足 2 倍时序余量之后
+//	   marker 仍不存在,后续调用的输出也干净 —— 输出与副作用都拿不到、rc 却是 0,
+//	   调用方(AI 常写 `nohup … &`)无从察觉失败;
+//	c. 对照组:脚本**存活期间**的后台 job 正常(`( sleep 0.3; echo LATE ) & echo NOW;
+//	   sleep 2` 同时打出 NOW 与 LATE)—— 证明取消发生在「请求结束」,不是后台 job
+//	   在 winbash 里根本不工作。
+//
+// 根因:internal/daemon/daemon.go 的 runJob 给每个请求建 per-request ctx,`Run` 一
+// 返回 `defer cancel()` 就取消它,mvdan 的后台 goroutine 连带被砍。与真 bash 的
+// **孤儿进程语义**不同(`bash -c '( sleep 2; cmd ) &'` 返回后后台进程照常存活),
+// 而 winbash 对外承诺会话跨调用常驻,两者放在一起就是静默数据丢失。
+//
+// **这是钉现状防漂移**:放活后台进程,还是响亮拒绝 `&`,是协议级设计,单独立项
+// (见 winbash/已知差异与限制.md 的「cmd & 后台 job」行)。哪天实现了「后台 job
+// 存活」的语义,a/b 两条断言必须反转、c 保留 —— 先改差异表,再改这里。
+//
+// 为什么必须端到端:取消长在「两条请求之间」—— runJob 返回的那个瞬间,包内测试
+// 看不见(与 TestFreshSessionIsIsolated 同一个理由)。
+func TestBackgroundJobDiesWithTheRequest(t *testing.T) {
+	exe := buildWinbash(t)
+	endpoint := benchEndpoint(t)
+	t.Cleanup(func() { stopAndWait(t, exe, endpoint) })
+
+	if out, code := runWinbash(t, exe, endpoint, "-c", "echo warm"); code != 0 {
+		t.Fatalf("预热失败 exit=%d out=%q", code, out)
+	}
+
+	marker := filepath.Join(t.TempDir(), "bg.marker")
+
+	// a. 后台 job 随请求立即返回:rc=0、只有 FIRST-DONE、不等后台 job。
+	//    计时判据给足两端余量:后台 sleep 2s,正常请求开销 ~15ms,即使慢机器放大
+	//    10 倍也远够不着 1.5s;而"等了后台 job"的实现会 ≥2s,两头都不会误判。
+	bgScript := "( sleep 2; echo BG > " + shellPathArg(marker) + "; echo LATE ) & echo FIRST-DONE"
+	start := time.Now()
+	out, code := runWinbash(t, exe, endpoint, "-c", bgScript)
+	elapsed := time.Since(start)
+	if code != 0 {
+		t.Fatalf("后台 job 的请求应当立即返回 rc=0: exit=%d out=%q", code, out)
+	}
+	if got := strings.TrimSpace(out); got != "FIRST-DONE" {
+		t.Fatalf("输出 = %q,期望只有 FIRST-DONE", got)
+	}
+	if elapsed >= 1500*time.Millisecond {
+		t.Errorf("第一条请求花了 %s —— 它等了后台 job,与「& 立即返回」的现状不符",
+			elapsed.Round(time.Millisecond))
+	}
+
+	// b. 给足 2 倍余量(后台 job 需要 2s,这里等 4s)之后,断言副作用消失了。
+	//    在 winbash 里查是顺带钉「后续调用的输出干净」;宿主侧 stat 是独立见证,
+	//    不依赖 winbash 自己的 [ -e ]。
+	out2, code2 := runWinbash(t, exe, endpoint, "-c",
+		"sleep 4; if [ -e "+shellPathArg(marker)+" ]; then echo MARKER-EXISTS; else echo MARKER-ABSENT; fi")
+	if code2 != 0 {
+		t.Fatalf("第二条请求失败 exit=%d out=%q", code2, out2)
+	}
+	if got := strings.TrimSpace(out2); got != "MARKER-ABSENT" {
+		if strings.Contains(got, "MARKER-EXISTS") {
+			t.Fatalf("后台 job 的副作用(写出 %s)在请求结束之后出现了 —— 后台 job 活过了请求。"+
+				"若这是你改的语义,请先反转本测试 a/b 的判据并更新差异表,再合代码", marker)
+		}
+		t.Fatalf("第二条请求的输出 = %q,期望恰为 MARKER-ABSENT", got)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Errorf("宿主侧也看得到 %s —— 后台 job 的副作用活过了请求", marker)
+	}
+
+	// c. 对照组:脚本存活期间,后台 job 的输出与副作用都正常。
+	//    LATE 最迟 ~0.3s 出现,脚本再等 2s —— 6 倍余量,慢机器也不会假红。
+	out3, code3 := runWinbash(t, exe, endpoint, "-c", "( sleep 0.3; echo LATE ) & echo NOW; sleep 2")
+	if code3 != 0 {
+		t.Fatalf("对照组失败 exit=%d out=%q", code3, out3)
+	}
+	if !strings.Contains(out3, "NOW") || !strings.Contains(out3, "LATE") {
+		t.Errorf("对照组应当同时打出 NOW 与 LATE(脚本存活期间后台 job 正常),实际: %q", out3)
+	}
+}
